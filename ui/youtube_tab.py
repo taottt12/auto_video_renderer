@@ -6,14 +6,15 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit,
     QPushButton, QComboBox, QSpinBox, QDateEdit, QCheckBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox, QProgressBar,
     QGroupBox, QSplitter, QFrame, QDialog, QTabWidget
 )
+
 
 from core.gemini_assistant import GeminiAssistant
 from core.settings import PROJECTS_DIR, SettingsManager
@@ -27,23 +28,67 @@ class AddChannelKeyDialog(QDialog):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Thêm Kênh YouTube (Nhập OAuth Key)")
-        self.resize(520, 360)
+        self.setWindowTitle("Thêm Kênh YouTube (Google OAuth 2.0)")
+        self.resize(580, 500)
         self.client_id = ""
         self.client_secret = ""
         self.raw_json = ""
+        self.port = 8080
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
-        info_lbl = QLabel(
-            "Nhập thông tin OAuth 2.0 từ Google Cloud Console.\n"
-            "Hệ thống sẽ tự động lưu cấu hình cho kênh vào file client_secret.json trong thư mục tokens/."
+        # Khung hướng dẫn cấu hình chuẩn Google OAuth
+        guide_box = QFrame()
+        guide_box.setFrameShape(QFrame.StyledPanel)
+        guide_box.setStyleSheet(
+            "background-color: #23272d; border: 1px solid #3d444d; border-radius: 6px; padding: 6px;"
         )
-        info_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
-        layout.addWidget(info_lbl)
+        lay_guide = QVBoxLayout(guide_box)
+        lay_guide.setSpacing(6)
+
+        guide_title = QLabel("💡 <b>HƯỚNG DẪN TẠO OAUTH KEY (Google Cloud Console)</b>")
+        guide_title.setStyleSheet("color: #58a6ff; font-size: 12px;")
+        lay_guide.addWidget(guide_title)
+
+        guide_desc = QLabel(
+            "• <b>Cách 1 (Khuyên dùng - Nhanh nhất):</b> Khi tạo OAuth Client ID, chọn Application type là "
+            "<span style='color: #7ee787;'><b>'Desktop app' (Ứng dụng máy tính)</b></span>.<br>"
+            "&nbsp;&nbsp;→ Loại này <b>không yêu cầu</b> cài đặt Redirect URI, xác thực ngay 100% không lo lỗi.<br>"
+            "• <b>Cách 2 (Nếu dùng 'Web application'):</b> Trong Google Cloud Console, mục "
+            "<b>'Authorized redirect URIs'</b> (URI chuyển hướng), bạn phải nhấn <b>ADD URI</b> và thêm chính xác link sau:"
+        )
+        guide_desc.setWordWrap(True)
+        guide_desc.setStyleSheet("color: #c9d1d9; font-size: 11px; line-height: 1.4;")
+        lay_guide.addWidget(guide_desc)
+
+        # Hàng hiển thị Redirect URI + Nút Copy + Cổng Port
+        row_uri = QHBoxLayout()
+        self.uri_display = QLineEdit("http://localhost:8080/")
+        self.uri_display.setReadOnly(True)
+        self.uri_display.setStyleSheet("background-color: #161b22; color: #58a6ff; font-weight: bold; font-family: Consolas;")
+        row_uri.addWidget(self.uri_display, 1)
+
+        self.copy_btn = QPushButton("📋 Sao chép URI")
+        self.copy_btn.setStyleSheet("padding: 4px 10px; font-weight: bold;")
+        self.copy_btn.clicked.connect(self._copy_redirect_uri)
+        row_uri.addWidget(self.copy_btn)
+
+        lbl_port = QLabel("Cổng (Port):")
+        lbl_port.setStyleSheet("color: #c9d1d9; font-weight: bold; font-size: 11px;")
+        row_uri.addWidget(lbl_port)
+
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1024, 65535)
+        self.port_spin.setValue(8080)
+        self.port_spin.setStyleSheet("background-color: #161b22; color: #58a6ff; font-weight: bold; padding: 2px;")
+        self.port_spin.valueChanged.connect(self._on_port_changed)
+        row_uri.addWidget(self.port_spin)
+
+        lay_guide.addLayout(row_uri)
+        layout.addWidget(guide_box)
 
         self.tab_type = QTabWidget()
 
@@ -54,26 +99,36 @@ class AddChannelKeyDialog(QDialog):
 
         lay_keys.addWidget(QLabel("Client ID:"))
         self.cid_edit = QLineEdit()
-        self.cid_edit.setPlaceholderText("Ví dụ: 123456789-abcdef.apps.googleusercontent.com")
+        self.cid_edit.setPlaceholderText("Ví dụ: 1035312312578-ocf0h...apps.googleusercontent.com")
         lay_keys.addWidget(self.cid_edit)
 
         lay_keys.addWidget(QLabel("Client Secret:"))
         self.csec_edit = QLineEdit()
         self.csec_edit.setEchoMode(QLineEdit.Password)
-        self.csec_edit.setPlaceholderText("Ví dụ: GOCSPX-abcdef123456")
+        self.csec_edit.setPlaceholderText("Ví dụ: GOCSPX-abcdef123456...")
         lay_keys.addWidget(self.csec_edit)
+
+        # Nút hiện/ẩn Secret
+        row_toggle = QHBoxLayout()
+        self.show_sec_chk = QCheckBox("Hiện Client Secret")
+        self.show_sec_chk.toggled.connect(
+            lambda checked: self.csec_edit.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+        )
+        row_toggle.addWidget(self.show_sec_chk)
+        row_toggle.addStretch(1)
+        lay_keys.addLayout(row_toggle)
         lay_keys.addStretch(1)
 
-        self.tab_type.addTab(tab_keys, "Nhập Client ID & Secret")
+        self.tab_type.addTab(tab_keys, "🔑 Nhập Client ID & Secret")
 
         # Tab 2: Dán nội dung JSON
         tab_json = QWidget()
         lay_json = QVBoxLayout(tab_json)
-        lay_json.addWidget(QLabel("Dán toàn bộ nội dung file client_secret JSON (nếu có):"))
+        lay_json.addWidget(QLabel("Dán toàn bộ nội dung file client_secret.json (tải từ Google Cloud):"))
         self.json_edit = QTextEdit()
-        self.json_edit.setPlaceholderText('{\n  "installed": {\n    "client_id": "...",\n    "client_secret": "..."\n  }\n}')
+        self.json_edit.setPlaceholderText('{\n  "web": {\n    "client_id": "...",\n    "client_secret": "..."\n  }\n}')
         lay_json.addWidget(self.json_edit)
-        self.tab_type.addTab(tab_json, "Dán JSON")
+        self.tab_type.addTab(tab_json, "📄 Dán JSON")
 
         layout.addWidget(self.tab_type)
 
@@ -88,7 +143,18 @@ class AddChannelKeyDialog(QDialog):
         btn_box.addWidget(self.cancel_btn)
         layout.addLayout(btn_box)
 
+    def _on_port_changed(self, val: int) -> None:
+        self.port = val
+        self.uri_display.setText(f"http://localhost:{val}/")
+
+    def _copy_redirect_uri(self) -> None:
+        uri = self.uri_display.text().strip()
+        QApplication.clipboard().setText(uri)
+        self.copy_btn.setText("✔ Đã chép!")
+        QTimer.singleShot(2000, lambda: self.copy_btn.setText("📋 Sao chép URI"))
+
     def _on_submit(self) -> None:
+        self.port = self.port_spin.value()
         if self.tab_type.currentIndex() == 0:
             self.client_id = self.cid_edit.text().strip()
             self.client_secret = self.csec_edit.text().strip()
@@ -112,12 +178,18 @@ class OAuthWorker(QThread):
         client_id: str = "",
         client_secret: str = "",
         raw_json: str = "",
+        port: int = 8080,
     ) -> None:
         super().__init__()
         self.auth_mgr = auth_mgr
         self.client_id = client_id
         self.client_secret = client_secret
         self.raw_json = raw_json
+        self.port = port
+        self._is_cancelled = False
+
+    def cancel(self) -> None:
+        self._is_cancelled = True
 
     def run(self) -> None:
         try:
@@ -125,10 +197,20 @@ class OAuthWorker(QThread):
                 client_id=self.client_id,
                 client_secret=self.client_secret,
                 raw_json_str=self.raw_json,
+                port=self.port,
+                cancel_check_fn=lambda: self._is_cancelled,
+                timeout_seconds=180,
             )
             self.finished_auth.emit(True, f"Đăng nhập thành công kênh: {ch_info.get('title')}", ch_info)
-        except Exception as e:
+        except InterruptedError:
+            self.finished_auth.emit(False, "Đã hủy xác thực kênh theo yêu cầu.", {})
+        except TimeoutError as e:
             self.finished_auth.emit(False, str(e), {})
+        except Exception as e:
+            if self._is_cancelled:
+                self.finished_auth.emit(False, "Đã hủy xác thực kênh theo yêu cầu.", {})
+            else:
+                self.finished_auth.emit(False, str(e), {})
 
 
 class GeminiWorker(QThread):
@@ -266,6 +348,16 @@ class YouTubeTab(QWidget):
         self.add_ch_btn = QPushButton("+ Thêm kênh")
         self.add_ch_btn.clicked.connect(self._add_channel)
         row_ch.addWidget(self.add_ch_btn)
+
+        self.cancel_oauth_btn = QPushButton("❌ Hủy")
+        self.cancel_oauth_btn.setToolTip("Hủy tiến trình đăng nhập OAuth trên trình duyệt")
+        self.cancel_oauth_btn.setStyleSheet(
+            "background-color: #c9302c; color: white; font-weight: bold; padding: 5px 10px;"
+        )
+        self.cancel_oauth_btn.setVisible(False)
+        self.cancel_oauth_btn.clicked.connect(self._cancel_oauth)
+        row_ch.addWidget(self.cancel_oauth_btn)
+
         lay_ch.addLayout(row_ch)
 
         self.ch_info_label = QLabel("Chưa chọn kênh nào")
@@ -540,26 +632,40 @@ class YouTubeTab(QWidget):
 
         self.add_ch_btn.setEnabled(False)
         self.add_ch_btn.setText("Đang mở web...")
-        self.ch_info_label.setText("Đang mở trình duyệt xác thực Google OAuth 2.0...")
+        self.cancel_oauth_btn.setVisible(True)
+        self.cancel_oauth_btn.setEnabled(True)
+        self.ch_info_label.setText("Đang mở trình duyệt xác thực Google OAuth 2.0... (Nhấn '❌ Hủy' nếu muốn dừng)")
 
         self._oauth_worker = OAuthWorker(
             self.auth_mgr,
             client_id=dlg.client_id,
             client_secret=dlg.client_secret,
             raw_json=dlg.raw_json,
+            port=dlg.port,
         )
         self._oauth_worker.finished_auth.connect(self._on_oauth_finished)
         self._oauth_worker.start()
 
+    def _cancel_oauth(self) -> None:
+        if self._oauth_worker and self._oauth_worker.isRunning():
+            self._oauth_worker.cancel()
+            self.cancel_oauth_btn.setEnabled(False)
+            self.ch_info_label.setText("⏳ Đang hủy xác thực và đóng cổng mạng...")
+
     def _on_oauth_finished(self, success: bool, msg: str, ch_info: dict) -> None:
         self.add_ch_btn.setEnabled(True)
         self.add_ch_btn.setText("+ Thêm kênh")
+        self.cancel_oauth_btn.setVisible(False)
+        self.cancel_oauth_btn.setEnabled(True)
         if success:
             QMessageBox.information(self, "Thành công", msg)
             self.refresh_channels()
         else:
-            QMessageBox.critical(self, "Lỗi đăng nhập OAuth", f"Không thể xác thực kênh:\n{msg}")
-            self.ch_info_label.setText("Lỗi xác thực OAuth.")
+            if "hủy" in msg.lower():
+                self.ch_info_label.setText("Đã hủy xác thực kênh theo yêu cầu.")
+            else:
+                QMessageBox.critical(self, "Lỗi đăng nhập OAuth", f"Không thể xác thực kênh:\n{msg}")
+                self.ch_info_label.setText("Lỗi xác thực OAuth.")
 
     # ==========================
     # LOGIC: DỰ ÁN & VIDEO MP4
