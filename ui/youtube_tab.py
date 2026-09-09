@@ -794,12 +794,13 @@ class YouTubeTab(QWidget):
 
         row_badge = QHBoxLayout()
         row_badge.addWidget(QLabel("Huy hiệu tập:"))
-        self.thumb_badge_edit = QLineEdit("PHẦN 1")
+        self.thumb_badge_edit = QLineEdit("P1")
         self.thumb_badge_edit.textChanged.connect(self._on_badge_changed)
         row_badge.addWidget(self.thumb_badge_edit)
 
         row_badge.addWidget(QLabel("Chữ to nổi bật:"))
         self.thumb_hl_edit = QLineEdit("TIÊU ĐỀ NỔI BẬT")
+        self.thumb_hl_edit.textChanged.connect(self._on_thumb_hl_changed)
         row_badge.addWidget(self.thumb_hl_edit)
         lay_thumb.addLayout(row_badge)
 
@@ -1050,6 +1051,7 @@ class YouTubeTab(QWidget):
                 "description": "",
                 "tags": f"{story_title.lower()}, truyen audio, kiem hiep, {badge.lower()}",
                 "thumbnail_path": thumb_path,
+                "thumbnail_hl": clean_story_title(story_title or f.stem).upper(),
             }
             self.video_items.append(item_data)
 
@@ -1134,12 +1136,18 @@ class YouTubeTab(QWidget):
         self.tags_edit.blockSignals(False)
 
         self.thumb_badge_edit.blockSignals(True)
-        self.thumb_badge_edit.setText(item.get("episode_badge", f"TẬP {row+1}"))
+        self.thumb_badge_edit.setText(item.get("episode_badge", f"P{row+1}"))
         self.thumb_badge_edit.blockSignals(False)
 
-        words = item.get("title", "").split()
-        short_title = " ".join(words[:5]) if len(words) >= 5 else item.get("title", "")
-        self.thumb_hl_edit.setText(short_title.upper())
+        self.thumb_hl_edit.blockSignals(True)
+        saved_hl = item.get("thumbnail_hl")
+        if saved_hl:
+            self.thumb_hl_edit.setText(saved_hl)
+        else:
+            default_hl = clean_story_title(item.get("title", "") or self.proj_combo.currentText())
+            self.thumb_hl_edit.setText(default_hl.upper())
+            item["thumbnail_hl"] = default_hl.upper()
+        self.thumb_hl_edit.blockSignals(False)
 
         # Cập nhật preview Thumbnail
         thumb_p = item.get("thumbnail_path")
@@ -1178,6 +1186,10 @@ class YouTubeTab(QWidget):
             tbl_it = self.video_table.item(self.current_video_idx, 1)
             if tbl_it:
                 tbl_it.setText(text)
+
+    def _on_thumb_hl_changed(self, text: str) -> None:
+        if 0 <= self.current_video_idx < len(self.video_items):
+            self.video_items[self.current_video_idx]["thumbnail_hl"] = text
 
     # ==========================
     # LOGIC: SINH NỘI DUNG AI
@@ -1258,8 +1270,11 @@ class YouTubeTab(QWidget):
                     if "tags" in data:
                         item["tags"] = data["tags"]
                     if "thumbnail_badge" in data:
-                        item["episode_badge"] = data["thumbnail_badge"]
-                        self.video_table.setItem(row_idx, 1, QTableWidgetItem(data["thumbnail_badge"]))
+                        badge = clean_episode_badge(data["thumbnail_badge"], row_idx + 1)
+                        item["episode_badge"] = badge
+                        self.video_table.setItem(row_idx, 1, QTableWidgetItem(badge))
+                    if "thumbnail_highlight" in data and data["thumbnail_highlight"]:
+                        item["thumbnail_hl"] = data["thumbnail_highlight"].strip().upper()
 
                     if row_idx == self.current_video_idx:
                         self._select_video_row(row_idx)
@@ -1307,13 +1322,12 @@ class YouTubeTab(QWidget):
 
         count = 0
         for idx, item in enumerate(self.video_items):
-            badge = item.get("episode_badge", f"TẬP {idx+1}")
+            badge = item.get("episode_badge", f"P{idx+1}")
             bg_img = candidates[idx % len(candidates)] if candidates else Path("temp/preview_fx_bubbles.png")
             out_thumb = out_dir / f"thumbnail_tap_{idx+1}.jpg"
 
-            # Tự động lấy chữ to nổi bật cho thumbnail
-            words = item.get("title", clean_title).split()
-            hl_text = " ".join(words[:4]) if len(words) >= 4 else clean_title
+            # Tự động lấy chữ to nổi bật cho thumbnail từ tên truyện/tiêu đề video
+            hl_text = item.get("thumbnail_hl") or clean_story_title(item.get("title", "") or raw_story_title).upper()
 
             try:
                 thumb_res = ThumbnailBuilder.create_thumbnail(
@@ -1356,8 +1370,8 @@ class YouTubeTab(QWidget):
         out_dir = self._current_project_dir or Path("D:/auto_video_renderer/auto_video_renderer/temp")
         out_thumb = out_dir / f"thumbnail_tap_{self.current_video_idx+1}.jpg"
 
-        badge = self.thumb_badge_edit.text().strip() or item.get("episode_badge", f"TẬP {self.current_video_idx+1}")
-        hl = self.thumb_hl_edit.text().strip() or item.get("title", "")
+        badge = self.thumb_badge_edit.text().strip() or item.get("episode_badge", f"P{self.current_video_idx+1}")
+        hl = self.thumb_hl_edit.text().strip() or item.get("thumbnail_hl") or clean_story_title(item.get("title", "") or self.proj_combo.currentText()).upper()
         ch_name = self.channel_combo.currentText().split("(")[0].strip()
 
         try:
@@ -1457,7 +1471,50 @@ class YouTubeTab(QWidget):
         is_premiere = self.premiere_chk.isChecked()
         tasks: List[Dict[str, Any]] = []
 
+        # Chuẩn bị tư liệu ảnh nếu cần tạo Thumbnail tự động cho video chưa có
+        candidates = list(self._current_project_media)
+        if not candidates and self._current_project_dir and self._current_project_dir.exists():
+            candidates = sorted(list(self._current_project_dir.glob("*.png")) + list(self._current_project_dir.glob("*.jpg")))
+        if not candidates:
+            global_media = self.settings.get("media_files", [])
+            candidates = [Path(m) for m in global_media if Path(m).exists()]
+
+        out_dir = self._current_project_dir or Path("D:/auto_video_renderer/auto_video_renderer/temp")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        raw_story_title = self.proj_combo.currentText()
+        ch_name = self.channel_combo.currentText().split("(")[0].strip()
+
         for idx, item in enumerate(selected_tasks_info):
+            # TỰ ĐỘNG TẠO THUMBNAIL KIẾM HIỆP NẾU CHƯA CÓ
+            thumb_path = item.get("thumbnail_path")
+            if not thumb_path or not Path(thumb_path).exists():
+                ep_idx = item.get("episode_index", idx + 1)
+                badge = item.get("episode_badge") or f"P{ep_idx}"
+                bg_img = candidates[(ep_idx - 1) % len(candidates)] if candidates else Path("temp/preview_fx_bubbles.png")
+                out_thumb = out_dir / f"thumbnail_tap_{ep_idx}.jpg"
+                hl_text = item.get("thumbnail_hl") or clean_story_title(item.get("title", "") or raw_story_title).upper()
+                try:
+                    thumb_res = ThumbnailBuilder.create_thumbnail(
+                        bg_image=bg_img,
+                        output_path=out_thumb,
+                        badge_text=badge,
+                        highlight_title=hl_text,
+                        subtitle=ch_name,
+                    )
+                    thumb_path = str(thumb_res)
+                    item["thumbnail_path"] = thumb_path
+                    # Cập nhật ô hiển thị trong bảng
+                    for r, v in enumerate(self.video_items):
+                        if v.get("video_path") == item.get("video_path"):
+                            it_tb = QTableWidgetItem("✔ Đã tạo")
+                            it_tb.setTextAlignment(Qt.AlignCenter)
+                            it_tb.setForeground(Qt.green)
+                            self.video_table.setItem(r, 4, it_tb)
+                            break
+                    self._log(f"🎨 [Tự Động Tạo] Đã tạo Thumbnail Kiếm Hiệp cho [{badge}]: {out_thumb.name}")
+                except Exception as e:
+                    self._log(f"⚠ Không thể tự tạo thumbnail tập {ep_idx}: {e}")
+
             pub_at = schedule_dts[idx] if schedule_dts else None
             tasks.append({
                 "video_path": item["video_path"],
@@ -1467,7 +1524,7 @@ class YouTubeTab(QWidget):
                 "privacy_status": privacy_status,
                 "publish_at": pub_at,
                 "is_premiere": is_premiere,
-                "thumbnail_path": item.get("thumbnail_path"),
+                "thumbnail_path": thumb_path,
                 "playlist_name": pl_name or "",
                 "playlist_id": pl_id,
             })

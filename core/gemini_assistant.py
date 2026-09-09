@@ -25,19 +25,23 @@ def clean_story_title(title: str) -> str:
 
 
 def clean_episode_badge(ep: str, fallback_idx: int = 1) -> str:
-    """Nhận diện chính xác huy hiệu tập: PHẦN 1, TẬP 12A, CHƯƠNG 5..."""
+    """Nhận diện huy hiệu tập ngắn gọn (mặc định dạng P1, P2, P3... theo yêu cầu người dùng)."""
     if not ep:
-        return f"TẬP {fallback_idx}"
-    m = re.search(r"\b(p\d+[a-zA-Z]?|tập\s*\d+|phần\s*\d+|chương\s*\d+)\b", ep, re.IGNORECASE)
+        return f"P{fallback_idx}"
+    m = re.search(r"\b(p\d+[a-zA-Z]?|tập\s*\d+[a-zA-Z]?|phần\s*\d+[a-zA-Z]?|chương\s*\d+[a-zA-Z]?)\b", ep, re.IGNORECASE)
     if m:
         raw = m.group(1).upper()
         if raw.startswith("P") and raw[1:].isalnum():
-            return f"PHẦN {raw[1:]}"
+            return raw
+        # Rút gọn PHẦN 1, TẬP 1, CHƯƠNG 1 -> P1
+        m_num = re.search(r"\d+[a-zA-Z]?", raw)
+        if m_num:
+            return f"P{m_num.group(0)}"
         return re.sub(r"\s+", " ", raw)
-    m_num = re.search(r"\d+", ep)
+    m_num = re.search(r"\d+[a-zA-Z]?", ep)
     if m_num:
-        return f"TẬP {m_num.group(0)}"
-    return f"TẬP {fallback_idx}"
+        return f"P{m_num.group(0)}"
+    return f"P{fallback_idx}"
 
 
 def to_ascii_tag(text: str) -> str:
