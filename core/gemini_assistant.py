@@ -330,7 +330,7 @@ Trả về JSON duy nhất:
   "thumbnail_highlight": "<3-5 chữ nổi bật in hoa>",
   "thumbnail_ai_prompt": "<prompt tiếng Anh>"
 }}"""
-        url = f"{self.base_url}/chat/completions"
+        url = f"{self.base_url}/chat/completions" if self.base_url.endswith("/v1") else f"{self.base_url}/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -339,18 +339,19 @@ Trả về JSON duy nhất:
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
+            "stream": False,
         }
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=25)
+            resp = requests.post(url, headers=headers, json=payload, timeout=35)
             if resp.status_code == 200:
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"].strip()
-                if "`json" in content:
-                    content = content.split("`json", 1)[1].split("`", 1)[0].strip()
-                elif "`" in content:
-                    content = content.split("`", 1)[1].split("`", 1)[0].strip()
+                # Trích xuất khối JSON chuẩn xác
+                m = re.search(r"\{.*\}", content, re.DOTALL)
+                if m:
+                    content = m.group(0)
                 res = json.loads(content)
-                res["provider_used"] = "custom_ai"
+                res["provider_used"] = f"custom_ai ({self.model})"
                 return res
         except Exception:
             pass

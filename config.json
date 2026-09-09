@@ -137,14 +137,20 @@
   },
   "youtube_uploader": {
     "gemini_api_key": "",
-    "gemini_model": "gemini-2.0-flash",
+    "gemini_model": "gemini-2.5-flash",
     "active_channel_id": "UCDSiEMpXssfhsrnxha5VckQ",
     "privacy_status": "schedule",
     "schedule_videos_per_day": 5,
     "schedule_time_slots": "17:00, 23:00",
     "is_premiere": true,
     "default_playlist": "",
-    "category_id": "24"
+    "category_id": "24",
+    "ai_provider": "custom",
+    "custom_api_key": "",
+    "custom_base_url": "https://api.groq.com/openai/v1",
+    "custom_model": "llama-3.3-70b-versatile",
+    "playlist_mode": "existing",
+    "use_playlist": false
   },
   "project": {
     "current_name": "TA LÀ TIÊU SƯ GIỮ QUY CỦ NHẤT THIÊN HẠ_ NHƯNG CŨNG LÀ KẺ TÀN NHẪN NHẤT",

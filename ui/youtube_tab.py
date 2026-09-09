@@ -256,7 +256,7 @@ class ContentWorker(QThread):
                         channel_name=self.channel_name,
                         episode_index=ep_idx,
                     )
-                elif self.provider == "custom":
+                elif self.provider in ["custom", "9router"]:
                     assistant = CustomAIAssistant(self.api_key, self.custom_base_url, self.model)
                     data = assistant.generate_video_metadata(
                         story_title=story_title,
@@ -353,6 +353,23 @@ class UploadWorker(QThread):
                 self.item_finished_sig.emit(idx, False, str(e))
 
         self.all_finished_sig.emit()
+
+
+def detect_9router_api_key() -> str:
+    """Tự động đọc API Key sẵn có từ cơ sở dữ liệu 9Router cục bộ."""
+    try:
+        db_path = Path.home() / "AppData/Roaming/9router/db/data.sqlite"
+        if db_path.exists():
+            import sqlite3
+            with sqlite3.connect(str(db_path)) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT key FROM apiKeys ORDER BY rowid DESC LIMIT 1;")
+                r = cur.fetchone()
+                if r and r[0]:
+                    return r[0]
+    except Exception:
+        pass
+    return ""
 
 
 class YouTubeTab(QWidget):
@@ -488,6 +505,7 @@ class YouTubeTab(QWidget):
         row_provider = QHBoxLayout()
         row_provider.addWidget(QLabel("Công cụ AI:"))
         self.ai_provider_combo = QComboBox()
+        self.ai_provider_combo.addItem("🔄 9Router Gateway (Xoay Model Trên Máy)", "9router")
         self.ai_provider_combo.addItem("⚡ Offline Smart SEO (Miễn phí 100%, Không cần Key)", "offline")
         self.ai_provider_combo.addItem("🌐 Google Gemini API (Free 1500 req/ngày)", "gemini")
         self.ai_provider_combo.addItem("🛠️ Custom Provider / OpenAI Format (Groq, OpenRouter...)", "custom")
@@ -500,6 +518,52 @@ class YouTubeTab(QWidget):
         lay_stack = QVBoxLayout(self.provider_stack)
         lay_stack.setContentsMargins(0, 4, 0, 4)
         lay_stack.setSpacing(4)
+
+        # 0. 9Router Box
+        self.box_9router = QFrame()
+        lay_9r = QVBoxLayout(self.box_9router)
+        lay_9r.setContentsMargins(0, 0, 0, 0)
+        lay_9r.setSpacing(4)
+
+        lbl_9r_info = QLabel("🟢 <b>9Router AI Gateway:</b> Đang kết nối port 20128 trên máy. Hỗ trợ xoay vòng nhiều tài khoản & model dự phòng.")
+        lbl_9r_info.setStyleSheet("color: #4caf50; font-size: 11px;")
+        lay_9r.addWidget(lbl_9r_info)
+
+        row_9r_cfg = QHBoxLayout()
+        row_9r_cfg.addWidget(QLabel("Base URL:"))
+        self.nine_url_edit = QLineEdit("http://localhost:20128/v1")
+        self.nine_url_edit.textChanged.connect(self._save_ui_settings)
+        row_9r_cfg.addWidget(self.nine_url_edit, 1)
+
+        row_9r_cfg.addWidget(QLabel("API Key:"))
+        self.nine_key_edit = QLineEdit(detect_9router_api_key())
+        self.nine_key_edit.setEchoMode(QLineEdit.Password)
+        self.nine_key_edit.textChanged.connect(self._save_ui_settings)
+        row_9r_cfg.addWidget(self.nine_key_edit, 1)
+        lay_9r.addLayout(row_9r_cfg)
+
+        row_9r_model = QHBoxLayout()
+        row_9r_model.addWidget(QLabel("Model:"))
+        self.nine_model_combo = QComboBox()
+        self.nine_model_combo.setEditable(True)
+        self.nine_model_combo.addItems([
+            "ag/gemini-3.8-flash-high",
+            "ag/gemini-3.8-flash-medium",
+            "ag/gemini-3.7-flash-high",
+            "ag/gemini-3.7-flash-medium",
+            "ag/gemini-3.6-flash-high",
+            "ag/claude-sonnet-4-6",
+            "ag/gpt-oss-120b-medium",
+        ])
+        self.nine_model_combo.currentIndexChanged.connect(self._save_ui_settings)
+        row_9r_model.addWidget(self.nine_model_combo, 1)
+
+        self.btn_refresh_9r_models = QPushButton("🔄 Lấy DS Model")
+        self.btn_refresh_9r_models.setToolTip("Lấy toàn bộ danh sách model đang cấu hình trong 9Router")
+        self.btn_refresh_9r_models.clicked.connect(self._fetch_9router_models)
+        row_9r_model.addWidget(self.btn_refresh_9r_models)
+        lay_9r.addLayout(row_9r_model)
+        lay_stack.addWidget(self.box_9router)
 
         # 1. Offline Info
         self.box_offline = QFrame()
@@ -800,9 +864,32 @@ class YouTubeTab(QWidget):
 
     def _update_provider_visibility(self) -> None:
         mode = self.ai_provider_combo.currentData()
+        self.box_9router.setVisible(mode == "9router")
         self.box_offline.setVisible(mode == "offline")
         self.box_gemini.setVisible(mode == "gemini")
         self.box_custom.setVisible(mode == "custom")
+
+    def _fetch_9router_models(self) -> None:
+        url = self.nine_url_edit.text().strip().rstrip("/")
+        if not url.endswith("/v1"):
+            url += "/v1"
+        try:
+            import requests
+            r = requests.get(f"{url}/models", timeout=5)
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                models = [m.get("id") for m in data if m.get("id")]
+                if models:
+                    cur = self.nine_model_combo.currentText()
+                    self.nine_model_combo.clear()
+                    self.nine_model_combo.addItems(models)
+                    idx = self.nine_model_combo.findText(cur)
+                    if idx >= 0:
+                        self.nine_model_combo.setCurrentIndex(idx)
+                    QMessageBox.information(self, "Thành công", f"Đã nạp {len(models)} model từ 9Router!")
+                    return
+        except Exception as e:
+            QMessageBox.warning(self, "Lỗi kết nối 9Router", f"Không thể lấy model từ 9Router:\n{e}\nHãy chắc chắn 9Router đang chạy tại {url}")
 
     def _on_playlist_chk_toggled(self, checked: bool) -> None:
         self.pl_options_widget.setEnabled(checked)
@@ -1129,6 +1216,12 @@ class YouTubeTab(QWidget):
                     self, "Thiếu Gemini API Key",
                     "Vui lòng nhập Gemini API Key từ Google AI Studio (bấm 'Lấy Key Free') hoặc chuyển sang chế độ 'Offline Smart SEO' để dùng miễn phí không cần Key."
                 )
+        elif provider == "9router":
+            api_key = self.nine_key_edit.text().strip()
+            custom_url = self.nine_url_edit.text().strip()
+            model = self.nine_model_combo.currentText().strip()
+            if not api_key:
+                QMessageBox.warning(self, "Thiếu API Key", "Vui lòng nhập API Key từ 9Router.")
                 return
         elif provider == "custom":
             api_key = self.custom_key_edit.text().strip()
@@ -1424,6 +1517,9 @@ class YouTubeTab(QWidget):
     def _save_ui_settings(self) -> None:
         yt_cfg = self.settings.setdefault("youtube_uploader", {})
         yt_cfg["ai_provider"] = self.ai_provider_combo.currentData() or "offline"
+        yt_cfg["9router_base_url"] = self.nine_url_edit.text().strip()
+        yt_cfg["9router_api_key"] = self.nine_key_edit.text().strip()
+        yt_cfg["9router_model"] = self.nine_model_combo.currentText().strip()
         yt_cfg["gemini_api_key"] = self.gemini_key_edit.text().strip()
         yt_cfg["gemini_model"] = self.gemini_model_combo.currentText().strip()
         yt_cfg["custom_base_url"] = self.custom_url_edit.text().strip()
@@ -1441,10 +1537,21 @@ class YouTubeTab(QWidget):
         self.settings = settings
         yt_cfg = settings.get("youtube_uploader", {}) or {}
 
-        provider = yt_cfg.get("ai_provider", "offline")
+        provider = yt_cfg.get("ai_provider", "9router")
         idx_p = self.ai_provider_combo.findData(provider)
         if idx_p >= 0:
             self.ai_provider_combo.setCurrentIndex(idx_p)
+
+        if yt_cfg.get("9router_base_url"):
+            self.nine_url_edit.setText(yt_cfg.get("9router_base_url"))
+        if yt_cfg.get("9router_api_key"):
+            self.nine_key_edit.setText(yt_cfg.get("9router_api_key"))
+        if yt_cfg.get("9router_model"):
+            m_idx = self.nine_model_combo.findText(yt_cfg.get("9router_model"))
+            if m_idx >= 0:
+                self.nine_model_combo.setCurrentIndex(m_idx)
+            else:
+                self.nine_model_combo.setEditText(yt_cfg.get("9router_model"))
 
         if yt_cfg.get("gemini_api_key"):
             self.gemini_key_edit.setText(yt_cfg.get("gemini_api_key"))
