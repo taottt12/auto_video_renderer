@@ -12,6 +12,7 @@ from core.settings import SettingsManager, PROJECTS_DIR
 from .crawler_tab import CrawlerTab
 from .setting_tab import SettingTab
 from .render_tab import RenderTab
+from .youtube_tab import YouTubeTab
 
 
 class ProjectDialog(QDialog):
@@ -116,10 +117,12 @@ class MainWindow(QMainWindow):
         self.crawler_tab = CrawlerTab(self.settings)
         self.setting_tab = SettingTab(self.settings)
         self.render_tab = RenderTab(self.settings)
+        self.youtube_tab = YouTubeTab(self.settings)
 
         self.tabs.addTab(self.crawler_tab, "Cào MP3")
         self.tabs.addTab(self.setting_tab, "Setting")
         self.tabs.addTab(self.render_tab, "Render")
+        self.tabs.addTab(self.youtube_tab, "Đăng YouTube")
         self.setCentralWidget(self.tabs)
 
         # Kết nối sự kiện giữa các tab
@@ -129,6 +132,7 @@ class MainWindow(QMainWindow):
 
         self.setting_tab.settings_changed.connect(self.on_settings_changed)
         self.render_tab.settings_changed.connect(self.on_settings_changed)
+        self.youtube_tab.settings_changed.connect(self.on_settings_changed)
 
         self.render_tab.project_requested.connect(self.open_project_dialog)
         self.render_tab.render_lock_changed.connect(self.setting_tab.set_locked)
@@ -138,6 +142,7 @@ class MainWindow(QMainWindow):
         self.settings.update(settings)
         self.settings_manager.save(self.settings)
         self.render_tab.update_settings(self.settings)
+        self.youtube_tab.load_settings(self.settings)
 
     def open_project_dialog(self) -> None:
         dlg = ProjectDialog(self, self.settings)
@@ -150,6 +155,7 @@ class MainWindow(QMainWindow):
                 self.settings["project"]["current_path"] = str(dlg.selected_path)
                 SettingsManager.save_project(dlg.selected_path, self.settings)
                 self.settings_manager.save(self.settings)
+                self.youtube_tab.refresh_projects()
                 QMessageBox.information(self, "Đã lưu", f"Đã lưu dự án:\n{dlg.selected_path.name}")
             elif dlg.action == "open":
                 self.settings = SettingsManager.load_project(dlg.selected_path)
@@ -160,6 +166,8 @@ class MainWindow(QMainWindow):
                 self.crawler_tab.load_settings(self.settings)
                 self.setting_tab.load_settings(self.settings)
                 self.render_tab.load_settings(self.settings)
+                self.youtube_tab.load_settings(self.settings)
+                self.youtube_tab.refresh_projects()
                 QMessageBox.information(self, "Đã mở", f"Đã mở dự án:\n{dlg.selected_path.name}")
         except Exception as exc:
             QMessageBox.critical(self, "Lỗi", f"Không xử lý được dự án: {exc}")

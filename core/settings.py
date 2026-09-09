@@ -106,6 +106,17 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "format": "mp4",
         "output_folder": "output",
     },
+    "youtube_uploader": {
+        "gemini_api_key": "",
+        "gemini_model": "gemini-2.0-flash",
+        "active_channel_id": "",
+        "privacy_status": "schedule",
+        "schedule_videos_per_day": 2,
+        "schedule_time_slots": "11:30, 19:30",
+        "is_premiere": False,
+        "default_playlist": "",
+        "category_id": "24",
+    },
     "project": {
         "current_name": "",
         "current_path": "",
