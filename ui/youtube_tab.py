@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import datetime
 import os
@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit,
     QPushButton, QComboBox, QSpinBox, QDateEdit, QCheckBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox, QProgressBar,
-    QGroupBox, QSplitter, QFrame
+    QGroupBox, QSplitter, QFrame, QDialog, QTabWidget
 )
 
 from core.gemini_assistant import GeminiAssistant
@@ -22,17 +22,110 @@ from core.youtube_auth import YouTubeAuthManager
 from core.youtube_uploader import YouTubeUploader
 
 
+class AddChannelKeyDialog(QDialog):
+    """Hộp thoại nhập Client ID & Secret hoặc dán JSON để kết nối kênh YouTube."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Thêm Kênh YouTube (Nhập OAuth Key)")
+        self.resize(520, 360)
+        self.client_id = ""
+        self.client_secret = ""
+        self.raw_json = ""
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        info_lbl = QLabel(
+            "Nhập thông tin OAuth 2.0 từ Google Cloud Console.\n"
+            "Hệ thống sẽ tự động lưu cấu hình cho kênh vào file client_secret.json trong thư mục tokens/."
+        )
+        info_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
+        layout.addWidget(info_lbl)
+
+        self.tab_type = QTabWidget()
+
+        # Tab 1: Nhập Client ID & Client Secret
+        tab_keys = QWidget()
+        lay_keys = QVBoxLayout(tab_keys)
+        lay_keys.setSpacing(8)
+
+        lay_keys.addWidget(QLabel("Client ID:"))
+        self.cid_edit = QLineEdit()
+        self.cid_edit.setPlaceholderText("Ví dụ: 123456789-abcdef.apps.googleusercontent.com")
+        lay_keys.addWidget(self.cid_edit)
+
+        lay_keys.addWidget(QLabel("Client Secret:"))
+        self.csec_edit = QLineEdit()
+        self.csec_edit.setEchoMode(QLineEdit.Password)
+        self.csec_edit.setPlaceholderText("Ví dụ: GOCSPX-abcdef123456")
+        lay_keys.addWidget(self.csec_edit)
+        lay_keys.addStretch(1)
+
+        self.tab_type.addTab(tab_keys, "Nhập Client ID & Secret")
+
+        # Tab 2: Dán nội dung JSON
+        tab_json = QWidget()
+        lay_json = QVBoxLayout(tab_json)
+        lay_json.addWidget(QLabel("Dán toàn bộ nội dung file client_secret JSON (nếu có):"))
+        self.json_edit = QTextEdit()
+        self.json_edit.setPlaceholderText('{\n  "installed": {\n    "client_id": "...",\n    "client_secret": "..."\n  }\n}')
+        lay_json.addWidget(self.json_edit)
+        self.tab_type.addTab(tab_json, "Dán JSON")
+
+        layout.addWidget(self.tab_type)
+
+        btn_box = QHBoxLayout()
+        self.ok_btn = QPushButton("🚀 Bắt đầu Đăng nhập")
+        self.ok_btn.setStyleSheet("font-weight: bold; background-color: #2e7d32; color: white; padding: 6px 16px;")
+        self.ok_btn.clicked.connect(self._on_submit)
+        self.cancel_btn = QPushButton("Hủy")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_box.addStretch(1)
+        btn_box.addWidget(self.ok_btn)
+        btn_box.addWidget(self.cancel_btn)
+        layout.addLayout(btn_box)
+
+    def _on_submit(self) -> None:
+        if self.tab_type.currentIndex() == 0:
+            self.client_id = self.cid_edit.text().strip()
+            self.client_secret = self.csec_edit.text().strip()
+            if not self.client_id or not self.client_secret:
+                QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng nhập đầy đủ Client ID và Client Secret.")
+                return
+        else:
+            self.raw_json = self.json_edit.toPlainText().strip()
+            if not self.raw_json:
+                QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng dán nội dung JSON vào ô.")
+                return
+        self.accept()
+
+
 class OAuthWorker(QThread):
     finished_auth = Signal(bool, str, dict)
 
-    def __init__(self, auth_mgr: YouTubeAuthManager, client_secrets: str) -> None:
+    def __init__(
+        self,
+        auth_mgr: YouTubeAuthManager,
+        client_id: str = "",
+        client_secret: str = "",
+        raw_json: str = "",
+    ) -> None:
         super().__init__()
         self.auth_mgr = auth_mgr
-        self.client_secrets = client_secrets
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.raw_json = raw_json
 
     def run(self) -> None:
         try:
-            ch_info = self.auth_mgr.add_channel_oauth(self.client_secrets)
+            ch_info = self.auth_mgr.add_channel_by_keys(
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                raw_json_str=self.raw_json,
+            )
             self.finished_auth.emit(True, f"Đăng nhập thành công kênh: {ch_info.get('title')}", ch_info)
         except Exception as e:
             self.finished_auth.emit(False, str(e), {})
@@ -441,20 +534,20 @@ class YouTubeTab(QWidget):
             self._reload_playlists()
 
     def _add_channel(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Chọn file client_secret.json tải từ Google Cloud Console",
-            "",
-            "JSON Files (*.json)"
-        )
-        if not file_path:
+        dlg = AddChannelKeyDialog(self)
+        if dlg.exec() != QDialog.Accepted:
             return
 
         self.add_ch_btn.setEnabled(False)
         self.add_ch_btn.setText("Đang mở web...")
         self.ch_info_label.setText("Đang mở trình duyệt xác thực Google OAuth 2.0...")
 
-        self._oauth_worker = OAuthWorker(self.auth_mgr, file_path)
+        self._oauth_worker = OAuthWorker(
+            self.auth_mgr,
+            client_id=dlg.client_id,
+            client_secret=dlg.client_secret,
+            raw_json=dlg.raw_json,
+        )
         self._oauth_worker.finished_auth.connect(self._on_oauth_finished)
         self._oauth_worker.start()
 
@@ -487,7 +580,19 @@ class YouTubeTab(QWidget):
 
     def _on_project_selected(self) -> None:
         proj_path_str = self.proj_combo.currentData()
-        output_dir = Path(self.settings.get("export", {}).get("output_folder", "output"))
+        output_dir = None
+
+        if proj_path_str and Path(proj_path_str).exists():
+            try:
+                p_cfg = SettingsManager.load_project(Path(proj_path_str))
+                out_str = p_cfg.get("export", {}).get("output_folder") or p_cfg.get("project", {}).get("output_folder")
+                if out_str:
+                    output_dir = Path(out_str)
+            except Exception:
+                pass
+
+        if not output_dir:
+            output_dir = Path(self.settings.get("export", {}).get("output_folder", "output"))
 
         # Nếu đường dẫn output tương đối, chuyển thành tuyệt đối
         if not output_dir.is_absolute():

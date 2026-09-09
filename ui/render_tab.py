@@ -412,6 +412,12 @@ class RenderTab(QWidget):
         self.stop_btn = QPushButton("⏹ Dừng")
         self.stop_btn.setStyleSheet("font-weight: bold; padding: 6px 14px;")
         self.project_btn = QPushButton("📁 Dự án")
+        self.change_out_btn = QPushButton("📂 Đổi thư mục xuất")
+        self.change_out_btn.clicked.connect(self._change_output_folder)
+        self.project_info_label = QLabel("Dự án: Chưa lưu")
+        self.project_info_label.setStyleSheet("color: #2e7d32; font-weight: bold; font-size: 11px;")
+        self.out_info_label = QLabel("")
+        self.out_info_label.setStyleSheet("color: #777; font-size: 11px;")
         self.remove_btn = QPushButton("Xóa dòng trong queue")
         self.clear_btn = QPushButton("Xóa tất cả queue")
 
@@ -424,7 +430,10 @@ class RenderTab(QWidget):
         buttons.addWidget(self.run_btn)
         buttons.addWidget(self.stop_btn)
         buttons.addWidget(self.project_btn)
-        buttons.addSpacing(20)
+        buttons.addWidget(self.change_out_btn)
+        buttons.addWidget(self.project_info_label)
+        buttons.addWidget(self.out_info_label)
+        buttons.addSpacing(15)
         buttons.addWidget(self.remove_btn)
         buttons.addWidget(self.clear_btn)
         buttons.addStretch(1)
@@ -745,10 +754,29 @@ class RenderTab(QWidget):
     @Slot(dict)
     def update_settings(self, settings: Dict[str, Any]) -> None:
         self.settings.update(settings)
+        self._update_project_labels()
+
+    def _change_output_folder(self) -> None:
+        current = self.settings.get("export", {}).get("output_folder", "") or self.settings.get("project", {}).get("output_folder", "")
+        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục xuất video", current)
+        if folder:
+            self.settings.setdefault("export", {})["output_folder"] = folder
+            self.settings.setdefault("project", {})["output_folder"] = folder
+            self._update_project_labels()
+            self.settings_changed.emit(self.settings)
+
+    def _update_project_labels(self) -> None:
+        p_name = self.settings.get("project", {}).get("current_name") or "Chưa lưu"
+        self.project_info_label.setText(f"Dự án: {p_name}")
+        out = self.settings.get("export", {}).get("output_folder") or "output"
+        disp = out if len(out) <= 35 else f"...{out[-30:]}"
+        self.out_info_label.setText(f"Xuất: {disp}")
+        self.out_info_label.setToolTip(f"Thư mục xuất video: {out}")
 
     def load_settings(self, settings: Dict[str, Any]) -> None:
         self._lock_sync = True
         self.settings = settings
+        self._update_project_labels()
 
         self.audio_list.clear()
         self.media_list.clear()

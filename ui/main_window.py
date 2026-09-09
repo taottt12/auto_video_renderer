@@ -39,7 +39,20 @@ class ProjectDialog(QDialog):
         name_row.addWidget(self.name_edit)
         root.addLayout(name_row)
 
+        out_row = QHBoxLayout()
+        self.output_edit = QLineEdit()
+        current_out = self.settings.get("export", {}).get("output_folder", "") or self.settings.get("project", {}).get("output_folder", "")
+        self.output_edit.setText(current_out)
+        self.output_edit.setPlaceholderText("Chọn thư mục lưu video render của dự án...")
+        self.choose_output_btn = QPushButton("Chọn thư mục...")
+        self.choose_output_btn.clicked.connect(self._choose_output_folder)
+        out_row.addWidget(QLabel("Thư mục xuất video:"))
+        out_row.addWidget(self.output_edit, 1)
+        out_row.addWidget(self.choose_output_btn)
+        root.addLayout(out_row)
+
         self.project_list = QListWidget()
+        self.project_list.itemClicked.connect(self._on_item_clicked)
         root.addWidget(self.project_list)
 
         buttons = QHBoxLayout()
@@ -58,6 +71,26 @@ class ProjectDialog(QDialog):
         self.import_btn.clicked.connect(self.import_action)
         self.close_btn.clicked.connect(self.reject)
 
+    def _choose_output_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục xuất video của dự án", self.output_edit.text().strip())
+        if folder:
+            self.output_edit.setText(folder)
+
+    def _on_item_clicked(self, item) -> None:
+        if not item:
+            return
+        p_path = PROJECTS_DIR / item.text()
+        if p_path.exists():
+            try:
+                cfg = SettingsManager.load_project(p_path)
+                p_name = cfg.get("project", {}).get("current_name", item.text().replace(".avr.json", "").replace(".json", ""))
+                p_out = cfg.get("export", {}).get("output_folder") or cfg.get("project", {}).get("output_folder", "")
+                self.name_edit.setText(p_name)
+                if p_out:
+                    self.output_edit.setText(p_out)
+            except Exception:
+                pass
+
     def refresh(self) -> None:
         self.project_list.clear()
         for path in SettingsManager.list_projects():
@@ -74,7 +107,14 @@ class ProjectDialog(QDialog):
         if not name:
             QMessageBox.warning(self, "Thiếu tên", "Hãy nhập tên dự án trước khi lưu.")
             return
+        out_folder = self.output_edit.text().strip()
+        if out_folder:
+            self.settings.setdefault("export", {})["output_folder"] = out_folder
+            self.settings.setdefault("project", {})["output_folder"] = out_folder
+        self.settings.setdefault("project", {})["current_name"] = name
         self.selected_path = SettingsManager.project_path(name)
+        self.settings["project"]["current_path"] = str(self.selected_path)
+        SettingsManager.save_project(self.selected_path, self.settings)
         self.action = "save"
         self.accept()
 
@@ -153,8 +193,14 @@ class MainWindow(QMainWindow):
                 self.settings.setdefault("project", {})
                 self.settings["project"]["current_name"] = dlg.selected_path.stem.replace(".avr", "")
                 self.settings["project"]["current_path"] = str(dlg.selected_path)
+                out_folder = dlg.output_edit.text().strip()
+                if out_folder:
+                    self.settings.setdefault("export", {})["output_folder"] = out_folder
+                    self.settings["project"]["output_folder"] = out_folder
                 SettingsManager.save_project(dlg.selected_path, self.settings)
                 self.settings_manager.save(self.settings)
+                self.render_tab.update_settings(self.settings)
+                self.youtube_tab.load_settings(self.settings)
                 self.youtube_tab.refresh_projects()
                 QMessageBox.information(self, "Đã lưu", f"Đã lưu dự án:\n{dlg.selected_path.name}")
             elif dlg.action == "open":

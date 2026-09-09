@@ -7,9 +7,9 @@
     "platform": "youtube",
     "save_folder": "E:\\YT\\output-test",
     "auto_add_to_audio_list": true,
-    "mode": "video",
+    "mode": "playlist",
     "video_urls": "https://www.youtube.com/watch?v=6SU6_mQTdmc",
-    "playlist_url": "https://www.youtube.com/watch?v=Cjhnlw8wU2I&list=PLcS_tNqCfrqF72ARQaU8wXYBqVuiA1rLU&index=1",
+    "playlist_url": "https://www.youtube.com/watch?v=s5__TzlIYyE&list=PLDX1xlIWIede5rNN1krO7t0Bolexhvv10&index=1",
     "playlist_limit": 20,
     "channel_url": "",
     "channel_limit": 50,
@@ -109,6 +109,17 @@
     "quality": "standard",
     "format": "mp4",
     "output_folder": "E:/YT/mp4/output/v2/v2-1"
+  },
+  "youtube_uploader": {
+    "gemini_api_key": "",
+    "gemini_model": "gemini-2.0-flash",
+    "active_channel_id": "",
+    "privacy_status": "schedule",
+    "schedule_videos_per_day": 2,
+    "schedule_time_slots": "11:30, 19:30",
+    "is_premiere": false,
+    "default_playlist": "",
+    "category_id": "24"
   },
   "project": {
     "current_name": "",

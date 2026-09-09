@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -92,6 +92,81 @@ class YouTubeAuthManager:
             "custom_url": custom_url,
             "avatar_url": avatar_url,
             "client_secrets_path": str(cs_path.resolve()),
+            "token_path": str(token_file.resolve()),
+        }
+
+        reg = self._load_registry()
+        reg[channel_id] = channel_info
+        self._save_registry(reg)
+
+        return channel_info
+
+    def add_channel_by_keys(
+        self,
+        client_id: str,
+        client_secret: str,
+        raw_json_str: str = "",
+        port: int = 0
+    ) -> Dict[str, Any]:
+        """Tạo client_secret từ Client ID và Secret (hoặc dán JSON) và đăng nhập OAuth không cần nạp file."""
+        if raw_json_str.strip():
+            try:
+                client_config = json.loads(raw_json_str.strip())
+            except Exception as e:
+                raise ValueError(f"Nội dung JSON không hợp lệ: {e}")
+        else:
+            cid = client_id.strip()
+            csec = client_secret.strip()
+            if not cid or not csec:
+                raise ValueError("Vui lòng nhập đầy đủ Client ID và Client Secret!")
+            client_config = {
+                "installed": {
+                    "client_id": cid,
+                    "client_secret": csec,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                    "redirect_uris": ["http://localhost"]
+                }
+            }
+
+        flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+        creds = flow.run_local_server(port=port, prompt="consent", access_type="offline")
+
+        youtube = build("youtube", "v3", credentials=creds)
+        resp = youtube.channels().list(part="snippet,contentDetails", mine=True).execute()
+
+        items = resp.get("items", [])
+        if not items:
+            raise RuntimeError("Tài khoản Google này chưa có kênh YouTube nào được tạo!")
+
+        channel_item = items[0]
+        channel_id = channel_item["id"]
+        snippet = channel_item.get("snippet", {})
+        title = snippet.get("title", "Kênh không tên")
+        custom_url = snippet.get("customUrl", "")
+        thumbnails = snippet.get("thumbnails", {})
+        avatar_url = (
+            thumbnails.get("default", {}).get("url")
+            or thumbnails.get("medium", {}).get("url")
+            or ""
+        )
+
+        # Lưu client_secret.json riêng theo từng kênh vào thư mục tokens
+        cs_file = TOKENS_DIR / f"client_secret_{channel_id}.json"
+        with open(cs_file, "w", encoding="utf-8") as f:
+            json.dump(client_config, f, ensure_ascii=False, indent=2)
+
+        token_file = TOKENS_DIR / f"channel_{channel_id}.json"
+        with open(token_file, "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+
+        channel_info: Dict[str, Any] = {
+            "channel_id": channel_id,
+            "title": title,
+            "custom_url": custom_url,
+            "avatar_url": avatar_url,
+            "client_secrets_path": str(cs_file.resolve()),
             "token_path": str(token_file.resolve()),
         }
 

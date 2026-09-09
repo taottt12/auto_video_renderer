@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import datetime
 import os
@@ -24,18 +24,27 @@ class YouTubeUploader:
         return self.auth_manager.get_service(channel_id)
 
     def list_playlists(self, channel_id: str) -> List[Dict[str, str]]:
-        """Lấy danh sách playlist của kênh."""
+        """Lấy toàn bộ danh sách playlist của kênh (hỗ trợ phân trang không giới hạn)."""
+        playlists: List[Dict[str, str]] = []
         try:
             youtube = self.get_service(channel_id)
-            resp = youtube.playlists().list(
+            request = youtube.playlists().list(
                 part="snippet",
                 mine=True,
                 maxResults=50
-            ).execute()
-            items = resp.get("items", [])
-            return [{"id": item["id"], "title": item["snippet"]["title"]} for item in items]
-        except Exception:
-            return []
+            )
+            while request:
+                resp = request.execute()
+                for item in resp.get("items", []):
+                    title = item.get("snippet", {}).get("title", "")
+                    pl_id = item.get("id", "")
+                    if pl_id and title:
+                        playlists.append({"id": pl_id, "title": title})
+                request = youtube.playlists().list_next(request, resp)
+            return playlists
+        except Exception as e:
+            print(f"Lỗi lấy toàn bộ playlist: {e}")
+            return playlists
 
     def ensure_playlist(self, channel_id: str, playlist_title: str) -> str:
         """Kiểm tra playlist đã có chưa, nếu chưa thì tạo mới."""

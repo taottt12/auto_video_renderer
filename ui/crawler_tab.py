@@ -623,47 +623,52 @@ class CrawlerTab(QWidget):
         self._update_selected_count()
 
     def _remove_selected_scanned_items(self) -> None:
-        """Xóa các video được chọn (hoặc được highlight) khỏi bảng danh sách đã quét."""
+        """Xóa các video được tích chọn (hoặc được highlight) khỏi bảng danh sách đã quét."""
         total = self.preview_table.rowCount()
         if total == 0:
             return
 
-        # Kiểm tra xem có dòng nào được highlight bằng chuột không
-        selected_rows = sorted({idx.row() for idx in self.preview_table.selectionModel().selectedRows()}, reverse=True)
+        # 1. Ưu tiên cao nhất: Tìm tất cả các dòng ĐÃ TÍCH CHỌN checkbox (Qt.Checked)
+        checked_rows = []
+        for r in range(total):
+            item = self.preview_table.item(r, 0)
+            if item and item.checkState() == Qt.Checked:
+                checked_rows.append(r)
 
-        # Nếu không có dòng nào được highlight bằng chuột, tìm các dòng có checkState == Checked
-        if not selected_rows:
-            selected_rows = []
-            for r in range(total - 1, -1, -1):
-                item = self.preview_table.item(r, 0)
-                if item and item.checkState() == Qt.Checked:
-                    selected_rows.append(r)
+        # 2. Nếu có dòng tích chọn checkbox, dùng danh sách này. Nếu không, mới lấy dòng đang bôi đen bằng chuột
+        if checked_rows:
+            rows_to_delete = checked_rows
+        else:
+            rows_to_delete = list({idx.row() for idx in self.preview_table.selectionModel().selectedRows()})
 
-        if not selected_rows:
-            QMessageBox.information(self, "Chưa chọn dòng", "Vui lòng tích chọn hoặc bôi đen dòng cần xóa khỏi danh sách.")
+        if not rows_to_delete:
+            QMessageBox.information(self, "Chưa chọn dòng", "Vui lòng tích chọn các video cần xóa khỏi danh sách.")
             return
 
         self._lock_table_event = True
-        for r in sorted(selected_rows, reverse=True):
-            if 0 <= r < len(self._scanned_videos):
-                self._scanned_videos.pop(r)
-            self.preview_table.removeRow(r)
+        try:
+            # Xóa từ dưới lên để không bị lệch chỉ số index
+            for r in sorted(rows_to_delete, reverse=True):
+                if 0 <= r < len(self._scanned_videos):
+                    self._scanned_videos.pop(r)
+                self.preview_table.removeRow(r)
 
-        # Cập nhật lại số thứ tự Tập 1, Tập 2,...
-        new_total = self.preview_table.rowCount()
-        for r in range(new_total):
-            item = self.preview_table.item(r, 0)
-            if item:
-                item.setText(f"Tập {r + 1}")
+            # Cập nhật lại số thứ tự Tập 1, Tập 2,...
+            new_total = self.preview_table.rowCount()
+            for r in range(new_total):
+                item = self.preview_table.item(r, 0)
+                if item:
+                    item.setText(f"Tập {r + 1}")
 
-        self.range_from_spin.setRange(1, max(1, new_total))
-        self.range_to_spin.setRange(1, max(1, new_total))
-        self.range_from_spin.setValue(1)
-        self.range_to_spin.setValue(max(1, new_total))
+            self.range_from_spin.setRange(1, max(1, new_total))
+            self.range_to_spin.setRange(1, max(1, new_total))
+            self.range_from_spin.setValue(1)
+            self.range_to_spin.setValue(max(1, new_total))
+        finally:
+            self._lock_table_event = False
 
-        self._lock_table_event = False
         self._update_selected_count()
-        self.scan_status_label.setText(f"Còn lại {new_total} video trong danh sách.")
+        self.scan_status_label.setText(f"Còn lại {self.preview_table.rowCount()} video trong danh sách.")
 
     def _clear_scanned_items(self) -> None:
         """Xóa toàn bộ danh sách đã quét."""
