@@ -29,10 +29,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube.readonly",
 ]
 
+DEFAULT_OAUTH_PORT = 8918
+
 
 def run_flow_server(
     flow: InstalledAppFlow,
-    port: int = 8080,
+    port: int = DEFAULT_OAUTH_PORT,
     timeout_seconds: int = 180,
     cancel_check_fn: Optional[Callable[[], bool]] = None,
     success_message: str = "Đăng nhập YouTube thành công! Bạn có thể đóng tab này và quay lại ứng dụng."
@@ -41,11 +43,11 @@ def run_flow_server(
     wsgi_app = _RedirectWSGIApp(success_message)
     local_server = None
 
-    # Thử bind port được chỉ định trước (mặc định 8080), nếu kẹt thì thử các port kế tiếp hoặc 0
+    # Thử bind port được chỉ định trước (mặc định 8918 - ít bị xung đột cổng hơn 8080)
     candidate_ports = [port]
-    if port != 8080:
-        candidate_ports.append(8080)
-    candidate_ports.extend([8081, 8082, 0])
+    if port != DEFAULT_OAUTH_PORT:
+        candidate_ports.append(DEFAULT_OAUTH_PORT)
+    candidate_ports.extend([8919, 8920, 8080, 0])
 
     for p in candidate_ports:
         try:
@@ -129,7 +131,7 @@ class YouTubeAuthManager:
     def add_channel_oauth(
         self,
         client_secrets_file: str | Path,
-        port: int = 8080,
+        port: int = DEFAULT_OAUTH_PORT,
         cancel_check_fn: Optional[Callable[[], bool]] = None,
         timeout_seconds: int = 180,
     ) -> Dict[str, Any]:
@@ -190,7 +192,7 @@ class YouTubeAuthManager:
         client_id: str,
         client_secret: str,
         raw_json_str: str = "",
-        port: int = 8080,
+        port: int = DEFAULT_OAUTH_PORT,
         cancel_check_fn: Optional[Callable[[], bool]] = None,
         timeout_seconds: int = 180,
     ) -> Dict[str, Any]:
@@ -228,6 +230,8 @@ class YouTubeAuthManager:
                         f"http://localhost:{port}/",
                         f"http://127.0.0.1:{port}/",
                         "http://localhost",
+                        "http://localhost:8918/",
+                        "http://localhost:8918",
                         "http://localhost:8080/",
                         "http://localhost:8080"
                     ]

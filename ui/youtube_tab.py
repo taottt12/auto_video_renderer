@@ -33,7 +33,7 @@ class AddChannelKeyDialog(QDialog):
         self.client_id = ""
         self.client_secret = ""
         self.raw_json = ""
-        self.port = 8080
+        self.port = 8918
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -66,7 +66,7 @@ class AddChannelKeyDialog(QDialog):
 
         # Hàng hiển thị Redirect URI + Nút Copy + Cổng Port
         row_uri = QHBoxLayout()
-        self.uri_display = QLineEdit("http://localhost:8080/")
+        self.uri_display = QLineEdit("http://localhost:8918/")
         self.uri_display.setReadOnly(True)
         self.uri_display.setStyleSheet("background-color: #161b22; color: #58a6ff; font-weight: bold; font-family: Consolas;")
         row_uri.addWidget(self.uri_display, 1)
@@ -82,7 +82,7 @@ class AddChannelKeyDialog(QDialog):
 
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1024, 65535)
-        self.port_spin.setValue(8080)
+        self.port_spin.setValue(8918)
         self.port_spin.setStyleSheet("background-color: #161b22; color: #58a6ff; font-weight: bold; padding: 2px;")
         self.port_spin.valueChanged.connect(self._on_port_changed)
         row_uri.addWidget(self.port_spin)
@@ -178,7 +178,7 @@ class OAuthWorker(QThread):
         client_id: str = "",
         client_secret: str = "",
         raw_json: str = "",
-        port: int = 8080,
+        port: int = 8918,
     ) -> None:
         super().__init__()
         self.auth_mgr = auth_mgr
