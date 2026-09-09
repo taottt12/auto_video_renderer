@@ -133,16 +133,16 @@
     "fps": 45,
     "quality": "standard",
     "format": "mp4",
-    "output_folder": "E:/YT/mp4/output/v2/v2-1"
+    "output_folder": "E:/YT/mp4/gadaotac/ta-la-tieu-su-giu-quy-cu-nhat-thien-ha-nhung-cung-la-ke-tan-nhan-nhat"
   },
   "youtube_uploader": {
     "gemini_api_key": "",
     "gemini_model": "gemini-2.0-flash",
-    "active_channel_id": "",
+    "active_channel_id": "UCDSiEMpXssfhsrnxha5VckQ",
     "privacy_status": "schedule",
-    "schedule_videos_per_day": 2,
-    "schedule_time_slots": "11:30, 19:30",
-    "is_premiere": false,
+    "schedule_videos_per_day": 5,
+    "schedule_time_slots": "17:00, 23:00",
+    "is_premiere": true,
     "default_playlist": "",
     "category_id": "24"
   },

@@ -158,6 +158,7 @@ class YouTubeUploader:
         category_id: str = "24",
         thumbnail_path: Optional[str | Path] = None,
         playlist_name: str = "",
+        playlist_id: Optional[str] = None,
         progress_cb: Optional[ProgressCallback] = None,
     ) -> Dict[str, Any]:
         """Tải video lên YouTube bằng giao thức Resumable Upload và cấu hình đầy đủ."""
@@ -237,14 +238,21 @@ class YouTubeUploader:
                 progress_cb(98, "Đang tải ảnh thumbnail...", 0.0)
             self.set_thumbnail(channel_id, video_id, thumbnail_path)
 
-        # 2. Thêm vào playlist nếu có
-        if playlist_name.strip():
+        # 2. Thêm vào playlist nếu người dùng có chọn hoặc tạo mới
+        target_pl_id = (playlist_id or "").strip()
+        if not target_pl_id and playlist_name.strip():
             if progress_cb:
-                progress_cb(99, "Đang thêm vào Playlist...", 0.0)
+                progress_cb(99, f"Đang kiểm tra/tạo Playlist: {playlist_name.strip()}...", 0.0)
             try:
-                pl_id = self.ensure_playlist(channel_id, playlist_name)
-                if pl_id:
-                    self.add_video_to_playlist(channel_id, pl_id, video_id)
+                target_pl_id = self.ensure_playlist(channel_id, playlist_name.strip())
+            except Exception as pe:
+                print(f"Lỗi tạo/tìm playlist: {pe}")
+
+        if target_pl_id:
+            if progress_cb:
+                progress_cb(99, "Đang thêm video vào Playlist...", 0.0)
+            try:
+                self.add_video_to_playlist(channel_id, target_pl_id, video_id)
             except Exception as pe:
                 print(f"Lỗi thêm playlist: {pe}")
 
