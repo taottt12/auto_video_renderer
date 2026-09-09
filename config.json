@@ -1,0 +1,122 @@
+{
+  "audio_files": [
+    "E:\\YT\\output-test\\VÌ SAO THU NHẬP THỤ ĐỘNG LÀ ĐIỀU ＂VỚ VẨN＂？.mp3"
+  ],
+  "audio_source_mode": "crawler",
+  "audio_crawler": {
+    "platform": "youtube",
+    "save_folder": "E:\\YT\\output-test",
+    "auto_add_to_audio_list": true,
+    "mode": "video",
+    "video_urls": "https://www.youtube.com/watch?v=6SU6_mQTdmc",
+    "playlist_url": "https://www.youtube.com/watch?v=Cjhnlw8wU2I&list=PLcS_tNqCfrqF72ARQaU8wXYBqVuiA1rLU&index=1",
+    "playlist_limit": 20,
+    "channel_url": "",
+    "channel_limit": 50,
+    "channel_order": "newest_first",
+    "channel_date_filter": "all",
+    "channel_date_from": "2026-08-09",
+    "channel_date_to": "2026-09-08",
+    "direct_crawl": false,
+    "audio_trim": {
+      "enabled": false,
+      "end_time": "00:00:10",
+      "mode": "remove_segment",
+      "start_time": "00:00:00"
+    }
+  },
+  "media_files": [
+    "E:/img-screenshost/8a8f1070-9166-4f2e-a76d-101a908d97c1.png",
+    "E:/img-screenshost/63a96df2-456f-424e-a4fb-60f5365c924d.png",
+    "E:/img-screenshost/5891e435-5085-4b2f-a2c9-b7fa7d8d485e.png"
+  ],
+  "shuffle_media": true,
+  "avoid_repeat": true,
+  "intro_file": "",
+  "outro_file": "E:/kenh-yt/ga-dao-tac/Red & White Modern Play Button Intro YouTube Video.mp4",
+  "logo_file": "E:/kenh-yt/ga-dao-tac/Gold Minimalist Circle TS Initials Nail Artist Logo.png",
+  "logo_enabled": true,
+  "logo_position": "top_right",
+  "logo_scale": 0.21,
+  "logo_margin_x": 80,
+  "logo_margin_y": 50,
+  "watermark_file": "E:/kenh-yt/ga-dao-tac/@GaDaoTac.png",
+  "watermark_enabled": true,
+  "watermark_opacity": 0.1,
+  "watermark_scale": 0.75,
+  "background_music": {
+    "enabled": false,
+    "file": "E:/YT/mp3/sound-nen/Cry For Me - michita ft 愛海 #愛海 #cryforme #nhactrungquoc #piano #douyin #nhachaymoingay - Hoai Nam Pianist (youtube).mp3",
+    "files": [
+      "E:/YT/mp3/sound-nen/Cry For Me - michita ft 愛海 #愛海 #cryforme #nhactrungquoc #piano #douyin #nhachaymoingay - Hoai Nam Pianist (youtube).mp3",
+      "E:/YT/mp3/sound-nen/Piano Mashup Fake Love x Suzume x Bóng Lá Rơi #piano #pianocover #viral #xuhuong - Chú Lâm - PianoMan (youtube).mp3",
+      "E:/YT/mp3/sound-nen/Thiếu Niên Hoa Hồng - bản violin🎻🎻 đến từ Cúc Tịnh Y 🌼 #weibo #xuhuong #cuctinhy #jujingyi鞠婧祎 - 𝙃𝙖𝙣𝙖 𝙠𝙞𝙠𝙪 (youtube).mp3"
+    ],
+    "shuffle": true,
+    "avoid_repeat": true,
+    "volume": 0.18,
+    "loop": true
+  },
+  "promo_audio": {
+    "enabled": false,
+    "files": [],
+    "positions_text": "",
+    "shuffle": true,
+    "avoid_repeat": true,
+    "volume": 1.0,
+    "duck_enabled": true,
+    "duck_volume": 0.35,
+    "duck_pad_start_ms": 100,
+    "duck_pad_end_ms": 300
+  },
+  "image_duration_mode": "30",
+  "effect_mode": "none",
+  "video_effect_mode": "bubbles",
+  "transition_mode": "auto_light",
+  "transition_duration": 1.5,
+  "audio_speed": 1.1,
+  "video_speed": 1.0,
+  "performance": {
+    "encoder": "nvidia",
+    "max_parallel_jobs": 1,
+    "cpu_threads": 0,
+    "auto_clear_temp": true,
+    "keep_temp_on_error": false,
+    "allow_cpu_fallback": false,
+    "gpu_preflight_check": true,
+    "temp_folder": "",
+    "transition_batch_size": 36
+  },
+  "text_overlay": {
+    "enabled": true,
+    "moving_enabled": true,
+    "speed_x": 135,
+    "speed_y": 85,
+    "content": "@hihihaha",
+    "font_size": 20,
+    "position": "center_right",
+    "margin_x": 80,
+    "margin_y": 100,
+    "font_color": "#D3CCCC",
+    "box_enabled": true,
+    "box_opacity": 0.1
+  },
+  "export": {
+    "ratio": "16:9",
+    "width": 1920,
+    "height": 1080,
+    "fps": 45,
+    "quality": "standard",
+    "format": "mp4",
+    "output_folder": "E:/YT/mp4/output/v2/v2-1"
+  },
+  "project": {
+    "current_name": "",
+    "current_path": ""
+  },
+  "video_effect_opacity": 0.8,
+  "video_effect_custom_file": "",
+  "image_motion_enabled": true,
+  "transition_enabled": true,
+  "video_effect_enabled": true
+}

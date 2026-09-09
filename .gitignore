@@ -1,0 +1,40 @@
+﻿# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Tools & Binaries (>100MB ffmpeg executables will be rejected by GitHub)
+tools/ffmpeg/bin/*.exe
+tools/ffmpeg/bin/
+tools/ffmpeg/
+tools/*.exe
+
+# Temporary files, caches & outputs
+temp/
+output/
+logs/
+*.log
+*.tmp
+*.mp4
+*.mp3
+!assets/overlays/*.mp4
+
+# Sensitive credentials & tokens (YouTube OAuth & API keys)
+client_secret*.json
+token*.json
+tokens/
+credentials.json
+.env
+
+# OS / Editor specific
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
