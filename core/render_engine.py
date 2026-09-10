@@ -729,22 +729,23 @@ class RenderEngine:
         # Tối ưu tốc độ: scale trực tiếp 1.0x (1080p), tăng tốc ~40% CPU
         base_scale = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
 
-        # Chu kỳ lặp chuyển động dao động mượt mà cho ảnh thời lượng dài
-        cycle = max(60, int(min(7.0, duration) * fps))
+        # Chu kỳ lặp chuyển động dao động mượt mà cho ảnh thời lượng dài:
+        # Nới rộng thời gian chu kỳ chuyển động từ 7s lên 25s - 30s để chuyển động siêu êm, không bị nhanh
+        cycle = max(180, int(min(30.0, max(18.0, duration)) * fps))
 
         patterns = {
-            # Zoom in liên tục mượt mà suốt thời lượng clip, không bao giờ dừng/khựng
-            "zoom_in": f"zoompan=z='1.0+0.15*(0.5-0.5*cos(PI*on/{frames}))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
-            # Zoom out liên tục mượt mà suốt thời lượng clip
-            "zoom_out": f"zoompan=z='1.15-0.15*(0.5-0.5*cos(PI*on/{frames}))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
-            # Pan ngang / dọc trải đều toàn bộ frame
-            "pan_left": f"zoompan=z='1.10':x='(iw-iw/zoom)*(1-on/{frames})':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
-            "pan_right": f"zoompan=z='1.10':x='(iw-iw/zoom)*(on/{frames})':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
-            "pan_up": f"zoompan=z='1.10':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/{frames})':d={frames}:s={width}x{height}:fps={fps}",
-            "pan_down": f"zoompan=z='1.10':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(on/{frames})':d={frames}:s={width}x{height}:fps={fps}",
-            # Chuyển động lặp hình sin tuần hoàn (breathe loop & pan loop)
-            "loop_zoom": f"zoompan=z='1.08+0.07*sin(2*PI*on/{cycle})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
-            "loop_pan_zoom": f"zoompan=z='1.08+0.06*sin(2*PI*on/{cycle})':x='(iw-iw/zoom)*(0.5+0.45*cos(2*PI*on/{cycle}))':y='(ih-ih/zoom)*(0.5+0.45*sin(2*PI*on/{cycle}))':d={frames}:s={width}x{height}:fps={fps}",
+            # Zoom in nhẹ nhàng, mượt mà suốt thời lượng clip (chỉ zoom 5%, nới rộng biên độ cực êm)
+            "zoom_in": f"zoompan=z='1.0+0.05*(0.5-0.5*cos(PI*on/{frames}))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
+            # Zoom out nhẹ nhàng từ 1.05 về 1.0
+            "zoom_out": f"zoompan=z='1.05-0.05*(0.5-0.5*cos(PI*on/{frames}))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
+            # Pan ngang / dọc trôi êm ái
+            "pan_left": f"zoompan=z='1.04':x='(iw-iw/zoom)*(1-on/{frames})':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
+            "pan_right": f"zoompan=z='1.04':x='(iw-iw/zoom)*(on/{frames})':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
+            "pan_up": f"zoompan=z='1.04':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/{frames})':d={frames}:s={width}x{height}:fps={fps}",
+            "pan_down": f"zoompan=z='1.04':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(on/{frames})':d={frames}:s={width}x{height}:fps={fps}",
+            # Chuyển động lặp hình sin tuần hoàn chậm rãi, thư thái (chu kỳ 25-30s)
+            "loop_zoom": f"zoompan=z='1.03+0.025*sin(2*PI*on/{cycle})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
+            "loop_pan_zoom": f"zoompan=z='1.03+0.02*sin(2*PI*on/{cycle})':x='(iw-iw/zoom)*(0.5+0.45*cos(2*PI*on/{cycle}))':y='(ih-ih/zoom)*(0.5+0.45*sin(2*PI*on/{cycle}))':d={frames}:s={width}x{height}:fps={fps}",
         }
         # Auto mode: tự đổi hiệu ứng theo từng ảnh
         if effect_mode in {"auto_light", "random_light"}:
@@ -760,24 +761,17 @@ class RenderEngine:
         return f"{base_scale},{selected},setsar=1,format=yuv420p"
 
     def _video_effect_filter(self, width: int, height: int, fps: int, duration: float, index: int) -> str:
-        effect_mode = str(self.settings.get("video_effect_mode", "auto_cinematic") or "none")
-        if effect_mode == "none":
-            return ""
+        effect_mode = str(self.settings.get("video_effect_mode", "none") or "none")
+        if effect_mode in {"none", "off", "auto_cinematic", "auto", "random"}:
+            return ""  # Giữ 100% màu gốc của ảnh, không đổi màu
 
         filters = {
-            "vignette": "vignette=PI/4",
-            "color_boost": "eq=contrast=1.08:brightness=0.01:saturation=1.16",
-            "film_grain": "noise=c1s=7:c0f=u:allf=t",
-            "slow_zoom": f"crop=w='iw*min(1,1-0.00025*n)':h='ih*min(1,1-0.00025*n)':x='(iw-ow)/2':y='(ih-oh)/2',scale={width}:{height}",
+            "vignette": "vignette=PI/6",
+            "color_boost": "eq=contrast=1.04:saturation=1.05",
+            "film_grain": "noise=c1s=5:c0f=u:allf=t",
+            "slow_zoom": f"crop=w='iw*min(1,1-0.0001*n)':h='ih*min(1,1-0.0001*n)':x='(iw-ow)/2':y='(ih-oh)/2',scale={width}:{height}",
         }
-
-        if effect_mode in {"auto_cinematic", "auto", "random"}:
-            cycle = ["vignette", "color_boost", "film_grain", "slow_zoom"]
-            chosen = cycle[(index - 1) % len(cycle)]
-            return filters.get(chosen, "")
-        elif effect_mode in filters:
-            return filters[effect_mode]
-        return ""
+        return filters.get(effect_mode, "")
 
     def _create_video_clip(self, src: Path, out: Path, width: int, height: int, fps: int, duration: float, index: int, speed: float) -> None:
         base_vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps={fps}"
@@ -786,7 +780,8 @@ class RenderEngine:
         else:
             vf = base_vf
 
-        extra_fx = self._video_effect_filter(width, height, fps, duration, index)
+        fx_enabled = bool(self.settings.get("video_effect_enabled", False))
+        extra_fx = self._video_effect_filter(width, height, fps, duration, index) if fx_enabled else ""
         if extra_fx:
             vf = f"{vf},{extra_fx},format=yuv420p"
         else:
@@ -1600,9 +1595,9 @@ class RenderEngine:
             out_label = f"[v{stage}]"
             filters.append(
                 f"[{input_index}:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},format=yuv420p{ov_label}"
+                f"crop={width}:{height},format=rgba,colorkey=0x000000:0.15:0.1,colorchannelmixer=aa={fx_opacity:.2f}{ov_label}"
             )
-            filters.append(f"{last}{ov_label}blend=all_mode=screen:all_opacity={fx_opacity:.2f}{out_label}")
+            filters.append(f"{last}{ov_label}overlay=0:0:format=auto{out_label}")
             last = out_label
             input_index += 1
             stage += 1
@@ -1732,9 +1727,9 @@ class RenderEngine:
             out_label = f"[v_stage{stage}]"
             filters.append(
                 f"[{input_index}:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},format=yuv420p{ov_label}"
+                f"crop={width}:{height},format=rgba,colorkey=0x000000:0.15:0.1,colorchannelmixer=aa={fx_opacity:.2f}{ov_label}"
             )
-            filters.append(f"{last}{ov_label}blend=all_mode=screen:all_opacity={fx_opacity:.2f}{out_label}")
+            filters.append(f"{last}{ov_label}overlay=0:0:format=auto{out_label}")
             last = out_label
             input_index += 1
             stage += 1

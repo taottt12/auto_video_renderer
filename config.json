@@ -94,9 +94,9 @@
     "duck_pad_start_ms": 100,
     "duck_pad_end_ms": 300
   },
-  "image_duration_mode": "30",
+  "image_duration_mode": "15",
   "effect_mode": "auto_light",
-  "video_effect_mode": "bubbles",
+  "video_effect_mode": "feathers",
   "transition_mode": "auto_light",
   "transition_duration": 1.5,
   "audio_speed": 1.1,
@@ -140,12 +140,15 @@
     "gemini_model": "gemini-2.5-flash",
     "active_channel_id": "UCDSiEMpXssfhsrnxha5VckQ",
     "privacy_status": "schedule",
-    "schedule_videos_per_day": 5,
-    "schedule_time_slots": "17:00, 23:00",
-    "is_premiere": true,
+    "schedule_videos_per_day": 2,
+    "schedule_time_slots": "11:30, 19:30",
+    "is_premiere": false,
     "default_playlist": "",
     "category_id": "24",
-    "ai_provider": "custom",
+    "9router_api_key": "sk-fd35e767cc9923c0-6jyuwt-39eb8e44",
+    "9router_base_url": "http://localhost:20128/v1",
+    "9router_model": "ag/gemini-3.8-flash-high",
+    "ai_provider": "9router",
     "custom_api_key": "",
     "custom_base_url": "https://api.groq.com/openai/v1",
     "custom_model": "llama-3.3-70b-versatile",
@@ -157,9 +160,9 @@
     "current_path": "D:\\auto_video_renderer\\auto_video_renderer\\projects\\TA LÀ TIÊU SƯ GIỮ QUY CỦ NHẤT THIÊN HẠ_ NHƯNG CŨNG LÀ KẺ TÀN NHẪN NHẤT.avr.json",
     "output_folder": "E:/YT/mp4/gadaotac/ta-la-tieu-su-giu-quy-cu-nhat-thien-ha-nhung-cung-la-ke-tan-nhan-nhat"
   },
-  "video_effect_opacity": 0.8,
+  "video_effect_opacity": 0.3,
   "video_effect_custom_file": "",
   "image_motion_enabled": true,
   "transition_enabled": true,
-  "video_effect_enabled": true
+  "video_effect_enabled": false
 }
