@@ -194,8 +194,13 @@ class ThumbnailBuilder:
         highlight_title: str = "",
         subtitle: str = "",
         channel_logo: Optional[str | Path] = None,
+        font_style: str = "but_phap",
+        position: str = "top_left",
+        pos_x: Optional[int] = None,
+        pos_y: Optional[int] = None,
+        font_scale: float = 0.68,
     ) -> Path:
-        """Tạo thumbnail chuẩn 16:9 1280x720: Giữ nguyên 100% màu gốc ảnh, chữ nghệ thuật cọ xước kiếm hiệp đỉnh cao."""
+        """Tạo thumbnail chuẩn 16:9 1280x720: Giữ nguyên 100% màu gốc ảnh, nét chữ bút pháp kiếm hiệp, né mặt nhân vật."""
         out_file = Path(output_path)
         out_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -217,97 +222,180 @@ class ThumbnailBuilder:
         top = (new_h - cls.HEIGHT) // 2
         base = base.crop((left, top, left + cls.WIDTH, top + cls.HEIGHT))
 
-        # 2. Hiệu ứng đổ bóng mờ góc bên trái (0 -> 54% bề ngang) để chữ luôn cực kỳ rõ nét mà không làm tối nhân vật
-        vignette = Image.new("RGBA", (cls.WIDTH, cls.HEIGHT), (0, 0, 0, 0))
-        vd = ImageDraw.Draw(vignette)
-        for x in range(int(cls.WIDTH * 0.54)):
-            ratio = 1.0 - (x / (cls.WIDTH * 0.54))
-            alpha = int(175 * (ratio ** 1.9))
-            vd.line([(x, 0), (x, cls.HEIGHT)], fill=(0, 0, 0, alpha))
-        base = Image.alpha_composite(base, vignette)
+        # 2. Xác định tọa độ vị trí & tỉ lệ chữ
+        pos_clean = (position or "top_left").lower().strip()
+        sc = max(0.4, min(1.5, font_scale or 0.68))
+
+        if pos_clean == "right":
+            px = pos_x if pos_x is not None else 780
+            py = pos_y if pos_y is not None else 65
+            rot_angle = -4
+            badge_pos = (cls.WIDTH - 165, 25)
+            # Vignette bên phải
+            vignette = Image.new("RGBA", (cls.WIDTH, cls.HEIGHT), (0, 0, 0, 0))
+            vd = ImageDraw.Draw(vignette)
+            for x in range(int(cls.WIDTH * 0.60), cls.WIDTH):
+                ratio = (x - int(cls.WIDTH * 0.60)) / (cls.WIDTH * 0.40)
+                vd.line([(x, 0), (x, cls.HEIGHT)], fill=(0, 0, 0, int(165 * (ratio ** 1.8))))
+            base = Image.alpha_composite(base, vignette)
+        elif pos_clean == "bottom_left":
+            px = pos_x if pos_x is not None else 20
+            py = pos_y if pos_y is not None else 390
+            rot_angle = -6
+            badge_pos = (40, 25)
+            # Vignette góc dưới bên trái
+            vignette = Image.new("RGBA", (cls.WIDTH, cls.HEIGHT), (0, 0, 0, 0))
+            vd = ImageDraw.Draw(vignette)
+            for y in range(int(cls.HEIGHT * 0.50), cls.HEIGHT):
+                ratio = (y - int(cls.HEIGHT * 0.50)) / (cls.HEIGHT * 0.50)
+                vd.line([(0, y), (int(cls.WIDTH * 0.45), y)], fill=(0, 0, 0, int(160 * (ratio ** 1.8))))
+            base = Image.alpha_composite(base, vignette)
+        elif pos_clean == "bottom_right":
+            px = pos_x if pos_x is not None else 780
+            py = pos_y if pos_y is not None else 390
+            rot_angle = -4
+            badge_pos = (cls.WIDTH - 165, 25)
+            vignette = Image.new("RGBA", (cls.WIDTH, cls.HEIGHT), (0, 0, 0, 0))
+            vd = ImageDraw.Draw(vignette)
+            for y in range(int(cls.HEIGHT * 0.50), cls.HEIGHT):
+                ratio = (y - int(cls.HEIGHT * 0.50)) / (cls.HEIGHT * 0.50)
+                vd.line([(int(cls.WIDTH * 0.55), y), (cls.WIDTH, y)], fill=(0, 0, 0, int(165 * (ratio ** 1.8))))
+            base = Image.alpha_composite(base, vignette)
+        elif pos_clean == "custom":
+            px = pos_x if pos_x is not None else 20
+            py = pos_y if pos_y is not None else 35
+            rot_angle = -5
+            badge_pos = (40, 25) if px < 500 else (cls.WIDTH - 165, 25)
+            # Vignette nhẹ
+            vignette = Image.new("RGBA", (cls.WIDTH, cls.HEIGHT), (0, 0, 0, 0))
+            vd = ImageDraw.Draw(vignette)
+            if px < 500:
+                for x in range(int(cls.WIDTH * 0.35)):
+                    ratio = 1.0 - (x / (cls.WIDTH * 0.35))
+                    vd.line([(x, 0), (x, cls.HEIGHT)], fill=(0, 0, 0, int(150 * (ratio ** 1.8))))
+            base = Image.alpha_composite(base, vignette)
+        else:
+            # Mặc định: top_left (Né mặt tối đa, nằm gọn góc trên bên trái)
+            px = pos_x if pos_x is not None else 16
+            py = pos_y if pos_y is not None else 75
+            rot_angle = -6
+            badge_pos = (28, 18)
+            # Vignette mỏng chỉ ở góc 32% bên trái
+            vignette = Image.new("RGBA", (cls.WIDTH, cls.HEIGHT), (0, 0, 0, 0))
+            vd = ImageDraw.Draw(vignette)
+            for x in range(int(cls.WIDTH * 0.34)):
+                ratio = 1.0 - (x / (cls.WIDTH * 0.34))
+                vd.line([(x, 0), (x, cls.HEIGHT)], fill=(0, 0, 0, int(160 * (ratio ** 1.8))))
+            base = Image.alpha_composite(base, vignette)
 
         overlay = Image.new("RGBA", (cls.WIDTH, cls.HEIGHT), (0, 0, 0, 0))
 
         # 3. Phân tích tiêu đề theo các tầng chữ
         p = cls._parse_title_structure(highlight_title)
 
-        # Tải bộ phông chữ nghệ thuật chuyên biệt
-        f_brush = cls._get_font("Protest_Revolution.ttf", 46)
-        f_hero = cls._get_font("Protest_Revolution.ttf", 110)
-        f_banner = cls._get_font("Dela_Gothic_One.ttf", 30)
-        f_sub = cls._get_font("Protest_Revolution.ttf", 38)
-        f_climax = cls._get_font("Road_Rage.ttf", 86)
-        f_badge = cls._get_font("Dela_Gothic_One.ttf", 28)
+        # 4. Chọn bộ font theo phong cách phối nghệ thuật (font_style)
+        st = (font_style or "but_phap").lower().strip()
+        if st == "dong_bo":
+            # Đồng bộ 100% nét cọ xước kiếm hiệp
+            fh_name, fb_name, fc_name = "Protest_Revolution.ttf", "Protest_Revolution.ttf", "Protest_Revolution.ttf"
+        elif st == "thu_phap":
+            # Thư pháp truyền thống Việt Nam
+            fh_name, fb_name, fc_name = "ThuphapCongthuy.ttf", "ThuphapCongthuy.ttf", "ThuphapCongthuy.ttf"
+        elif st == "co_phong":
+            # Nét bút lông Á Đông mềm mại, trang nhã
+            fh_name, fb_name, fc_name = "Sriracha.ttf", "Sriracha.ttf", "Charm_Bold.ttf"
+        elif st == "huyet_thu":
+            # Huyết thư kinh dị kịch tính
+            fh_name, fb_name, fc_name = "Protest_Revolution.ttf", "Protest_Revolution.ttf", "Road_Rage.ttf"
+        else:
+            # but_phap (Mặc định): Hero cọ xước + Banner Sedgwick Ave mềm mại + Climax cọ xước huyết dụ
+            fh_name, fb_name, fc_name = "Protest_Revolution.ttf", "Sedgwick_Ave.ttf", "Protest_Revolution.ttf"
 
-        # Canvas vẽ chữ
-        tc_w, tc_h = 660, 500
+        f_brush = cls._get_font(fh_name, int(40 * sc))
+        f_hero = cls._get_font(fh_name, int(92 * sc))
+        f_banner = cls._get_font(fb_name, int(26 * sc))
+        f_sub = cls._get_font(fh_name, int(34 * sc))
+        f_climax = cls._get_font(fc_name, int(62 * sc))
+        f_badge = cls._get_font("Protest_Revolution.ttf", 22)
+
+        # 5. Tính toán kích thước canvas vẽ chữ (tránh bị cắt cụt chữ)
+        dummy_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        w_lead = dummy_draw.textbbox((0, 0), p["lead"], font=f_brush)[2] if p["lead"] else 0
+        w_hero = dummy_draw.textbbox((0, 0), p["hero"], font=f_hero)[2] if p["hero"] else 0
+        w_banner = dummy_draw.textbbox((0, 0), p["banner"], font=f_banner)[2] if p["banner"] else 0
+        w_pivot = dummy_draw.textbbox((0, 0), p["pivot"], font=f_sub)[2] if p["pivot"] else 0
+        w_climax = dummy_draw.textbbox((0, 0), p["climax"], font=f_climax)[2] if p["climax"] else 0
+
+        max_line_w = max(w_lead, w_hero, w_banner + int(50 * sc), w_pivot, w_climax, 100)
+        tc_w = int(max_line_w + 40 * sc)
+        tc_h = int(380 * sc)
+
         tc = Image.new("RGBA", (tc_w, tc_h), (0, 0, 0, 0))
         td = ImageDraw.Draw(tc)
 
-        cur_y = 15
+        cur_y = int(6 * sc)
 
-        # Dòng 1: Tiền tố (Lead)
+        # Dòng 1: Tiền đề dẫn nhập (Lead: 'TA LÀ', 'TRỌNG SINH'...)
         if p["lead"]:
-            td.text((84, cur_y + 4), p["lead"], font=f_brush, fill=(0, 0, 0, 240))
-            td.text((80, cur_y), p["lead"], font=f_brush, fill=(245, 240, 235, 255))
-            cur_y += 47
-        else:
-            cur_y += 15
+            td.text((int(38 * sc), cur_y + 2), p["lead"], font=f_brush, fill=(0, 0, 0, 230))
+            td.text((int(36 * sc), cur_y), p["lead"], font=f_brush, fill=(245, 240, 235, 255))
+            cur_y += int(38 * sc)
 
-        # Dòng 2: Tên nhân vật / Từ khóa chính (Hero) - Chữ Cọ Xước Kiếm Hiệp khổng lồ với bóng 3D
+        # Dòng 2: Tên nhân vật / Từ khóa chính (Hero) - Chữ Bút Pháp Kiếm Hiệp với bóng đổ 3D
         if p["hero"]:
-            for off in range(7, 0, -1):
-                td.text((35 + off, cur_y + off), p["hero"], font=f_hero, fill=(20, 0, 0, 240))
-            td.text((35, cur_y), p["hero"], font=f_hero, fill=(255, 248, 238, 255), stroke_width=3, stroke_fill=(35, 5, 5, 255))
-            cur_y += 136
+            for off in range(int(5 * sc), 0, -1):
+                td.text((int(15 * sc) + off, cur_y + off), p["hero"], font=f_hero, fill=(20, 0, 0, 240))
+            td.text((int(15 * sc), cur_y), p["hero"], font=f_hero, fill=(255, 250, 242, 255), stroke_width=2, stroke_fill=(35, 5, 5, 255))
+            cur_y += int(98 * sc)
 
         # Dòng 3: Dải vệt cọ xước rách sơn đỏ (Banner)
         if p["banner"]:
-            bbox_b = td.textbbox((0, 0), p["banner"], font=f_banner)
-            tw = bbox_b[2] - bbox_b[0]
-            banner_w = min(tc_w - 20, max(440, tw + 90))
-            banner_h = 62
-            b_img = cls._make_grunge_banner(banner_w, banner_h, color=(205, 12, 18))
+            banner_w = min(tc_w - int(8 * sc), int(w_banner + 50 * sc))
+            banner_h = int(46 * sc)
+            b_img = cls._make_grunge_banner(banner_w, banner_h, color=(205, 12, 18), seed=888)
 
             # Bóng mờ dưới vệt sơn đỏ
             b_sh = Image.new("RGBA", (banner_w, banner_h), (0, 0, 0, 0))
-            ImageDraw.Draw(b_sh).rectangle([12, 5, banner_w - 12, banner_h - 5], fill=(0, 0, 0, 180))
-            b_sh = b_sh.filter(ImageFilter.GaussianBlur(5))
-            tc.paste(b_sh, (12, cur_y + 5), b_sh)
-            tc.paste(b_img, (10, cur_y), b_img)
+            ImageDraw.Draw(b_sh).rectangle([int(8 * sc), int(3 * sc), banner_w - int(8 * sc), banner_h - int(3 * sc)], fill=(0, 0, 0, 180))
+            b_sh = b_sh.filter(ImageFilter.GaussianBlur(3))
+            tc.paste(b_sh, (int(8 * sc), cur_y + int(2 * sc)), b_sh)
+            tc.paste(b_img, (int(6 * sc), cur_y), b_img)
 
             # Chữ trắng ngà sắc bén bên trong vệt sơn
-            bx = 10 + (banner_w - tw) // 2
-            by = cur_y + (banner_h - (bbox_b[3] - bbox_b[1])) // 2 - 2
-            td.text((bx + 2, by + 2), p["banner"], font=f_banner, fill=(50, 0, 0, 240))
+            bx = int(6 * sc) + (banner_w - w_banner) // 2
+            bbox_ban = td.textbbox((0, 0), p["banner"], font=f_banner)
+            bh_text = bbox_ban[3] - bbox_ban[1]
+            by = cur_y + (banner_h - bh_text) // 2 - int(2 * sc)
+            td.text((bx + 1, by + 1), p["banner"], font=f_banner, fill=(50, 0, 0, 240))
             td.text((bx, by), p["banner"], font=f_banner, fill=(255, 250, 235, 255))
-            cur_y += 82
+            cur_y += int(62 * sc)
 
-        # Dòng 4: Từ nối chuyển ý (Pivot)
+        # Dòng 4: Từ nối chuyển ý (Pivot: 'NHƯNG CŨNG LÀ'...)
         if p["pivot"]:
-            td.text((102, cur_y + 3), p["pivot"], font=f_sub, fill=(0, 0, 0, 230))
-            td.text((100, cur_y), p["pivot"], font=f_sub, fill=(250, 245, 240, 255))
-            cur_y += 50
+            td.text((int(38 * sc), cur_y + 2), p["pivot"], font=f_sub, fill=(0, 0, 0, 230))
+            td.text((int(36 * sc), cur_y), p["pivot"], font=f_sub, fill=(250, 245, 240, 255))
+            cur_y += int(38 * sc)
 
-        # Dòng 5: Chữ Huyết Thư rùng rợn (Climax)
+        # Dòng 5: Chữ Huyết Thư / Cọ Xước rùng rợn (Climax: 'KẺ TÀN NHẪN NHẤT'...)
         if p["climax"]:
-            td.text((33, cur_y + 4), p["climax"], font=f_climax, fill=(0, 0, 0, 240))
-            td.text((30, cur_y), p["climax"], font=f_climax, fill=(230, 12, 18, 255), stroke_width=2, stroke_fill=(70, 0, 0, 255))
+            for off in range(int(4 * sc), 0, -1):
+                td.text((int(12 * sc) + off, cur_y + off), p["climax"], font=f_climax, fill=(20, 0, 0, 240))
+            td.text((int(12 * sc), cur_y), p["climax"], font=f_climax, fill=(235, 15, 20, 255), stroke_width=2, stroke_fill=(65, 0, 0, 255))
 
-        # Nghiêng toàn bộ khối chữ -6 độ theo phong cách poster phim bom tấn
-        rotated_tc = tc.rotate(-6, resample=Image.Resampling.BICUBIC, expand=True)
-        overlay.paste(rotated_tc, (12, 85), rotated_tc)
+        # Nghiêng toàn bộ khối chữ theo góc nghệ thuật
+        rotated_tc = tc.rotate(rot_angle, resample=Image.Resampling.BICUBIC, expand=True)
+        overlay.paste(rotated_tc, (px, py), rotated_tc)
 
-        # 4. Huy hiệu số tập (Badge: P1, P2...) ở góc trên bên trái
+        # 6. Huy hiệu số tập (Badge: P1, P2...)
         badge_clean = (badge_text or "").strip().upper()
         if badge_clean:
-            bdg = Image.new("RGBA", (135, 54), (0, 0, 0, 0))
+            bdg = Image.new("RGBA", (110, 42), (0, 0, 0, 0))
             bdg_d = ImageDraw.Draw(bdg)
-            bdg_d.rounded_rectangle([2, 2, 131, 50], radius=10, fill=(185, 15, 20, 240), outline=(255, 215, 0, 255), width=2)
-            bdg_d.text((38, 7), badge_clean, font=f_badge, fill=(255, 255, 255, 255))
-            overlay.paste(bdg, (45, 30), bdg)
+            bdg_d.rounded_rectangle([2, 2, 106, 38], radius=8, fill=(185, 15, 20, 240), outline=(255, 215, 0, 255), width=2)
+            bdg_d.text((32, 5), badge_clean, font=f_badge, fill=(255, 255, 255, 255))
+            overlay.paste(bdg, badge_pos, bdg)
 
-        # 5. Lưu kết quả JPEG chất lượng cao 95%
+        # 7. Lưu kết quả JPEG chất lượng cao 95%
         final_img = Image.alpha_composite(base, overlay).convert("RGB")
         final_img.save(str(out_file), "JPEG", quality=95, optimize=True)
         return out_file

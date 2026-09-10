@@ -804,6 +804,60 @@ class YouTubeTab(QWidget):
         row_badge.addWidget(self.thumb_hl_edit)
         lay_thumb.addLayout(row_badge)
 
+        # Hàng chọn phong cách phối font & vị trí né mặt nhân vật
+        row_font_pos = QHBoxLayout()
+        row_font_pos.addWidget(QLabel("Phối Font:"))
+        self.thumb_font_combo = QComboBox()
+        self.thumb_font_combo.addItem("Bút Pháp Kiếm Hiệp (Mềm mại, không thô)", "but_phap")
+        self.thumb_font_combo.addItem("Đồng Bộ Cọ Xước (Nhất quán 100%)", "dong_bo")
+        self.thumb_font_combo.addItem("Thư Pháp Cổ Trang (Á Đông Bay Bổng)", "thu_phap")
+        self.thumb_font_combo.addItem("Cổ Phong Nhu Đạo (Trang nhã, mềm mại)", "co_phong")
+        self.thumb_font_combo.addItem("Huyết Thư Kịch Tính (Chữ Rỉ Máu)", "huyet_thu")
+        self.thumb_font_combo.currentIndexChanged.connect(self._on_thumb_style_or_pos_changed)
+        row_font_pos.addWidget(self.thumb_font_combo, 1)
+
+        row_font_pos.addWidget(QLabel("Vị trí:"))
+        self.thumb_pos_combo = QComboBox()
+        self.thumb_pos_combo.addItem("Góc Trái Trên (Né mặt 100%)", "top_left")
+        self.thumb_pos_combo.addItem("Bên Phải (Né nhân vật trái)", "right")
+        self.thumb_pos_combo.addItem("Góc Trái Dưới (Chân ảnh)", "bottom_left")
+        self.thumb_pos_combo.addItem("Góc Phải Dưới", "bottom_right")
+        self.thumb_pos_combo.addItem("Tùy Chỉnh Tọa Độ...", "custom")
+        self.thumb_pos_combo.currentIndexChanged.connect(self._on_thumb_style_or_pos_changed)
+        row_font_pos.addWidget(self.thumb_pos_combo, 1)
+        lay_thumb.addLayout(row_font_pos)
+
+        # Khung tọa độ tùy chỉnh tự do (khi người dùng muốn tự tay căn chỉnh)
+        self.custom_pos_box = QFrame()
+        lay_cp = QHBoxLayout(self.custom_pos_box)
+        lay_cp.setContentsMargins(0, 0, 0, 0)
+        lay_cp.addWidget(QLabel("X (px):"))
+        self.thumb_x_spin = QSpinBox()
+        self.thumb_x_spin.setRange(0, 1200)
+        self.thumb_x_spin.setSingleStep(10)
+        self.thumb_x_spin.setValue(16)
+        self.thumb_x_spin.valueChanged.connect(self._on_thumb_style_or_pos_changed)
+        lay_cp.addWidget(self.thumb_x_spin)
+
+        lay_cp.addWidget(QLabel("Y:"))
+        self.thumb_y_spin = QSpinBox()
+        self.thumb_y_spin.setRange(0, 650)
+        self.thumb_y_spin.setSingleStep(10)
+        self.thumb_y_spin.setValue(75)
+        self.thumb_y_spin.valueChanged.connect(self._on_thumb_style_or_pos_changed)
+        lay_cp.addWidget(self.thumb_y_spin)
+
+        lay_cp.addWidget(QLabel("Cỡ (%):"))
+        self.thumb_scale_spin = QSpinBox()
+        self.thumb_scale_spin.setRange(40, 150)
+        self.thumb_scale_spin.setSingleStep(5)
+        self.thumb_scale_spin.setValue(68)
+        self.thumb_scale_spin.valueChanged.connect(self._on_thumb_style_or_pos_changed)
+        lay_cp.addWidget(self.thumb_scale_spin)
+
+        self.custom_pos_box.setVisible(False)
+        lay_thumb.addWidget(self.custom_pos_box)
+
         self.btn_gen_all_thumbs = QPushButton("🎨 Tự Tạo Thumbnail Cho Tất Cả Tập (Mỗi tập 1 ảnh)")
         self.btn_gen_all_thumbs.setStyleSheet("font-weight: bold; background-color: #d9534f; color: white; padding: 6px; border-radius: 4px;")
         self.btn_gen_all_thumbs.clicked.connect(self._create_all_thumbnails)
@@ -1191,6 +1245,13 @@ class YouTubeTab(QWidget):
         if 0 <= self.current_video_idx < len(self.video_items):
             self.video_items[self.current_video_idx]["thumbnail_hl"] = text
 
+    def _on_thumb_style_or_pos_changed(self) -> None:
+        is_custom = (self.thumb_pos_combo.currentData() == "custom")
+        self.custom_pos_box.setVisible(is_custom)
+        self._save_ui_settings()
+        if 0 <= self.current_video_idx < len(self.video_items):
+            self._create_single_thumbnail(silent=True)
+
     # ==========================
     # LOGIC: SINH NỘI DUNG AI
     # ==========================
@@ -1320,6 +1381,12 @@ class YouTubeTab(QWidget):
         out_dir = self._current_project_dir or Path("D:/auto_video_renderer/auto_video_renderer/temp")
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        font_style = self.thumb_font_combo.currentData() or "but_phap"
+        position = self.thumb_pos_combo.currentData() or "top_left"
+        pos_x = self.thumb_x_spin.value() if position == "custom" else None
+        pos_y = self.thumb_y_spin.value() if position == "custom" else None
+        font_scale = (self.thumb_scale_spin.value() / 100.0) if position == "custom" else 0.68
+
         count = 0
         for idx, item in enumerate(self.video_items):
             badge = item.get("episode_badge", f"P{idx+1}")
@@ -1336,6 +1403,11 @@ class YouTubeTab(QWidget):
                     badge_text=badge,
                     highlight_title=hl_text,
                     subtitle=ch_name,
+                    font_style=font_style,
+                    position=position,
+                    pos_x=pos_x,
+                    pos_y=pos_y,
+                    font_scale=font_scale,
                 )
                 item["thumbnail_path"] = str(thumb_res)
                 
@@ -1354,9 +1426,10 @@ class YouTubeTab(QWidget):
         self._log(f"🎨 Đã tự động tạo trọn bộ {count} Thumbnail chất lượng cao 1280x720 cho từng tập!")
         QMessageBox.information(self, "Thumbnail hoàn tất", f"Đã tạo thành công {count} Thumbnail chuẩn 1280x720 cho các tập!")
 
-    def _create_single_thumbnail(self) -> None:
+    def _create_single_thumbnail(self, silent: bool = False) -> None:
         if self.current_video_idx < 0 or self.current_video_idx >= len(self.video_items):
-            QMessageBox.warning(self, "Chưa chọn tập", "Vui lòng chọn 1 tập trong bảng để tạo Thumbnail.")
+            if not silent:
+                QMessageBox.warning(self, "Chưa chọn tập", "Vui lòng chọn 1 tập trong bảng để tạo Thumbnail.")
             return
 
         item = self.video_items[self.current_video_idx]
@@ -1374,6 +1447,12 @@ class YouTubeTab(QWidget):
         hl = self.thumb_hl_edit.text().strip() or item.get("thumbnail_hl") or clean_story_title(item.get("title", "") or self.proj_combo.currentText()).upper()
         ch_name = self.channel_combo.currentText().split("(")[0].strip()
 
+        font_style = self.thumb_font_combo.currentData() or "but_phap"
+        position = self.thumb_pos_combo.currentData() or "top_left"
+        pos_x = self.thumb_x_spin.value() if position == "custom" else None
+        pos_y = self.thumb_y_spin.value() if position == "custom" else None
+        font_scale = (self.thumb_scale_spin.value() / 100.0) if position == "custom" else 0.68
+
         try:
             res_path = ThumbnailBuilder.create_thumbnail(
                 bg_image=bg_img,
@@ -1381,6 +1460,11 @@ class YouTubeTab(QWidget):
                 badge_text=badge,
                 highlight_title=hl,
                 subtitle=ch_name,
+                font_style=font_style,
+                position=position,
+                pos_x=pos_x,
+                pos_y=pos_y,
+                font_scale=font_scale,
             )
             item["thumbnail_path"] = str(res_path)
             self._set_thumbnail_preview(res_path)
@@ -1389,9 +1473,11 @@ class YouTubeTab(QWidget):
             it_tb.setTextAlignment(Qt.AlignCenter)
             it_tb.setForeground(Qt.green)
             self.video_table.setItem(self.current_video_idx, 4, it_tb)
-            self._log(f"✔ Đã tạo Thumbnail cho [{badge}]: {res_path.name}")
+            if not silent:
+                self._log(f"✔ Đã tạo Thumbnail cho [{badge}]: {res_path.name}")
         except Exception as e:
-            QMessageBox.critical(self, "Lỗi tạo Thumbnail", str(e))
+            if not silent:
+                QMessageBox.critical(self, "Lỗi tạo Thumbnail", str(e))
 
     def _pick_custom_thumbnail(self) -> None:
         if self.current_video_idx < 0 or self.current_video_idx >= len(self.video_items):
@@ -1484,6 +1570,12 @@ class YouTubeTab(QWidget):
         raw_story_title = self.proj_combo.currentText()
         ch_name = self.channel_combo.currentText().split("(")[0].strip()
 
+        font_style = self.thumb_font_combo.currentData() or "but_phap"
+        position = self.thumb_pos_combo.currentData() or "top_left"
+        pos_x = self.thumb_x_spin.value() if position == "custom" else None
+        pos_y = self.thumb_y_spin.value() if position == "custom" else None
+        font_scale = (self.thumb_scale_spin.value() / 100.0) if position == "custom" else 0.68
+
         for idx, item in enumerate(selected_tasks_info):
             # TỰ ĐỘNG TẠO THUMBNAIL KIẾM HIỆP NẾU CHƯA CÓ
             thumb_path = item.get("thumbnail_path")
@@ -1500,6 +1592,11 @@ class YouTubeTab(QWidget):
                         badge_text=badge,
                         highlight_title=hl_text,
                         subtitle=ch_name,
+                        font_style=font_style,
+                        position=position,
+                        pos_x=pos_x,
+                        pos_y=pos_y,
+                        font_scale=font_scale,
                     )
                     thumb_path = str(thumb_res)
                     item["thumbnail_path"] = thumb_path
@@ -1588,6 +1685,11 @@ class YouTubeTab(QWidget):
         yt_cfg["is_premiere"] = self.premiere_chk.isChecked()
         yt_cfg["use_playlist"] = self.chk_use_playlist.isChecked()
         yt_cfg["playlist_mode"] = "existing" if self.rad_existing_pl.isChecked() else "new"
+        yt_cfg["thumb_font_style"] = self.thumb_font_combo.currentData() or "but_phap"
+        yt_cfg["thumb_position"] = self.thumb_pos_combo.currentData() or "top_left"
+        yt_cfg["thumb_x"] = self.thumb_x_spin.value()
+        yt_cfg["thumb_y"] = self.thumb_y_spin.value()
+        yt_cfg["thumb_scale"] = self.thumb_scale_spin.value()
         self.settings_changed.emit(self.settings)
 
     def load_settings(self, settings: Dict[str, Any]) -> None:
@@ -1636,4 +1738,23 @@ class YouTubeTab(QWidget):
             self.rad_new_pl.setChecked(True)
         else:
             self.rad_existing_pl.setChecked(True)
+
+        # Cấu hình Thumbnail Kiếm Hiệp
+        font_style = yt_cfg.get("thumb_font_style", "but_phap")
+        idx_fs = self.thumb_font_combo.findData(font_style)
+        if idx_fs >= 0:
+            self.thumb_font_combo.setCurrentIndex(idx_fs)
+
+        position = yt_cfg.get("thumb_position", "top_left")
+        idx_pos = self.thumb_pos_combo.findData(position)
+        if idx_pos >= 0:
+            self.thumb_pos_combo.setCurrentIndex(idx_pos)
+
+        if "thumb_x" in yt_cfg:
+            self.thumb_x_spin.setValue(int(yt_cfg["thumb_x"]))
+        if "thumb_y" in yt_cfg:
+            self.thumb_y_spin.setValue(int(yt_cfg["thumb_y"]))
+        if "thumb_scale" in yt_cfg:
+            self.thumb_scale_spin.setValue(int(yt_cfg["thumb_scale"]))
+        self.custom_pos_box.setVisible(position == "custom")
 
