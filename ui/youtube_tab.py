@@ -816,13 +816,14 @@ class YouTubeTab(QWidget):
         self.thumb_font_combo.currentIndexChanged.connect(self._on_thumb_style_or_pos_changed)
         row_font_pos.addWidget(self.thumb_font_combo, 1)
 
-        row_font_pos.addWidget(QLabel("Vị trí:"))
+        row_font_pos.addWidget(QLabel("Bố cục:"))
         self.thumb_pos_combo = QComboBox()
-        self.thumb_pos_combo.addItem("Góc Trái Trên (Né mặt 100%)", "top_left")
-        self.thumb_pos_combo.addItem("Bên Phải (Né nhân vật trái)", "right")
-        self.thumb_pos_combo.addItem("Góc Trái Dưới (Chân ảnh)", "bottom_left")
-        self.thumb_pos_combo.addItem("Góc Phải Dưới", "bottom_right")
-        self.thumb_pos_combo.addItem("Tùy Chỉnh Tọa Độ...", "custom")
+        self.thumb_pos_combo.addItem("⚡ Phân Tách Hai Bên: Trái Trên + Phải (Chữ To, Cân Đối)", "split_lr")
+        self.thumb_pos_combo.addItem("⚡ Phân Tách Chéo: Trái Trên + Phải Dưới", "split_lb")
+        self.thumb_pos_combo.addItem("👉 Dồn Sang Phải: Chữ To Khổng Lồ (Khi NV ở Trái)", "full_right")
+        self.thumb_pos_combo.addItem("👈 Dồn Sang Trái: Chữ To Khổng Lồ (Khi NV ở Phải)", "full_left")
+        self.thumb_pos_combo.addItem("📌 Gom Gọn Góc Trái Trên (Né Mặt Cổ Điển)", "compact_tl")
+        self.thumb_pos_combo.addItem("🛠 Tùy Chỉnh Tọa Độ...", "custom")
         self.thumb_pos_combo.currentIndexChanged.connect(self._on_thumb_style_or_pos_changed)
         row_font_pos.addWidget(self.thumb_pos_combo, 1)
         lay_thumb.addLayout(row_font_pos)
@@ -1382,7 +1383,7 @@ class YouTubeTab(QWidget):
         out_dir.mkdir(parents=True, exist_ok=True)
 
         font_style = self.thumb_font_combo.currentData() or "but_phap"
-        position = self.thumb_pos_combo.currentData() or "top_left"
+        position = self.thumb_pos_combo.currentData() or "split_lr"
         pos_x = self.thumb_x_spin.value() if position == "custom" else None
         pos_y = self.thumb_y_spin.value() if position == "custom" else None
         font_scale = (self.thumb_scale_spin.value() / 100.0) if position == "custom" else 0.68
@@ -1448,7 +1449,7 @@ class YouTubeTab(QWidget):
         ch_name = self.channel_combo.currentText().split("(")[0].strip()
 
         font_style = self.thumb_font_combo.currentData() or "but_phap"
-        position = self.thumb_pos_combo.currentData() or "top_left"
+        position = self.thumb_pos_combo.currentData() or "split_lr"
         pos_x = self.thumb_x_spin.value() if position == "custom" else None
         pos_y = self.thumb_y_spin.value() if position == "custom" else None
         font_scale = (self.thumb_scale_spin.value() / 100.0) if position == "custom" else 0.68
@@ -1571,7 +1572,7 @@ class YouTubeTab(QWidget):
         ch_name = self.channel_combo.currentText().split("(")[0].strip()
 
         font_style = self.thumb_font_combo.currentData() or "but_phap"
-        position = self.thumb_pos_combo.currentData() or "top_left"
+        position = self.thumb_pos_combo.currentData() or "split_lr"
         pos_x = self.thumb_x_spin.value() if position == "custom" else None
         pos_y = self.thumb_y_spin.value() if position == "custom" else None
         font_scale = (self.thumb_scale_spin.value() / 100.0) if position == "custom" else 0.68
@@ -1686,7 +1687,7 @@ class YouTubeTab(QWidget):
         yt_cfg["use_playlist"] = self.chk_use_playlist.isChecked()
         yt_cfg["playlist_mode"] = "existing" if self.rad_existing_pl.isChecked() else "new"
         yt_cfg["thumb_font_style"] = self.thumb_font_combo.currentData() or "but_phap"
-        yt_cfg["thumb_position"] = self.thumb_pos_combo.currentData() or "top_left"
+        yt_cfg["thumb_position"] = self.thumb_pos_combo.currentData() or "split_lr"
         yt_cfg["thumb_x"] = self.thumb_x_spin.value()
         yt_cfg["thumb_y"] = self.thumb_y_spin.value()
         yt_cfg["thumb_scale"] = self.thumb_scale_spin.value()
@@ -1745,7 +1746,11 @@ class YouTubeTab(QWidget):
         if idx_fs >= 0:
             self.thumb_font_combo.setCurrentIndex(idx_fs)
 
-        position = yt_cfg.get("thumb_position", "top_left")
+        position = yt_cfg.get("thumb_position", "split_lr")
+        if position in ("top_left", "compact_tl"):
+            position = "compact_tl"
+        elif position in ("right", "full_right"):
+            position = "full_right"
         idx_pos = self.thumb_pos_combo.findData(position)
         if idx_pos >= 0:
             self.thumb_pos_combo.setCurrentIndex(idx_pos)
