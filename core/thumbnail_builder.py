@@ -298,21 +298,27 @@ class ThumbnailBuilder:
             w_lead = dummy_draw.textbbox((0, 0), p["lead"], font=f_brush1)[2] if p["lead"] else 0
             w_hero = dummy_draw.textbbox((0, 0), p["hero"], font=f_hero1)[2] if p["hero"] else 0
             tc1_w = int(max(w_lead, w_hero, 100) + 40 * sc1)
-            tc1_h = int(180 * sc1)
+            tc1_h = int(220 * sc1)
 
             tc1 = Image.new("RGBA", (tc1_w, tc1_h), (0, 0, 0, 0))
             td1 = ImageDraw.Draw(tc1)
-            cur_y1 = int(6 * sc1)
+            cur_bottom1 = int(8 * sc1)
 
             if p["lead"]:
-                td1.text((int(26 * sc1), cur_y1 + 2), p["lead"], font=f_brush1, fill=(0, 0, 0, 230))
-                td1.text((int(24 * sc1), cur_y1), p["lead"], font=f_brush1, fill=(245, 240, 235, 255))
-                cur_y1 += int(42 * sc1)
+                b_lead = dummy_draw.textbbox((0, 0), p["lead"], font=f_brush1)
+                lead_y = cur_bottom1 - b_lead[1]
+                td1.text((int(26 * sc1), lead_y + 2), p["lead"], font=f_brush1, fill=(0, 0, 0, 230))
+                td1.text((int(24 * sc1), lead_y), p["lead"], font=f_brush1, fill=(245, 240, 235, 255))
+                cur_bottom1 = lead_y + b_lead[3]
 
             if p["hero"]:
+                b_hero = dummy_draw.textbbox((0, 0), p["hero"], font=f_hero1)
+                hero_top = cur_bottom1 + int(16 * sc1)
+                hero_y = hero_top - b_hero[1]
                 for off in range(int(5 * sc1), 0, -1):
-                    td1.text((int(12 * sc1) + off, cur_y1 + off), p["hero"], font=f_hero1, fill=(20, 0, 0, 240))
-                td1.text((int(12 * sc1), cur_y1), p["hero"], font=f_hero1, fill=(255, 250, 242, 255), stroke_width=2, stroke_fill=(35, 5, 5, 255))
+                    td1.text((int(12 * sc1) + off, hero_y + off), p["hero"], font=f_hero1, fill=(20, 0, 0, 240))
+                td1.text((int(12 * sc1), hero_y), p["hero"], font=f_hero1, fill=(255, 250, 242, 255), stroke_width=2, stroke_fill=(35, 5, 5, 255))
+                cur_bottom1 = hero_y + b_hero[3]
 
             rot1 = tc1.rotate(-6, resample=Image.Resampling.BICUBIC, expand=True)
             overlay.paste(rot1, (px1, py1), rot1)
@@ -341,11 +347,11 @@ class ThumbnailBuilder:
                 max_b_w = max(w_banner + int(50 * sc2), w_pivot, w_climax, 100)
 
             tc2_w = int(max_b_w + 50 * sc2)
-            tc2_h = int(240 * sc2)
+            tc2_h = int(280 * sc2)
 
             tc2 = Image.new("RGBA", (tc2_w, tc2_h), (0, 0, 0, 0))
             td2 = ImageDraw.Draw(tc2)
-            cur_y2 = int(6 * sc2)
+            cur_bottom2 = int(6 * sc2)
 
             if p["banner"]:
                 banner_w = min(tc2_w - int(8 * sc2), int(w_banner + 50 * sc2))
@@ -354,26 +360,33 @@ class ThumbnailBuilder:
                 b_sh = Image.new("RGBA", (banner_w, banner_h), (0, 0, 0, 0))
                 ImageDraw.Draw(b_sh).rectangle([int(8 * sc2), int(3 * sc2), banner_w - int(8 * sc2), banner_h - int(3 * sc2)], fill=(0, 0, 0, 180))
                 b_sh = b_sh.filter(ImageFilter.GaussianBlur(3))
-                tc2.paste(b_sh, (int(8 * sc2), cur_y2 + int(2 * sc2)), b_sh)
-                tc2.paste(b_img, (int(6 * sc2), cur_y2), b_img)
+                tc2.paste(b_sh, (int(8 * sc2), cur_bottom2 + int(2 * sc2)), b_sh)
+                tc2.paste(b_img, (int(6 * sc2), cur_bottom2), b_img)
 
                 bx = int(6 * sc2) + (banner_w - w_banner) // 2
                 bbox_ban = td2.textbbox((0, 0), p["banner"], font=f_banner2)
                 bh_text = bbox_ban[3] - bbox_ban[1]
-                by = cur_y2 + (banner_h - bh_text) // 2 - int(2 * sc2)
+                by = cur_bottom2 + (banner_h - bh_text) // 2 - int(2 * sc2)
                 td2.text((bx + 1, by + 1), p["banner"], font=f_banner2, fill=(50, 0, 0, 240))
                 td2.text((bx, by), p["banner"], font=f_banner2, fill=(255, 250, 235, 255))
-                cur_y2 += int(62 * sc2)
+                cur_bottom2 += banner_h
 
             if p["pivot"]:
-                td2.text((int(32 * sc2), cur_y2 + 2), p["pivot"], font=f_sub2, fill=(0, 0, 0, 230))
-                td2.text((int(30 * sc2), cur_y2), p["pivot"], font=f_sub2, fill=(250, 245, 240, 255))
-                cur_y2 += int(38 * sc2)
+                b_pivot = dummy_draw.textbbox((0, 0), p["pivot"], font=f_sub2)
+                pivot_top = cur_bottom2 + int(14 * sc2)
+                pivot_y = pivot_top - b_pivot[1]
+                td2.text((int(32 * sc2), pivot_y + 2), p["pivot"], font=f_sub2, fill=(0, 0, 0, 230))
+                td2.text((int(30 * sc2), pivot_y), p["pivot"], font=f_sub2, fill=(250, 245, 240, 255))
+                cur_bottom2 = pivot_y + b_pivot[3]
 
             if p["climax"]:
+                b_climax = dummy_draw.textbbox((0, 0), p["climax"], font=f_climax2)
+                climax_top = cur_bottom2 + int(16 * sc2)
+                climax_y = climax_top - b_climax[1]
                 for off in range(int(5 * sc2), 0, -1):
-                    td2.text((int(12 * sc2) + off, cur_y2 + off), p["climax"], font=f_climax2, fill=(20, 0, 0, 240))
-                td2.text((int(12 * sc2), cur_y2), p["climax"], font=f_climax2, fill=(235, 15, 20, 255), stroke_width=2, stroke_fill=(65, 0, 0, 255))
+                    td2.text((int(12 * sc2) + off, climax_y + off), p["climax"], font=f_climax2, fill=(20, 0, 0, 240))
+                td2.text((int(12 * sc2), climax_y), p["climax"], font=f_climax2, fill=(235, 15, 20, 255), stroke_width=2, stroke_fill=(65, 0, 0, 255))
+                cur_bottom2 = climax_y + b_climax[3]
 
             rot2 = tc2.rotate(rot_angle2, resample=Image.Resampling.BICUBIC, expand=True)
             px2 = max(660, min(cls.WIDTH - int(rot2.size[0]) - 20, 750))
@@ -475,22 +488,27 @@ class ThumbnailBuilder:
 
             max_line_w = max(w_lead, w_hero, w_banner + int(50 * sc), w_pivot, w_climax, 100)
             tc_w = int(max_line_w + 40 * sc)
-            tc_h = int(380 * sc)
+            tc_h = int(480 * sc)
 
             tc = Image.new("RGBA", (tc_w, tc_h), (0, 0, 0, 0))
             td = ImageDraw.Draw(tc)
-            cur_y = int(6 * sc)
+            cur_bottom = int(8 * sc)
 
             if p["lead"]:
-                td.text((int(38 * sc), cur_y + 2), p["lead"], font=f_brush, fill=(0, 0, 0, 230))
-                td.text((int(36 * sc), cur_y), p["lead"], font=f_brush, fill=(245, 240, 235, 255))
-                cur_y += int(38 * sc)
+                b_lead = dummy_draw.textbbox((0, 0), p["lead"], font=f_brush)
+                lead_y = cur_bottom - b_lead[1]
+                td.text((int(38 * sc), lead_y + 2), p["lead"], font=f_brush, fill=(0, 0, 0, 230))
+                td.text((int(36 * sc), lead_y), p["lead"], font=f_brush, fill=(245, 240, 235, 255))
+                cur_bottom = lead_y + b_lead[3]
 
             if p["hero"]:
+                b_hero = dummy_draw.textbbox((0, 0), p["hero"], font=f_hero)
+                hero_top = cur_bottom + int(16 * sc)
+                hero_y = hero_top - b_hero[1]
                 for off in range(int(5 * sc), 0, -1):
-                    td.text((int(15 * sc) + off, cur_y + off), p["hero"], font=f_hero, fill=(20, 0, 0, 240))
-                td.text((int(15 * sc), cur_y), p["hero"], font=f_hero, fill=(255, 250, 242, 255), stroke_width=2, stroke_fill=(35, 5, 5, 255))
-                cur_y += int(98 * sc)
+                    td.text((int(15 * sc) + off, hero_y + off), p["hero"], font=f_hero, fill=(20, 0, 0, 240))
+                td.text((int(15 * sc), hero_y), p["hero"], font=f_hero, fill=(255, 250, 242, 255), stroke_width=2, stroke_fill=(35, 5, 5, 255))
+                cur_bottom = hero_y + b_hero[3]
 
             if p["banner"]:
                 banner_w = min(tc_w - int(8 * sc), int(w_banner + 50 * sc))
@@ -499,26 +517,34 @@ class ThumbnailBuilder:
                 b_sh = Image.new("RGBA", (banner_w, banner_h), (0, 0, 0, 0))
                 ImageDraw.Draw(b_sh).rectangle([int(8 * sc), int(3 * sc), banner_w - int(8 * sc), banner_h - int(3 * sc)], fill=(0, 0, 0, 180))
                 b_sh = b_sh.filter(ImageFilter.GaussianBlur(3))
-                tc.paste(b_sh, (int(8 * sc), cur_y + int(2 * sc)), b_sh)
-                tc.paste(b_img, (int(6 * sc), cur_y), b_img)
+                banner_top = cur_bottom + int(14 * sc)
+                tc.paste(b_sh, (int(8 * sc), banner_top + int(2 * sc)), b_sh)
+                tc.paste(b_img, (int(6 * sc), banner_top), b_img)
 
                 bx = int(6 * sc) + (banner_w - w_banner) // 2
                 bbox_ban = td.textbbox((0, 0), p["banner"], font=f_banner)
                 bh_text = bbox_ban[3] - bbox_ban[1]
-                by = cur_y + (banner_h - bh_text) // 2 - int(2 * sc)
+                by = banner_top + (banner_h - bh_text) // 2 - int(2 * sc)
                 td.text((bx + 1, by + 1), p["banner"], font=f_banner, fill=(50, 0, 0, 240))
                 td.text((bx, by), p["banner"], font=f_banner, fill=(255, 250, 235, 255))
-                cur_y += int(62 * sc)
+                cur_bottom = banner_top + banner_h
 
             if p["pivot"]:
-                td.text((int(38 * sc), cur_y + 2), p["pivot"], font=f_sub, fill=(0, 0, 0, 230))
-                td.text((int(36 * sc), cur_y), p["pivot"], font=f_sub, fill=(250, 245, 240, 255))
-                cur_y += int(38 * sc)
+                b_pivot = dummy_draw.textbbox((0, 0), p["pivot"], font=f_sub)
+                pivot_top = cur_bottom + int(14 * sc)
+                pivot_y = pivot_top - b_pivot[1]
+                td.text((int(38 * sc), pivot_y + 2), p["pivot"], font=f_sub, fill=(0, 0, 0, 230))
+                td.text((int(36 * sc), pivot_y), p["pivot"], font=f_sub, fill=(250, 245, 240, 255))
+                cur_bottom = pivot_y + b_pivot[3]
 
             if p["climax"]:
+                b_climax = dummy_draw.textbbox((0, 0), p["climax"], font=f_climax)
+                climax_top = cur_bottom + int(16 * sc)
+                climax_y = climax_top - b_climax[1]
                 for off in range(int(4 * sc), 0, -1):
-                    td.text((int(12 * sc) + off, cur_y + off), p["climax"], font=f_climax, fill=(20, 0, 0, 240))
-                td.text((int(12 * sc), cur_y), p["climax"], font=f_climax, fill=(235, 15, 20, 255), stroke_width=2, stroke_fill=(65, 0, 0, 255))
+                    td.text((int(12 * sc) + off, climax_y + off), p["climax"], font=f_climax, fill=(20, 0, 0, 240))
+                td.text((int(12 * sc), climax_y), p["climax"], font=f_climax, fill=(235, 15, 20, 255), stroke_width=2, stroke_fill=(65, 0, 0, 255))
+                cur_bottom = climax_y + b_climax[3]
 
             rotated_tc = tc.rotate(rot_angle, resample=Image.Resampling.BICUBIC, expand=True)
             overlay.paste(rotated_tc, (px, py), rotated_tc)
