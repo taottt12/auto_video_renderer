@@ -811,8 +811,7 @@ class YouTubeTab(QWidget):
         self.thumb_font_combo.addItem("Bút Pháp Kiếm Hiệp (Mềm mại, không thô)", "but_phap")
         self.thumb_font_combo.addItem("Đồng Bộ Cọ Xước (Nhất quán 100%)", "dong_bo")
         self.thumb_font_combo.addItem("Thư Pháp Cổ Trang (Á Đông Bay Bổng)", "thu_phap")
-        self.thumb_font_combo.addItem("Cổ Phong Nhu Đạo (Trang nhã, mềm mại)", "co_phong")
-        self.thumb_font_combo.addItem("Huyết Thư Kịch Tính (Chữ Rỉ Máu)", "huyet_thu")
+        self.thumb_font_combo.addItem("Cuồng Ma Huyết Thư (Cọ Xước Rỉ Máu)", "huyet_thu")
         self.thumb_font_combo.currentIndexChanged.connect(self._on_thumb_style_or_pos_changed)
         row_font_pos.addWidget(self.thumb_font_combo, 1)
 
@@ -1742,6 +1741,8 @@ class YouTubeTab(QWidget):
 
         # Cấu hình Thumbnail Kiếm Hiệp
         font_style = yt_cfg.get("thumb_font_style", "but_phap")
+        if font_style == "co_phong":
+            font_style = "but_phap"
         idx_fs = self.thumb_font_combo.findData(font_style)
         if idx_fs >= 0:
             self.thumb_font_combo.setCurrentIndex(idx_fs)

@@ -230,11 +230,9 @@ class ThumbnailBuilder:
         if st == "dong_bo":
             fh_name, fb_name, fc_name = "Protest_Revolution.ttf", "Protest_Revolution.ttf", "Protest_Revolution.ttf"
         elif st == "thu_phap":
-            fh_name, fb_name, fc_name = "ThuphapCongthuy.ttf", "ThuphapCongthuy.ttf", "ThuphapCongthuy.ttf"
-        elif st == "co_phong":
-            fh_name, fb_name, fc_name = "Sriracha.ttf", "Sriracha.ttf", "Charm_Bold.ttf"
+            fh_name, fb_name, fc_name = "ThuphapCongthuy.ttf", "Sedgwick_Ave.ttf", "ThuphapCongthuy.ttf"
         elif st == "huyet_thu":
-            fh_name, fb_name, fc_name = "Protest_Revolution.ttf", "Protest_Revolution.ttf", "Road_Rage.ttf"
+            fh_name, fb_name, fc_name = "Protest_Revolution.ttf", "Sedgwick_Ave.ttf", "Protest_Revolution.ttf"
         else:
             # but_phap (Mặc định): Hero cọ xước + Banner Sedgwick Ave mềm mại + Climax cọ xước huyết dụ
             fh_name, fb_name, fc_name = "Protest_Revolution.ttf", "Sedgwick_Ave.ttf", "Protest_Revolution.ttf"
