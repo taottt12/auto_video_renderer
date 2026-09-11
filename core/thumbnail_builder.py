@@ -650,3 +650,68 @@ class ThumbnailBuilder:
         final_img = Image.alpha_composite(base, overlay).convert("RGB")
         final_img.save(str(out_file), "JPEG", quality=95, optimize=True)
         return out_file
+
+    @classmethod
+    def extract_video_frame(cls, video_path: str | Path, output_path: str | Path, timestamp_sec: float = 3.0) -> Path:
+        """Trích xuất 1 khung hình sắc nét từ video bằng FFmpeg tại timestamp_sec (mặc định giây thứ 3)."""
+        import subprocess
+        from core.paths import find_binary
+
+        v_path = Path(video_path)
+        out_file = Path(output_path)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        ffmpeg_bin = find_binary("ffmpeg.exe") or "ffmpeg"
+
+        m, s = divmod(int(timestamp_sec), 60)
+        h, m = divmod(m, 60)
+        time_str = f"{h:02d}:{m:02d}:{s:02d}"
+
+        cmd = [
+            str(ffmpeg_bin),
+            "-y",
+            "-ss", time_str,
+            "-i", str(v_path),
+            "-vframes", "1",
+            "-q:v", "2",
+            str(out_file)
+        ]
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=flags)
+
+        # Nếu timestamp vượt quá độ dài video, thử fallback về giây thứ 1
+        if not out_file.exists() or out_file.stat().st_size == 0:
+            cmd[2] = "00:00:01"
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=flags)
+
+        if not out_file.exists() or out_file.stat().st_size == 0:
+            raise RuntimeError(f"Không thể trích xuất khung hình từ video: {res.stderr[:200]}")
+        return out_file
+
+    @classmethod
+    def generate_ai_thumbnail_image(cls, prompt_or_title: str, output_path: str | Path) -> Path:
+        """Tạo hình ảnh Thumbnail nghệ thuật chất lượng cao (1280x720) bằng AI (Pollinations.ai FLUX hoàn toàn MIỄN PHÍ)."""
+        import urllib.request
+        import urllib.parse
+
+        out_file = Path(output_path)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+
+        clean_p = (prompt_or_title or "").strip()
+        # Xây dựng prompt điện ảnh cuốn hút
+        full_prompt = (
+            f"cinematic dramatic YouTube thumbnail wallpaper, {clean_p}, "
+            "vibrant colors, epic lighting, highly detailed, photorealistic, 8k resolution, masterpiece"
+        )
+        encoded = urllib.parse.quote(full_prompt)
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&nologo=true&model=flux"
+
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
+        with urllib.request.urlopen(req, timeout=45) as response, open(out_file, "wb") as f_out:
+            f_out.write(response.read())
+
+        if not out_file.exists() or out_file.stat().st_size < 1000:
+            raise RuntimeError("Không thể tải ảnh AI từ Pollinations.ai")
+        return out_file

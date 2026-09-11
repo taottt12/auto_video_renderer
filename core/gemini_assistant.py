@@ -60,31 +60,94 @@ def clean_episode_badge(ep: str, fallback_idx: Optional[int] = None) -> str:
 def extract_clean_video_title(filename_or_stem: str) -> str:
     """Làm sạch tên file video thành tiêu đề video đẹp:
     - Bỏ phần mở rộng (.mp4, .mkv...)
-    - Bỏ mã số ID video dài (>=7 chữ số) ở đầu (ví dụ 19 số TikTok/Douyin: 7672309670169562394_)
+    - Bỏ mã số ID video dài (>=6 chữ số) ở BẤT KỲ ĐÂU (ví dụ 19 số TikTok/Douyin: 7672309670169562394)
     - Bỏ các hậu tố kỹ thuật (_vi_xuly, _xuly, _output, _hd, _merged, _converted...)
     - Bỏ tiền tố/hậu tố số tập nếu có (đã có badge riêng) để tránh trùng lặp
     - Chuyển dấu gạch dưới thành khoảng trắng
+    - Dọn dẹp ký tự thừa ở đầu và cuối
     """
     stem = Path(filename_or_stem).stem
-    # Bỏ mã ID dạng số dài (>=7 số) ở đầu: ví dụ 7672309670169562394_
-    t = re.sub(r"^\d{7,}[_\-\s]+", "", stem)
-    # Bỏ hậu tố kỹ thuật ở đuôi
-    t = re.sub(r"([_\-\s]+(vi_xuly|xuly|output|final|converted|render|1080p|720p|hd|sub))+$", "", t, flags=re.IGNORECASE)
+    # Bỏ các hậu tố kỹ thuật ở đuôi
+    t = re.sub(r"([_\-\s]+(vi_xuly|xuly|output|final|converted|render|1080p|720p|4k|hd|sub|raw))+$", "", stem, flags=re.IGNORECASE)
+    # Bỏ mã ID dạng số dài (>=6 chữ số) ở bất kỳ đâu trong tên
+    t = re.sub(r"[_\-\s]*\b\d{6,}\b[_\-\s]*", " ", t)
+    # Tiếp tục dọn các hậu tố kỹ thuật còn sót lại sau khi bỏ số
+    t = re.sub(r"([_\-\s]+(vi_xuly|xuly|output|final|converted|render|1080p|720p|4k|hd|sub|raw))+$", "", t, flags=re.IGNORECASE)
     # Bỏ tiền tố số tập ở đầu nếu có (đã có badge riêng)
     t = re.sub(r"^(?:p\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?)[\s:\-_]+", "", t, flags=re.IGNORECASE).strip()
     # Bỏ số tập ở đuôi nếu có (ví dụ _Tap_3, - Tập 3, _P3)
     t = re.sub(r"[\s:\-_]+(?:p\s*\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?)$", "", t, flags=re.IGNORECASE).strip()
     t = t.replace("_", " ")
     t = re.sub(r"\s+", " ", t).strip()
+    # Dọn dẹp dấu gạch ngang, dấu phẩy, dấu chấm lơ lửng ở cuối
+    t = re.sub(r"[\s,\-–_:]+$", "", t).strip()
     return t
 
 
-def to_ascii_tag(text: str) -> str:
-    """Tạo hashtag không dấu viết liền từ tên tiếng Việt."""
-    nfkd = unicodedata.normalize("NFKD", text)
+def to_hashtag(text: str) -> str:
+    """Tạo hashtag chuẩn YouTube: bắt đầu bằng #, không dấu tiếng Việt, không khoảng trắng, chỉ gồm chữ và số."""
+    if not text:
+        return ""
+    s = str(text).replace("Đ", "D").replace("đ", "d")
+    nfkd = unicodedata.normalize("NFKD", s)
     ascii_text = "".join([c for c in nfkd if not unicodedata.combining(c)])
     clean = re.sub(r"[^a-zA-Z0-9]", "", ascii_text.lower())
-    return clean[:20] if clean else "truyenaudio"
+    if not clean:
+        return ""
+    return f"#{clean}"
+
+
+def to_ascii_tag(text: str) -> str:
+    """Tạo hashtag không dấu viết liền từ tên tiếng Việt (tương thích ngược)."""
+    h = to_hashtag(text)
+    return h.lstrip("#")[:20] if h else "truyenaudio"
+
+
+def format_tags_string(tags_input: Any) -> str:
+    """Định dạng toàn bộ thẻ tags chuẩn 100%: #tagkhongdau, #tagkhongcach, #tagtieptheo."""
+    if not tags_input:
+        return "#video, #truyenaudio, #khampha"
+
+    if isinstance(tags_input, str):
+        raw_items = re.split(r"[,;\n]+", tags_input)
+    elif isinstance(tags_input, (list, tuple, set)):
+        raw_items = [str(x) for x in tags_input]
+    else:
+        raw_items = [str(tags_input)]
+
+    results = []
+    seen = set()
+
+    for item in raw_items:
+        s = item.strip()
+        if not s:
+            continue
+        # Làm sạch ID số dài nếu có dính trong tag
+        s = re.sub(r"\b\d{6,}\b", "", s).strip()
+        if not s:
+            continue
+
+        if "#" in s:
+            sub_parts = [p for p in s.split("#") if p.strip()]
+        elif " " in s:
+            # Vừa tạo tag cụm từ vừa thêm từ khóa chính
+            words = s.split()
+            sub_parts = [s]
+            if len(words) > 2:
+                sub_parts.append("".join(words[:2]))
+        else:
+            sub_parts = [s]
+
+        for p in sub_parts:
+            ht = to_hashtag(p)
+            if ht and len(ht) > 2 and ht not in seen:
+                seen.add(ht)
+                results.append(ht)
+
+    if not results:
+        return "#video, #youtube"
+
+    return ", ".join(results)
 
 
 class OfflineSEOAssistant:
@@ -126,6 +189,59 @@ class OfflineSEOAssistant:
         "TRẤN ÁP TỨ PHƯƠNG!",
         "ĐỘT PHÁ CẢNH GIỚI!",
     ]
+
+    @classmethod
+    def enhance_catchy_title(cls, raw_title: str) -> str:
+        """Tự động phát hiện và viết lại tiêu đề thô / cụt lủn thành tiêu đề YouTube cực kỳ cuốn hút, giật gân, tò mò (High CTR)."""
+        clean = extract_clean_video_title(raw_title).strip()
+        if not clean:
+            return "Câu Chuyện Kỳ Lạ - Sự Thật Bất Ngờ Khiến Tất Cả Sững Sờ"
+
+        # Bổ sung từ bị cụt lửng ở đuôi nếu có
+        dangling_fixes = [
+            (r"\b(bị\s+rơi\s+vào|rơi\s+vào)\s*$", " Cơ Thể Bí Ẩn"),
+            (r"\b(vô\s+tình\s+rơi\s+vào|lạc\s+vào)\s*$", " Thế Giới Kỳ Lạ"),
+            (r"\b(bị|được|lại|sẽ|đã)\s*$", " Phát Hiện Sự Thật Động Trời"),
+            (r"\b(vào|ở|tại|trong|cho|với|của)\s*$", " Hoàn Cảnh Khó Tin"),
+            (r"\b(khi|thì|nếu|mà|vì)\s*$", " Sự Thật Được Phơi Bày"),
+        ]
+        completed = clean
+        for pat, completion in dangling_fixes:
+            if re.search(pat, completed, re.IGNORECASE):
+                completed = re.sub(pat, "", completed, flags=re.IGNORECASE).strip() + completion
+                break
+
+        # Nếu đã có cấu trúc hấp dẫn hoặc dấu phân tách rõ ràng và đủ dài (>= 35 ký tự)
+        if re.search(r"[-|:!?]", completed) and len(completed) >= 35:
+            return completed[:95].strip()
+
+        # Kho hook giật gân kích thích tương tác mạnh mẽ
+        VIRAL_HOOKS = [
+            "Cái Kết Khiến Triệu Người Ngỡ Ngàng",
+            "Sự Thật Đằng Sau Khiến Ai Nấy Sững Sờ",
+            "Cú Lội Ngược Dòng Đỉnh Cao Không Thể Ngờ",
+            "Bước Ngoặt Định Mệnh Thay Đổi Cả Cuộc Đời",
+            "Quyết Định Táo Bạo Khiến Kẻ Thù Khiếp Sợ",
+            "Màn Đảo Ngược Tình Thế Chấn Động Tứ Phương",
+            "Hành Trình Kỳ Lạ Chưa Từng Được Tiết Lộ",
+            "Bí Mật Động Trời Khiến Tất Cả Bàng Hoàng",
+            "Cái Giá Đắt Phải Trả Khi Xem Thường Người Khác",
+            "Bài Học Đắt Giá Khiến Triệu Người Thán Phục",
+        ]
+
+        seed = abs(hash(completed)) % len(VIRAL_HOOKS)
+        hook = VIRAL_HOOKS[seed]
+
+        if re.search(r"\b(gì|sao|thế nào|không|ai)\s*$", completed, re.IGNORECASE):
+            candidate = f"{completed}? - {hook}"
+        else:
+            candidate = f"{completed} - {hook}"
+
+        if len(candidate) > 95:
+            max_head = 95 - len(hook) - 4
+            candidate = f"{completed[:max_head].rstrip()}... - {hook}"
+
+        return candidate[:95].strip()
 
     @classmethod
     def generate_video_metadata(
@@ -193,23 +309,23 @@ Vui lòng không sao chép hoặc reup dưới mọi hình thức để tôn tr�
 #truyenaudio #kiemhiep #tienhiep #{tag_story} #{tag_ch}{badge_hashtag} #audiodoctruyen
 """
 
-        # Tags chuẩn SEO
+        # Tags chuẩn SEO: Bắt buộc dạng #tagkhongdau, #tagkhongcach
         tags_list = [
-            clean_title.lower(),
+            clean_title,
             "truyen audio",
             "kiem hiep",
             "tien hiep",
             "truyen audio hay",
             "truyen audio moi nhat",
-            ch_name.lower(),
+            ch_name,
             "audio truyen",
             "doc truyen online",
-            "truyen audio trinh tham",
+            "review phim",
         ]
         if badge:
-            tags_list.append(badge.lower())
-            tags_list.append(f"{clean_title.lower()} {badge.lower()}")
-        tags = ", ".join(tags_list)
+            tags_list.append(badge)
+            tags_list.append(f"{clean_title} {badge}")
+        tags = format_tags_string(tags_list)
 
         return {
             "title": candidate_title,
@@ -345,6 +461,8 @@ BẮT BUỘC TRẢ VỀ DƯỚI ĐỊNH DẠNG JSON DUY NHẤT:
                 res["title"] = re.sub(r"^(?:p\d{1,4}[a-zA-Z]?|tập\s*\d{1,4}[a-zA-Z]?|phần\s*\d{1,4}[a-zA-Z]?)[\s:\-_]+", "", res.get("title", ""), flags=re.IGNORECASE).strip()
             if len(res.get("title", "")) > 100:
                 res["title"] = res["title"][:97] + "..."
+            if "tags" in res:
+                res["tags"] = format_tags_string(res["tags"])
             res["provider_used"] = "gemini_api"
             return res
         except Exception as e:
@@ -415,6 +533,8 @@ Trả về JSON duy nhất:
                 if not episode_name:
                     res["thumbnail_badge"] = ""
                     res["title"] = re.sub(r"^(?:p\d{1,4}[a-zA-Z]?|tập\s*\d{1,4}[a-zA-Z]?|phần\s*\d{1,4}[a-zA-Z]?)[\s:\-_]+", "", res.get("title", ""), flags=re.IGNORECASE).strip()
+                if "tags" in res:
+                    res["tags"] = format_tags_string(res["tags"])
                 res["provider_used"] = f"custom_ai ({self.model})"
                 return res
         except Exception:
