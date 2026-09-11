@@ -24,24 +24,59 @@ def clean_story_title(title: str) -> str:
     return t.title() if t.isupper() or t.islower() else t
 
 
-def clean_episode_badge(ep: str, fallback_idx: int = 1) -> str:
-    """Nhận diện huy hiệu tập ngắn gọn (mặc định dạng P1, P2, P3... theo yêu cầu người dùng)."""
+def clean_episode_badge(ep: str, fallback_idx: Optional[int] = None) -> str:
+    """Nhận diện huy hiệu tập ngắn gọn (dạng P1, P2, Tập 1...).
+    Hỗ trợ cả có dấu và không dấu (tập/tap, phần/phan, chương/chuong, p, ep).
+    Nếu quét tiêu đề file không tìm thấy số tập hợp lệ thì trả về chuỗi rỗng "" (không tự ý gán số tập).
+    """
     if not ep:
-        return f"P{fallback_idx}"
-    m = re.search(r"\b(p\d+[a-zA-Z]?|tập\s*\d+[a-zA-Z]?|phần\s*\d+[a-zA-Z]?|chương\s*\d+[a-zA-Z]?)\b", ep, re.IGNORECASE)
+        return f"P{fallback_idx}" if fallback_idx is not None else ""
+
+    # Chuẩn hóa khoảng trắng và gạch ngang/gạch dưới để dễ nhận diện
+    normalized = re.sub(r"[_\-]+", " ", ep).strip()
+
+    # Tìm các mẫu số tập hợp lệ rõ ràng: P1, P10, Tập 1, Tap 1, Phần 2, Phan 2, Ep 3, Chương 5... (1 đến 4 chữ số)
+    m = re.search(
+        r"(?:^|[\s\[\(_\-])(?:p\s*(\d{1,4}[a-zA-Z]?)|(?:tập|tap)\s*(\d{1,4}[a-zA-Z]?)|(?:phần|phan)\s*(\d{1,4}[a-zA-Z]?)|(?:chương|chuong)\s*(\d{1,4}[a-zA-Z]?)|(?:ep|episode)\s*(\d{1,4}[a-zA-Z]?))(?:$|[\s\]\)_:\-])",
+        normalized,
+        re.IGNORECASE
+    )
     if m:
-        raw = m.group(1).upper()
-        if raw.startswith("P") and raw[1:].isalnum():
-            return raw
-        # Rút gọn PHẦN 1, TẬP 1, CHƯƠNG 1 -> P1
-        m_num = re.search(r"\d+[a-zA-Z]?", raw)
-        if m_num:
-            return f"P{m_num.group(0)}"
-        return re.sub(r"\s+", " ", raw)
-    m_num = re.search(r"\d+[a-zA-Z]?", ep)
-    if m_num:
-        return f"P{m_num.group(0)}"
-    return f"P{fallback_idx}"
+        for num in m.groups():
+            if num:
+                return f"P{num.upper().strip()}"
+
+    # Kiểm tra dạng ngoặc hoặc ký hiệu bao bọc: [P1], (P1), _P1_, - P1 -
+    m_bracket = re.search(r"[\[\(_\-\s](?:p|ep|tập|tap|phần|phan)\s*(\d{1,4}[a-zA-Z]?)[\]\)_\-\s]", ep, re.IGNORECASE)
+    if m_bracket:
+        return f"P{m_bracket.group(1).upper().strip()}"
+
+    # Nếu không tìm thấy mẫu tập rõ ràng, KHÔNG tự tiện lấy chuỗi số ngẫu nhiên (tránh bắt nhầm mã ID 19 số của TikTok/Douyin)
+    if fallback_idx is not None:
+        return f"P{fallback_idx}"
+    return ""
+
+
+def extract_clean_video_title(filename_or_stem: str) -> str:
+    """Làm sạch tên file video thành tiêu đề video đẹp:
+    - Bỏ phần mở rộng (.mp4, .mkv...)
+    - Bỏ mã số ID video dài (>=7 chữ số) ở đầu (ví dụ 19 số TikTok/Douyin: 7672309670169562394_)
+    - Bỏ các hậu tố kỹ thuật (_vi_xuly, _xuly, _output, _hd, _merged, _converted...)
+    - Bỏ tiền tố/hậu tố số tập nếu có (đã có badge riêng) để tránh trùng lặp
+    - Chuyển dấu gạch dưới thành khoảng trắng
+    """
+    stem = Path(filename_or_stem).stem
+    # Bỏ mã ID dạng số dài (>=7 số) ở đầu: ví dụ 7672309670169562394_
+    t = re.sub(r"^\d{7,}[_\-\s]+", "", stem)
+    # Bỏ hậu tố kỹ thuật ở đuôi
+    t = re.sub(r"([_\-\s]+(vi_xuly|xuly|output|final|converted|render|1080p|720p|hd|sub))+$", "", t, flags=re.IGNORECASE)
+    # Bỏ tiền tố số tập ở đầu nếu có (đã có badge riêng)
+    t = re.sub(r"^(?:p\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?)[\s:\-_]+", "", t, flags=re.IGNORECASE).strip()
+    # Bỏ số tập ở đuôi nếu có (ví dụ _Tap_3, - Tập 3, _P3)
+    t = re.sub(r"[\s:\-_]+(?:p\s*\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?)$", "", t, flags=re.IGNORECASE).strip()
+    t = t.replace("_", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
 def to_ascii_tag(text: str) -> str:
@@ -99,52 +134,63 @@ class OfflineSEOAssistant:
         episode_name: str = "",
         extra_info: str = "",
         channel_name: str = "",
-        episode_index: int = 1,
+        episode_index: Optional[int] = None,
     ) -> Dict[str, Any]:
         clean_title = clean_story_title(story_title)
-        badge = clean_episode_badge(episode_name, episode_index)
+        badge = clean_episode_badge(episode_name, episode_index) if episode_name else ""
         ch_name = channel_name.strip() or "Truyện Audio"
 
         # Lấy hook theo index để từng tập có phụ đề khác nhau
-        hook_idx = (episode_index - 1) % len(cls.EPISODE_HOOKS)
-        hook = cls.EPISODE_HOOKS[hook_idx]
+        if episode_index is not None and episode_index > 0:
+            hook_idx = (episode_index - 1) % len(cls.EPISODE_HOOKS)
+            hl_idx = (episode_index - 1) % len(cls.HIGHLIGHT_HOOKS)
+        else:
+            seed = abs(hash(clean_title))
+            hook_idx = seed % len(cls.EPISODE_HOOKS)
+            hl_idx = seed % len(cls.HIGHLIGHT_HOOKS)
 
-        hl_idx = (episode_index - 1) % len(cls.HIGHLIGHT_HOOKS)
+        hook = cls.EPISODE_HOOKS[hook_idx]
         hl_text = cls.HIGHLIGHT_HOOKS[hl_idx]
 
         # Tiêu đề chuẩn SEO YouTube (< 100 ký tự)
-        # Ví dụ: "PHẦN 1: Ta Là Tiêu Sư Giữ Quy Củ Nhất Thiên Hạ - Xuất Sơn Lập Uy | Gã Đạo Tặc"
-        candidate_title = f"{badge}: {clean_title} - {hook} | {ch_name}"
+        if badge:
+            candidate_title = f"{badge}: {clean_title} - {hook} | {ch_name}"
+        else:
+            candidate_title = f"{clean_title} - {hook} | {ch_name}"
+
         if len(candidate_title) > 98:
-            # Rút gọn nếu quá dài
-            candidate_title = f"{badge}: {clean_title} | {ch_name}"
+            candidate_title = f"{badge}: {clean_title} | {ch_name}" if badge else f"{clean_title} | {ch_name}"
             if len(candidate_title) > 98:
                 candidate_title = candidate_title[:95] + "..."
 
         # Hashtags
         tag_story = to_ascii_tag(clean_title)
         tag_ch = to_ascii_tag(ch_name)
-        tag_badge = to_ascii_tag(badge)
+        tag_badge = to_ascii_tag(badge) if badge else ""
+
+        badge_header = f" ({badge})" if badge else ""
+        badge_summary = f" {badge}" if badge else ""
+        badge_hashtag = f" #{tag_badge}" if tag_badge else ""
 
         # Mô tả chuyên nghiệp chuẩn YouTube
         description = f"""🎧 Chào mừng quý thính giả đến với kênh {ch_name}!
-📖 Mời các bạn cùng lắng nghe bộ truyện audio đặc sắc:
-⚔ {clean_title} ({badge})
+📖 Mời các bạn cùng lắng nghe tác phẩm đặc sắc:
+⚔ {clean_title}{badge_header}
 
-🔥 Tóm tắt nội dung {badge}:
-Hành trình kịch tính và đầy lôi cuốn của nhân vật chính giữa muôn trùng hiểm nguy và những quy tắc khắc nghiệt nơi giang hồ. Cùng theo dõi những tình tiết bất ngờ, những trận so tài nghẹt thở trong {badge}!
+🔥 Tóm tắt nội dung{badge_summary}:
+Hành trình kịch tính và đầy lôi cuốn của nhân vật chính giữa muôn trùng hiểm nguy và những biến cố khó lường. Cùng theo dõi những tình tiết bất ngờ, những nút thắt nghẹt thở!
 
 🎙 Diễn đọc: AI Story Audio
 📻 Chất lượng âm thanh: Âm thanh vòm Stereo chất lượng cao
 ⏰ Lịch phát sóng: Phát định kỳ hàng ngày trên kênh {ch_name}
 
-🔔 Hãy bấm ĐĂNG KÝ KÊNH (Subscribe) và BẬT CHUÔNG 🔔 để đón nghe các tập tiếp theo sớm nhất!
+🔔 Hãy bấm ĐĂNG KÝ KÊNH (Subscribe) và BẬT CHUÔNG 🔔 để đón xem các nội dung tiếp theo sớm nhất!
 👍 Đừng quên LIKE & BÌNH LUẬN cảm xúc của bạn dưới video để ủng hộ kênh nhé!
 
 © Bản quyền nội dung và âm thanh thuộc về {ch_name}.
 Vui lòng không sao chép hoặc reup dưới mọi hình thức để tôn trọng bản quyền tác giả.
 
-#truyenaudio #kiemhiep #tienhiep #{tag_story} #{tag_ch} #{tag_badge} #audiodoctruyen
+#truyenaudio #kiemhiep #tienhiep #{tag_story} #{tag_ch}{badge_hashtag} #audiodoctruyen
 """
 
         # Tags chuẩn SEO
@@ -155,13 +201,14 @@ Vui lòng không sao chép hoặc reup dưới mọi hình thức để tôn tr�
             "tien hiep",
             "truyen audio hay",
             "truyen audio moi nhat",
-            badge.lower(),
             ch_name.lower(),
             "audio truyen",
             "doc truyen online",
             "truyen audio trinh tham",
-            f"{clean_title.lower()} {badge.lower()}",
         ]
+        if badge:
+            tags_list.append(badge.lower())
+            tags_list.append(f"{clean_title.lower()} {badge.lower()}")
         tags = ", ".join(tags_list)
 
         return {
@@ -218,25 +265,29 @@ class GeminiAssistant:
             "generationConfig": {
                 "temperature": 0.7,
                 "topP": 0.95,
-                "maxOutputTokens": 2048,
+                "topK": 40,
+                "maxOutputTokens": 1200,
+                "responseMimeType": "application/json",
             }
         }
 
-        for m in models_to_try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={self.api_key}"
+        for mod in models_to_try:
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{mod}:generateContent?key={self.api_key}"
             try:
-                resp = requests.post(url, json=payload, timeout=25)
+                resp = requests.post(endpoint, json=payload, timeout=30)
                 if resp.status_code == 200:
                     data = resp.json()
                     candidates = data.get("candidates", [])
-                    if candidates:
-                        return candidates[0]["content"]["parts"][0]["text"]
-                last_error = f"Model {m} trả về HTTP {resp.status_code}: {resp.text}"
-            except Exception as e:
-                last_error = str(e)
-                continue
+                    if candidates and "content" in candidates[0]:
+                        parts = candidates[0]["content"].get("parts", [])
+                        if parts:
+                            return parts[0].get("text", "")
+                else:
+                    last_error = f"HTTP {resp.status_code}: {resp.text}"
+            except Exception as ex:
+                last_error = str(ex)
 
-        raise RuntimeError(f"Không thể kết nối Gemini API:\n{last_error}")
+        raise RuntimeError(f"Tất cả model Gemini đều thất bại. Chi tiết: {last_error}")
 
     def generate_video_metadata(
         self,
@@ -244,19 +295,21 @@ class GeminiAssistant:
         episode_name: str = "",
         extra_info: str = "",
         channel_name: str = "",
-        episode_index: int = 1,
+        episode_index: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Tạo trọn bộ Metadata: Tiêu đề giật tít SEO, Mô tả đầy đủ, Tags và text Thumbnail."""
+        ep_info = episode_name if episode_name else "Video đơn lẻ / Không có số tập (KHÔNG thêm tiền tố tập hay P... vào tiêu đề)"
+        title_eg = f'"{episode_name}: Tự Phế Đان Điền Để Đúc Căn Cơ Vô Thượng | {channel_name}"' if episode_name else f'"Tự Phế Đان Điền Để Đúc Căn Cơ Vô Thượng | {channel_name}"'
         prompt = f"""
 Bạn là chuyên gia tối ưu hóa nội dung YouTube (SEO YouTube Master) cho các kênh truyện audio, phim, tiểu thuyết.
 Hãy tạo thông tin đăng tải cho video YouTube sau:
 - Tên truyện / Chủ đề: {story_title}
-- Tập hoặc Chương: {episode_name}
+- Tập hoặc Chương: {ep_info}
 - Thông tin thêm: {extra_info}
 - Tên kênh: {channel_name}
 
 Yêu cầu nghiêm ngặt:
-1. "title": Tiêu đề cực kỳ cuốn hút, giật tít gây tò mò, chuẩn SEO nhưng TUYỆT ĐỐI KHÔNG vượt quá 95 ký tự. Ví dụ: "{episode_name}: Tự Phế Đan Điền Để Đúc Căn Cơ Vô Thượng | {channel_name}"
+1. "title": Tiêu đề cực kỳ cuốn hút, giật tít gây tò mò, chuẩn SEO nhưng TUYỆT ĐỐI KHÔNG vượt quá 95 ký tự. {title_eg}
 2. "description": Mô tả video chuyên nghiệp gồm:
    - Đoạn tóm tắt mở đầu 3-4 câu kịch tính, lôi cuốn người nghe.
    - Danh sách lưu ý nghe truyện, lịch phát sóng.
@@ -264,7 +317,7 @@ Yêu cầu nghiêm ngặt:
    - Tuyên bố bản quyền & miễn trừ trách nhiệm (Disclaimer).
    - 5 đến 8 Hashtag liên quan chuẩn xu hướng (#truyenaudio #kiemhiep...).
 3. "tags": Danh sách 15-20 từ khóa tìm kiếm (tags) chuẩn SEO liên quan nhất, cách nhau bằng dấu phẩy. Tổng độ dài dưới 450 ký tự.
-4. "thumbnail_badge": Chữ số tập ngắn gọn cho huy hiệu thumbnail (ví dụ: "{episode_name}").
+4. "thumbnail_badge": Chữ số tập ngắn gọn cho huy hiệu thumbnail (nếu không có số tập thì để chuỗi rỗng "").
 5. "thumbnail_highlight": Câu chữ ngắn 3-6 chữ gây sốc nhất để in to lên Thumbnail (ví dụ: "GIẢ LÀM PHẾ VẬT!").
 6. "thumbnail_ai_prompt": Một prompt chi tiết bằng tiếng Anh (dài 30-50 từ) để vẽ ảnh bìa.
 
@@ -273,7 +326,7 @@ BẮT BUỘC TRẢ VỀ DƯỚI ĐỊNH DẠNG JSON DUY NHẤT:
   "title": "...",
   "description": "...",
   "tags": "tag1, tag2, tag3, ...",
-  "thumbnail_badge": "...",
+  "thumbnail_badge": "{episode_name}",
   "thumbnail_highlight": "...",
   "thumbnail_ai_prompt": "..."
 }}
@@ -287,6 +340,9 @@ BẮT BUỘC TRẢ VỀ DƯỚI ĐỊNH DẠNG JSON DUY NHẤT:
                 cleaned = cleaned.split("`", 1)[1].split("`", 1)[0].strip()
 
             res = json.loads(cleaned)
+            if not episode_name:
+                res["thumbnail_badge"] = ""
+                res["title"] = re.sub(r"^(?:p\d{1,4}[a-zA-Z]?|tập\s*\d{1,4}[a-zA-Z]?|phần\s*\d{1,4}[a-zA-Z]?)[\s:\-_]+", "", res.get("title", ""), flags=re.IGNORECASE).strip()
             if len(res.get("title", "")) > 100:
                 res["title"] = res["title"][:97] + "..."
             res["provider_used"] = "gemini_api"
@@ -318,11 +374,12 @@ class CustomAIAssistant:
         episode_name: str = "",
         extra_info: str = "",
         channel_name: str = "",
-        episode_index: int = 1,
+        episode_index: Optional[int] = None,
     ) -> Dict[str, Any]:
+        ep_info = episode_name if episode_name else "Video đơn lẻ / Không có số tập (KHÔNG thêm tiền tố tập hay P... vào tiêu đề)"
         prompt = f"""Bạn là chuyên gia SEO YouTube truyện audio.
 Tên truyện: {story_title}
-Tập: {episode_name}
+Tập: {ep_info}
 Kênh: {channel_name}
 
 Trả về JSON duy nhất:
@@ -355,6 +412,9 @@ Trả về JSON duy nhất:
                 if m:
                     content = m.group(0)
                 res = json.loads(content)
+                if not episode_name:
+                    res["thumbnail_badge"] = ""
+                    res["title"] = re.sub(r"^(?:p\d{1,4}[a-zA-Z]?|tập\s*\d{1,4}[a-zA-Z]?|phần\s*\d{1,4}[a-zA-Z]?)[\s:\-_]+", "", res.get("title", ""), flags=re.IGNORECASE).strip()
                 res["provider_used"] = f"custom_ai ({self.model})"
                 return res
         except Exception:

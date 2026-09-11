@@ -13,12 +13,13 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit,
     QPushButton, QComboBox, QSpinBox, QDateEdit, QCheckBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox, QProgressBar,
-    QGroupBox, QSplitter, QFrame, QDialog, QTabWidget, QRadioButton, QButtonGroup
+    QGroupBox, QSplitter, QFrame, QDialog, QTabWidget, QRadioButton, QButtonGroup,
+    QScrollArea
 )
 
 from core.gemini_assistant import (
     GeminiAssistant, OfflineSEOAssistant, CustomAIAssistant,
-    clean_story_title, clean_episode_badge
+    clean_story_title, clean_episode_badge, extract_clean_video_title
 )
 from core.settings import PROJECTS_DIR, SettingsManager
 from core.thumbnail_builder import ThumbnailBuilder
@@ -246,8 +247,8 @@ class ContentWorker(QThread):
             if self._is_cancelled:
                 break
             story_title = task.get("story_title", "")
-            ep = task.get("episode_badge", f"TẬP {idx+1}")
-            ep_idx = task.get("episode_index", idx + 1)
+            ep = task.get("episode_badge") if task.get("episode_badge") is not None else ""
+            ep_idx = task.get("episode_index")
             try:
                 if self.provider == "offline":
                     data = OfflineSEOAssistant.generate_video_metadata(
@@ -404,16 +405,9 @@ class YouTubeTab(QWidget):
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(10)
 
-        splitter = QSplitter(Qt.Horizontal)
-
         # ==========================================
-        # CỘT 1: KÊNH YOUTUBE & DANH SÁCH VIDEO DỰ ÁN
+        # 1. KÊNH YOUTUBE
         # ==========================================
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(8)
-
         # Box 1: Quản lý kênh
         grp_channel = QGroupBox("1. Kênh YouTube (Đa tài khoản)")
         lay_ch = QVBoxLayout(grp_channel)
@@ -441,16 +435,21 @@ class YouTubeTab(QWidget):
         self.ch_info_label = QLabel("Chưa chọn kênh nào")
         self.ch_info_label.setStyleSheet("color: #666; font-size: 11px;")
         lay_ch.addWidget(self.ch_info_label)
-        left_layout.addWidget(grp_channel)
 
-        # Box 2: Chọn Dự án & Danh sách Video MP4 từng tập
+        # ==========================================
+        # 2. CHỌN DỰ ÁN & DANH SÁCH VIDEO
+        # ==========================================
         grp_project = QGroupBox("2. Chọn Dự án & Danh sách Video các tập")
         lay_proj = QVBoxLayout(grp_project)
 
         row_proj = QHBoxLayout()
         row_proj.addWidget(QLabel("Dự án:"))
         self.proj_combo = QComboBox()
+        self.proj_combo.setEditable(True)
+        self.proj_combo.setInsertPolicy(QComboBox.NoInsert)
         self.proj_combo.currentIndexChanged.connect(self._on_project_selected)
+        if self.proj_combo.lineEdit():
+            self.proj_combo.lineEdit().editingFinished.connect(self._on_project_name_edited)
         row_proj.addWidget(self.proj_combo, 1)
         self.refresh_proj_btn = QPushButton("🔄")
         self.refresh_proj_btn.setToolTip("Làm mới danh sách dự án và video")
@@ -477,6 +476,7 @@ class YouTubeTab(QWidget):
         h_header.setHighlightSections(True)
         self.video_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.video_table.cellClicked.connect(self._on_video_clicked)
+        self.video_table.cellChanged.connect(self._on_table_cell_changed)
         lay_proj.addWidget(self.video_table)
 
         row_tbl_btns = QHBoxLayout()
@@ -492,16 +492,17 @@ class YouTubeTab(QWidget):
         row_tbl_btns.addWidget(self.btn_pick_external_videos)
         lay_proj.addLayout(row_tbl_btns)
 
-        left_layout.addWidget(grp_project, 1)
-        splitter.addWidget(left_widget)
+        # Cụm nửa trên cột trái: Kênh YouTube + Danh sách Video MP4
+        left_top_widget = QWidget()
+        left_top_layout = QVBoxLayout(left_top_widget)
+        left_top_layout.setContentsMargins(0, 0, 0, 0)
+        left_top_layout.setSpacing(6)
+        left_top_layout.addWidget(grp_channel)
+        left_top_layout.addWidget(grp_project, 1)
 
         # ==========================================
-        # CỘT 2: TRỢ LÝ AI SEO & METADATA CHI TIẾT
+        # 3. TRỢ LÝ AI SEO & METADATA CHI TIẾT
         # ==========================================
-        mid_widget = QWidget()
-        mid_layout = QVBoxLayout(mid_widget)
-        mid_layout.setContentsMargins(0, 0, 0, 0)
-        mid_layout.setSpacing(8)
 
         # Box 3: Trợ lý AI SEO Content (Offline / Gemini / Custom)
         grp_ai = QGroupBox("3. Trợ lý AI Tạo Tiêu Đề & SEO (Đa Nhà Cung Cấp)")
@@ -648,7 +649,6 @@ class YouTubeTab(QWidget):
         self.btn_batch_ai_gen.setStyleSheet("font-weight: bold; background-color: #2b5797; color: white; padding: 7px; border-radius: 4px;")
         self.btn_batch_ai_gen.clicked.connect(self._generate_all_content)
         lay_ai.addWidget(self.btn_batch_ai_gen)
-        mid_layout.addWidget(grp_ai)
 
         # Box 4: Nội dung Video xuất bản (Theo từng tập)
         grp_meta = QGroupBox("4. Nội dung Video xuất bản (Tập đang chọn)")
@@ -776,15 +776,33 @@ class YouTubeTab(QWidget):
         lay_pub.addWidget(grp_pl)
 
         lay_meta.addLayout(lay_pub)
-        mid_layout.addWidget(grp_meta, 1)
-        splitter.addWidget(mid_widget)
+
+        # Ghép Cụm 3 & Cụm 4 vào nửa dưới của cột bên trái (bọc trong ScrollArea)
+        left_bottom_widget = QWidget()
+        left_bottom_layout = QVBoxLayout(left_bottom_widget)
+        left_bottom_layout.setContentsMargins(0, 0, 4, 0)
+        left_bottom_layout.setSpacing(6)
+        left_bottom_layout.addWidget(grp_ai)
+        left_bottom_layout.addWidget(grp_meta)
+
+        left_bottom_scroll = QScrollArea()
+        left_bottom_scroll.setWidgetResizable(True)
+        left_bottom_scroll.setFrameShape(QFrame.NoFrame)
+        left_bottom_scroll.setWidget(left_bottom_widget)
+
+        # Splitter dọc bên trái: Nửa trên (Kênh + Danh sách Video), Nửa dưới (AI SEO + Metadata)
+        left_splitter = QSplitter(Qt.Vertical)
+        left_splitter.setChildrenCollapsible(False)
+        left_splitter.addWidget(left_top_widget)
+        left_splitter.addWidget(left_bottom_scroll)
+        left_splitter.setSizes([380, 420])
 
         # ==========================================
-        # CỘT 3: THUMBNAIL STUDIO & TIẾN TRÌNH UPLOAD
+        # CỘT PHẢI: THUMBNAIL STUDIO & TIẾN TRÌNH UPLOAD
         # ==========================================
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setContentsMargins(0, 0, 4, 0)
         right_layout.setSpacing(8)
 
         # Box 5: Thumbnail Studio
@@ -951,13 +969,21 @@ class YouTubeTab(QWidget):
         lay_up.addWidget(self.upload_log)
 
         right_layout.addWidget(grp_upload, 1)
-        splitter.addWidget(right_widget)
 
-        splitter.setSizes([620, 440, 420])
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 3)
-        splitter.setStretchFactor(2, 3)
-        main_layout.addWidget(splitter)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.NoFrame)
+        right_scroll.setWidget(right_widget)
+
+        # Splitter chính nằm ngang: Cột Trái (Kênh + Video + AI + Meta) | Cột Phải (Thumbnail + Upload)
+        main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.setChildrenCollapsible(False)
+        main_splitter.addWidget(left_splitter)
+        main_splitter.addWidget(right_scroll)
+        main_splitter.setSizes([750, 450])
+        main_splitter.setStretchFactor(0, 3)
+        main_splitter.setStretchFactor(1, 2)
+        main_layout.addWidget(main_splitter)
         self._update_provider_visibility()
 
     # ==========================
@@ -1076,18 +1102,68 @@ class YouTubeTab(QWidget):
     # ==========================
     # LOGIC: DỰ ÁN & DANH SÁCH VIDEO
     # ==========================
+    def _on_project_name_edited(self) -> None:
+        raw_name = self.proj_combo.currentText().strip()
+        if raw_name:
+            clean_title = clean_story_title(raw_name)
+            self.new_playlist_edit.setText(clean_title)
+
+    def _on_table_cell_changed(self, row: int, col: int) -> None:
+        if not hasattr(self, "video_items") or row < 0 or row >= len(self.video_items):
+            return
+        item = self.video_items[row]
+        tbl_it = self.video_table.item(row, col)
+        if not tbl_it:
+            return
+        val = tbl_it.text().strip()
+
+        if col == 1:  # Cột Tập
+            item["episode_badge"] = val
+            if row == self.current_video_idx:
+                self.thumb_badge_edit.blockSignals(True)
+                self.thumb_badge_edit.setText(val)
+                self.thumb_badge_edit.blockSignals(False)
+                badge_prefix = f"[{val}] " if val else ""
+                self.editing_video_label.setText(f"Đang chỉnh sửa: {badge_prefix}{item['file_name']}")
+        elif col == 3:  # Cột Tiêu đề YouTube
+            item["title"] = val
+            tbl_it.setToolTip(val)
+            if row == self.current_video_idx:
+                self.title_edit.blockSignals(True)
+                self.title_edit.setText(val)
+                self.title_edit.blockSignals(False)
+                length = len(val)
+                self.title_len_label.setText(f"{length}/100")
+                if length > 95:
+                    self.title_len_label.setStyleSheet("color: red; font-weight: bold; font-size: 11px;")
+                else:
+                    self.title_len_label.setStyleSheet("color: #888; font-size: 11px;")
+
     def refresh_projects(self) -> None:
+        cur_text = self.proj_combo.currentText()
+        cur_data = self.proj_combo.currentData()
+        self.proj_combo.blockSignals(True)
         self.proj_combo.clear()
+
+        # Thêm mục Mặc định
+        self.proj_combo.addItem("Mặc định (Dự án chính)", "")
+
         projects = SettingsManager.list_projects()
         for p in projects:
             self.proj_combo.addItem(p.name.replace(".avr.json", "").replace(".json", ""), str(p))
 
-        current_name = self.settings.get("project", {}).get("current_name", "")
-        idx = self.proj_combo.findText(current_name)
-        if idx >= 0:
-            self.proj_combo.setCurrentIndex(idx)
-        elif self.proj_combo.count() > 0:
+        # Nếu trước đó đang chọn thư mục ngoài, giữ lại thư mục đó
+        if cur_data and Path(cur_data).is_dir():
+            self.proj_combo.insertItem(0, cur_text, cur_data)
             self.proj_combo.setCurrentIndex(0)
+        else:
+            current_name = self.settings.get("project", {}).get("current_name", "")
+            idx = self.proj_combo.findText(current_name)
+            if idx >= 0:
+                self.proj_combo.setCurrentIndex(idx)
+            elif self.proj_combo.count() > 0:
+                self.proj_combo.setCurrentIndex(0)
+        self.proj_combo.blockSignals(False)
         self._on_project_selected()
 
     def _on_project_selected(self) -> None:
@@ -1099,16 +1175,22 @@ class YouTubeTab(QWidget):
         clean_title = clean_story_title(raw_proj_name)
         self.new_playlist_edit.setText(clean_title)
 
-        if proj_path_str and Path(proj_path_str).exists():
-            try:
-                p_cfg = SettingsManager.load_project(Path(proj_path_str))
-                out_str = p_cfg.get("export", {}).get("output_folder") or p_cfg.get("project", {}).get("output_folder")
-                if out_str:
-                    output_dir = Path(out_str)
-                m_list = p_cfg.get("media_files", [])
-                self._current_project_media = [Path(m) for m in m_list if Path(m).exists()]
-            except Exception:
-                pass
+        is_external = False
+        if proj_path_str:
+            p_path = Path(proj_path_str)
+            if p_path.is_dir():
+                output_dir = p_path
+                is_external = True
+            elif p_path.exists():
+                try:
+                    p_cfg = SettingsManager.load_project(p_path)
+                    out_str = p_cfg.get("export", {}).get("output_folder") or p_cfg.get("project", {}).get("output_folder")
+                    if out_str:
+                        output_dir = Path(out_str)
+                    m_list = p_cfg.get("media_files", [])
+                    self._current_project_media = [Path(m) for m in m_list if Path(m).exists()]
+                except Exception:
+                    pass
 
         if not output_dir:
             output_dir = Path(self.settings.get("export", {}).get("output_folder", "output"))
@@ -1124,14 +1206,16 @@ class YouTubeTab(QWidget):
             return
 
         mp4_files = sorted(list(output_dir.glob("*.mp4")), key=lambda p: p.name)
-        self._load_mp4_files_into_table(mp4_files, clean_title)
+        self._load_mp4_files_into_table(mp4_files, clean_title, is_external=is_external)
 
-    def _load_mp4_files_into_table(self, mp4_files: List[Path], story_title: str) -> None:
+    def _load_mp4_files_into_table(self, mp4_files: List[Path], story_title: str, is_external: bool = False) -> None:
+        self.video_table.blockSignals(True)
         self.video_items = []
         self.video_table.setRowCount(len(mp4_files))
 
         for row, f in enumerate(mp4_files):
-            badge = clean_episode_badge(f.stem, row + 1)
+            # Nhận diện huy hiệu tập: nếu tên file không chứa số tập hợp lệ thì badge = ""
+            badge = clean_episode_badge(f.stem, fallback_idx=None)
             sz_mb = f.stat().st_size / (1024 * 1024) if f.exists() else 0.0
 
             # Kiểm tra xem có sẵn thumbnail trong thư mục không
@@ -1140,22 +1224,48 @@ class YouTubeTab(QWidget):
                 thumb_candidate = f.parent / f"{f.stem}.jpg"
             thumb_path = str(thumb_candidate) if thumb_candidate.exists() else None
 
-            # Sinh tiêu đề mặc định đẹp cho từng tập
-            item_title = f"{badge}: {story_title}" if story_title else f.stem
+            # Làm sạch tên video: bỏ ID dài, bỏ _vi_xuly...
+            clean_name = extract_clean_video_title(f.stem)
+            if not clean_name:
+                clean_name = f.stem
+
+            if is_external:
+                # Video mở ngoài: ưu tiên lấy tên video sạch của chính nó
+                if badge:
+                    item_title = f"{badge}: {clean_name}"
+                else:
+                    item_title = clean_name
+            else:
+                # Dự án nội bộ
+                if clean_name and clean_name.lower() != story_title.lower() and clean_name.lower() != "video":
+                    if badge:
+                        item_title = f"{badge}: {clean_name}"
+                    else:
+                        item_title = clean_name
+                else:
+                    if badge:
+                        item_title = f"{badge}: {story_title}"
+                    else:
+                        item_title = story_title or clean_name
+
             if len(item_title) > 95:
                 item_title = item_title[:95]
+
+            tag_base = f"{clean_name.lower()}, {story_title.lower() if story_title else ''}, truyen audio"
+            if badge:
+                tag_base += f", {badge.lower()}"
 
             item_data = {
                 "video_path": str(f),
                 "file_name": f.name,
                 "size_mb": sz_mb,
                 "episode_badge": badge,
-                "episode_index": row + 1,
+                "episode_index": row + 1 if badge else None,
                 "title": item_title,
                 "description": "",
-                "tags": f"{story_title.lower()}, truyen audio, kiem hiep, {badge.lower()}",
+                "tags": tag_base.strip(", "),
                 "thumbnail_path": thumb_path,
-                "thumbnail_hl": clean_story_title(story_title or f.stem).upper(),
+                "thumbnail_hl": (clean_name or story_title or f.stem).upper()[:40],
             }
             self.video_items.append(item_data)
 
@@ -1163,19 +1273,21 @@ class YouTubeTab(QWidget):
             chk_item = QTableWidgetItem()
             chk_item.setCheckState(Qt.Checked)
             chk_item.setData(Qt.UserRole, row)
+            chk_item.setFlags(chk_item.flags() & ~Qt.ItemIsEditable)
             self.video_table.setItem(row, 0, chk_item)
 
-            # Col 1: Tập
+            # Col 1: Tập (Cho phép sửa trực tiếp trong bảng)
             it_badge = QTableWidgetItem(badge)
             it_badge.setTextAlignment(Qt.AlignCenter)
             self.video_table.setItem(row, 1, it_badge)
 
-            # Col 2: Tên file
+            # Col 2: Tên file (Chỉ đọc)
             it_name = QTableWidgetItem(f.name)
             it_name.setToolTip(f.name)
+            it_name.setFlags(it_name.flags() & ~Qt.ItemIsEditable)
             self.video_table.setItem(row, 2, it_name)
 
-            # Col 3: Tiêu đề YouTube
+            # Col 3: Tiêu đề YouTube (Cho phép sửa trực tiếp trong bảng)
             it_title = QTableWidgetItem(item_title)
             it_title.setToolTip(item_title)
             self.video_table.setItem(row, 3, it_title)
@@ -1184,6 +1296,7 @@ class YouTubeTab(QWidget):
             thumb_status = "✔ Đã có" if thumb_path else "Chưa tạo"
             it_thumb = QTableWidgetItem(thumb_status)
             it_thumb.setTextAlignment(Qt.AlignCenter)
+            it_thumb.setFlags(it_thumb.flags() & ~Qt.ItemIsEditable)
             if thumb_path:
                 it_thumb.setForeground(Qt.green)
             else:
@@ -1193,20 +1306,41 @@ class YouTubeTab(QWidget):
             # Col 5: Dung lượng
             it_sz = QTableWidgetItem(f"{sz_mb:.1f} MB")
             it_sz.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            it_sz.setFlags(it_sz.flags() & ~Qt.ItemIsEditable)
             self.video_table.setItem(row, 5, it_sz)
+
+        self.video_table.blockSignals(False)
 
         if mp4_files:
             self._select_video_row(0)
 
     def _pick_external_videos(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Chọn danh sách video MP4 cần tải lên", "", "Video (*.mp4 *.mkv *.mov)"
+            self, "Chọn danh sách video MP4 cần tải lên", "", "Video (*.mp4 *.mkv *.mov *.avi)"
         )
         if not files:
             return
         mp4_files = [Path(f) for f in files]
-        story_title = clean_story_title(self.proj_combo.currentText())
-        self._load_mp4_files_into_table(mp4_files, story_title)
+        folder = mp4_files[0].parent
+        folder_name = folder.name
+
+        # Đặt tên dự án theo tên thư mục ngoài
+        proj_label = f"📁 {folder_name} (Thư mục ngoài)"
+        self.proj_combo.blockSignals(True)
+        found_idx = -1
+        for i in range(self.proj_combo.count()):
+            if self.proj_combo.itemData(i) == str(folder):
+                found_idx = i
+                break
+        if found_idx >= 0:
+            self.proj_combo.setCurrentIndex(found_idx)
+        else:
+            self.proj_combo.insertItem(0, proj_label, str(folder))
+            self.proj_combo.setCurrentIndex(0)
+        self.proj_combo.blockSignals(False)
+
+        self._current_project_dir = folder
+        self._load_mp4_files_into_table(mp4_files, story_title=folder_name, is_external=True)
 
     def _select_all_videos(self) -> None:
         for r in range(self.video_table.rowCount()):
@@ -1229,7 +1363,10 @@ class YouTubeTab(QWidget):
         self.current_video_idx = row
         item = self.video_items[row]
 
-        self.editing_video_label.setText(f"Đang chỉnh sửa: [{item['episode_badge']}] {item['file_name']}")
+        badge_val = item.get("episode_badge", "")
+        badge_prefix = f"[{badge_val}] " if badge_val else ""
+        self.editing_video_label.setText(f"Đang chỉnh sửa: {badge_prefix}{item['file_name']}")
+
         self.title_edit.blockSignals(True)
         self.title_edit.setText(item.get("title", ""))
         self.title_edit.blockSignals(False)
@@ -1244,7 +1381,7 @@ class YouTubeTab(QWidget):
         self.tags_edit.blockSignals(False)
 
         self.thumb_badge_edit.blockSignals(True)
-        self.thumb_badge_edit.setText(item.get("episode_badge", f"P{row+1}"))
+        self.thumb_badge_edit.setText(badge_val)
         self.thumb_badge_edit.blockSignals(False)
 
         self.thumb_hl_edit.blockSignals(True)
@@ -1253,8 +1390,8 @@ class YouTubeTab(QWidget):
             self.thumb_hl_edit.setText(saved_hl)
         else:
             default_hl = clean_story_title(item.get("title", "") or self.proj_combo.currentText())
-            self.thumb_hl_edit.setText(default_hl.upper())
-            item["thumbnail_hl"] = default_hl.upper()
+            self.thumb_hl_edit.setText(default_hl.upper()[:40])
+            item["thumbnail_hl"] = default_hl.upper()[:40]
         self.thumb_hl_edit.blockSignals(False)
 
         # Cập nhật preview Thumbnail
@@ -1263,7 +1400,8 @@ class YouTubeTab(QWidget):
             self._set_thumbnail_preview(Path(thumb_p))
         else:
             self.thumb_preview.clear()
-            self.thumb_preview.setText(f"Chưa có Thumbnail\n({item['episode_badge']})")
+            badge_note = f"\n({badge_val})" if badge_val else ""
+            self.thumb_preview.setText(f"Chưa có Thumbnail{badge_note}")
             self.current_thumbnail_path = None
 
     def _on_title_changed(self, text: str) -> None:
@@ -1277,8 +1415,11 @@ class YouTubeTab(QWidget):
         if 0 <= self.current_video_idx < len(self.video_items):
             self.video_items[self.current_video_idx]["title"] = text
             tbl_it = self.video_table.item(self.current_video_idx, 3)
-            if tbl_it:
+            if tbl_it and tbl_it.text() != text:
+                self.video_table.blockSignals(True)
                 tbl_it.setText(text)
+                tbl_it.setToolTip(text)
+                self.video_table.blockSignals(False)
 
     def _on_desc_changed(self) -> None:
         if 0 <= self.current_video_idx < len(self.video_items):
@@ -1370,10 +1511,11 @@ class YouTubeTab(QWidget):
             if chk_it and chk_it.checkState() == Qt.Checked and r < len(self.video_items):
                 item = self.video_items[r]
                 selected_indices.append(r)
+                bdg = item.get("episode_badge", "")
                 tasks.append({
-                    "story_title": clean_title or item["file_name"],
-                    "episode_badge": item.get("episode_badge", f"TẬP {r+1}"),
-                    "episode_index": item.get("episode_index", r + 1),
+                    "story_title": item.get("title") or clean_title or item["file_name"],
+                    "episode_badge": bdg,
+                    "episode_index": item.get("episode_index"),
                 })
 
         if not tasks:
@@ -1427,6 +1569,7 @@ class YouTubeTab(QWidget):
                 row_idx = selected_indices[task_idx]
                 if ok and data:
                     item = self.video_items[row_idx]
+                    self.video_table.blockSignals(True)
                     if "title" in data:
                         item["title"] = data["title"]
                         self.video_table.setItem(row_idx, 3, QTableWidgetItem(data["title"]))
@@ -1435,16 +1578,23 @@ class YouTubeTab(QWidget):
                     if "tags" in data:
                         item["tags"] = data["tags"]
                     if "thumbnail_badge" in data:
-                        badge = clean_episode_badge(data["thumbnail_badge"], row_idx + 1)
+                        raw_bdg = data["thumbnail_badge"]
+                        if item.get("episode_badge"):
+                            badge = clean_episode_badge(raw_bdg, fallback_idx=None) or item["episode_badge"]
+                        else:
+                            badge = ""
                         item["episode_badge"] = badge
                         self.video_table.setItem(row_idx, 1, QTableWidgetItem(badge))
+                    self.video_table.blockSignals(False)
+
                     if "thumbnail_highlight" in data and data["thumbnail_highlight"]:
                         item["thumbnail_hl"] = data["thumbnail_highlight"].strip().upper()
 
                     if row_idx == self.current_video_idx:
                         self._select_video_row(row_idx)
 
-                    self._log(f"✔ Đã tạo nội dung cho [{item['episode_badge']}]: {item['title']}")
+                    bdg_tag = f"[{item['episode_badge']}] " if item.get('episode_badge') else ""
+                    self._log(f"✔ Đã tạo nội dung cho {bdg_tag}{item['title']}")
                 else:
                     self._log(f"⚠ Lỗi tạo tập {task_idx+1}: {msg}")
 
@@ -1496,7 +1646,7 @@ class YouTubeTab(QWidget):
         count = 0
         badge_only_count = 0
         for idx, item in enumerate(self.video_items):
-            badge = item.get("episode_badge", f"P{idx+1}")
+            badge = item.get("episode_badge") if item.get("episode_badge") is not None else ""
             bg_img = candidates[idx % len(candidates)] if candidates else Path("temp/preview_fx_bubbles.png")
             out_thumb = out_dir / f"thumbnail_tap_{idx+1}.jpg"
 
@@ -1508,7 +1658,8 @@ class YouTubeTab(QWidget):
                 has_text, info = ThumbnailBuilder.detect_text_in_image(bg_img)
                 if has_text:
                     is_badge_only = True
-                    self._log(f"🔍 [Tập {idx+1}] Ảnh ĐÃ CÓ CHỮ SẴN ({info}) -> Tự động chỉ đóng Huy hiệu [{badge}].")
+                    bdg_info = f"[{badge}]" if badge else "Huy hiệu"
+                    self._log(f"🔍 [Tập {idx+1}] Ảnh ĐÃ CÓ CHỮ SẴN ({info}) -> Tự động chỉ đóng {bdg_info}.")
                 else:
                     is_badge_only = False
             else:
@@ -1570,7 +1721,9 @@ class YouTubeTab(QWidget):
         out_dir = self._current_project_dir or Path("D:/auto_video_renderer/auto_video_renderer/temp")
         out_thumb = out_dir / f"thumbnail_tap_{self.current_video_idx+1}.jpg"
 
-        badge = self.thumb_badge_edit.text().strip() or item.get("episode_badge", f"P{self.current_video_idx+1}")
+        badge = self.thumb_badge_edit.text().strip()
+        if not badge and item.get("episode_badge") is not None:
+            badge = item.get("episode_badge", "")
         hl = self.thumb_hl_edit.text().strip() or item.get("thumbnail_hl") or clean_story_title(item.get("title", "") or self.proj_combo.currentText()).upper()
         ch_name = self.channel_combo.currentText().split("(")[0].strip()
 
@@ -1728,10 +1881,12 @@ class YouTubeTab(QWidget):
             # TỰ ĐỘNG TẠO THUMBNAIL KIẾM HIỆP NẾU CHƯA CÓ
             thumb_path = item.get("thumbnail_path")
             if not thumb_path or not Path(thumb_path).exists():
-                ep_idx = item.get("episode_index", idx + 1)
-                badge = item.get("episode_badge") or f"P{ep_idx}"
-                bg_img = candidates[(ep_idx - 1) % len(candidates)] if candidates else Path("temp/preview_fx_bubbles.png")
-                out_thumb = out_dir / f"thumbnail_tap_{ep_idx}.jpg"
+                ep_idx = item.get("episode_index")
+                badge = item.get("episode_badge") if item.get("episode_badge") is not None else ""
+                bg_idx = (ep_idx - 1) if (ep_idx is not None and ep_idx > 0) else idx
+                bg_img = candidates[bg_idx % len(candidates)] if candidates else Path("temp/preview_fx_bubbles.png")
+                thumb_suffix = f"tap_{ep_idx}" if ep_idx is not None else f"video_{idx+1}"
+                out_thumb = out_dir / f"thumbnail_{thumb_suffix}.jpg"
                 hl_text = item.get("thumbnail_hl") or clean_story_title(item.get("title", "") or raw_story_title).upper()
 
                 is_badge_only = False
