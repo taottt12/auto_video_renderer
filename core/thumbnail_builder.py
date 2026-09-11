@@ -6,7 +6,7 @@ import math
 import random
 from pathlib import Path
 from typing import Optional, Dict, Tuple
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageStat
 
 
 class ThumbnailBuilder:
@@ -186,6 +186,43 @@ class ThumbnailBuilder:
         }
 
     @classmethod
+    def detect_text_in_image(cls, image_path: str | Path) -> Tuple[bool, str]:
+        """Tự động quét phát hiện xem ảnh nền đã có sẵn chữ/tiêu đề hay chưa.
+        Phân tích mật độ viền sắc nét cục bộ (High-contrast Edge Density) qua PIL:
+        Chữ viết/Typography luôn có độ tương phản cao và mật độ đường viền dày đặc trong các vùng cục bộ.
+        """
+        try:
+            p = Path(image_path)
+            if not p.exists():
+                return False, "File không tồn tại"
+
+            img = Image.open(p).convert("L")
+            target_w, target_h = 1280, 720
+            img_resized = img.resize((target_w, target_h), Image.Resampling.BILINEAR)
+            edges = img_resized.filter(ImageFilter.FIND_EDGES)
+
+            grid_x, grid_y = 8, 8
+            cell_w = target_w // grid_x
+            cell_h = target_h // grid_y
+            high_edge_cells = 0
+
+            for r in range(grid_y):
+                for c in range(grid_x):
+                    box = (c * cell_w, r * cell_h, (c + 1) * cell_w, (r + 1) * cell_h)
+                    cell = edges.crop(box)
+                    stat = ImageStat.Stat(cell)
+                    mean_edge = stat.mean[0]
+                    std_edge = stat.stddev[0]
+                    if mean_edge > 30 and std_edge > 32:
+                        high_edge_cells += 1
+
+            has_text = high_edge_cells >= 4
+            info = f"Mật độ viền chữ: {high_edge_cells} vùng (ngưỡng phát hiện >= 4)"
+            return has_text, info
+        except Exception as e:
+            return False, f"Lỗi quét: {e}"
+
+    @classmethod
     def create_thumbnail(
         cls,
         bg_image: str | Path,
@@ -199,6 +236,8 @@ class ThumbnailBuilder:
         pos_x: Optional[int] = None,
         pos_y: Optional[int] = None,
         font_scale: float = 0.68,
+        badge_only: bool = False,
+        badge_position: str = "top_left",
     ) -> Path:
         """Tạo thumbnail chuẩn 16:9 1280x720: Giữ nguyên 100% màu gốc ảnh, nét chữ bút pháp kiếm hiệp, né mặt nhân vật và hỗ trợ bố cục phân tách đa điểm (Split Layout)."""
         out_file = Path(output_path)
@@ -221,6 +260,45 @@ class ThumbnailBuilder:
         left = (new_w - cls.WIDTH) // 2
         top = (new_h - cls.HEIGHT) // 2
         base = base.crop((left, top, left + cls.WIDTH, top + cls.HEIGHT))
+
+        # =========================================================================
+        # CHẾ ĐỘ CHỈ ĐÓNG HUY HIỆU TẬP (Khi ảnh gốc ĐÃ CÓ CHỮ SẴN)
+        # 100% giữ nguyên ảnh gốc, không phủ vignette làm mờ, không vẽ lại tiêu đề
+        # =========================================================================
+        if badge_only:
+            overlay = Image.new("RGBA", (cls.WIDTH, cls.HEIGHT), (0, 0, 0, 0))
+            badge_clean = (badge_text or "").strip().upper()
+            if badge_clean:
+                f_badge = cls._get_font("Protest_Revolution.ttf", 24)
+                d_test = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+                bbox = d_test.textbbox((0, 0), badge_clean, font=f_badge)
+                tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
+                bw = max(110, int(tw + 36))
+                bh = 46
+                bdg = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+                bd = ImageDraw.Draw(bdg)
+                # Bóng đổ
+                bd.rounded_rectangle([4, 4, bw, bh], radius=8, fill=(0, 0, 0, 180))
+                # Nền đỏ viền vàng hoàng kim
+                bd.rounded_rectangle([0, 0, bw - 4, bh - 4], radius=8, fill=(185, 15, 20, 245), outline=(255, 215, 0, 255), width=2)
+                tx = (bw - 4 - tw) // 2 - bbox[0]
+                ty = (bh - 4 - th) // 2 - bbox[1]
+                bd.text((tx, ty), badge_clean, font=f_badge, fill=(255, 255, 255, 255))
+
+                pos = (28, 22)
+                bpos_clean = (badge_position or "top_left").lower().strip()
+                if bpos_clean in ("top_right", "tr"):
+                    pos = (cls.WIDTH - bw - 28, 22)
+                elif bpos_clean in ("bottom_left", "bl"):
+                    pos = (28, cls.HEIGHT - bh - 22)
+                elif bpos_clean in ("bottom_right", "br"):
+                    pos = (cls.WIDTH - bw - 28, cls.HEIGHT - bh - 22)
+                overlay.paste(bdg, pos, bdg)
+
+            final_img = Image.alpha_composite(base, overlay).convert("RGB")
+            final_img.save(str(out_file), "JPEG", quality=95, optimize=True)
+            return out_file
 
         # 2. Phân tích tiêu đề theo các tầng chữ
         p = cls._parse_title_structure(highlight_title)
@@ -553,10 +631,19 @@ class ThumbnailBuilder:
         badge_clean = (badge_text or "").strip().upper()
         if badge_clean:
             f_badge = cls._get_font("Protest_Revolution.ttf", 22)
-            bdg = Image.new("RGBA", (110, 42), (0, 0, 0, 0))
+            d_test = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+            b_box = d_test.textbbox((0, 0), badge_clean, font=f_badge)
+            tw = b_box[2] - b_box[0]
+            th = b_box[3] - b_box[1]
+            bw = max(110, int(tw + 34))
+            bh = 42
+            bdg = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
             bdg_d = ImageDraw.Draw(bdg)
-            bdg_d.rounded_rectangle([2, 2, 106, 38], radius=8, fill=(185, 15, 20, 240), outline=(255, 215, 0, 255), width=2)
-            bdg_d.text((32, 5), badge_clean, font=f_badge, fill=(255, 255, 255, 255))
+            bdg_d.rounded_rectangle([3, 3, bw, bh], radius=8, fill=(0, 0, 0, 160))
+            bdg_d.rounded_rectangle([0, 0, bw - 3, bh - 3], radius=8, fill=(185, 15, 20, 240), outline=(255, 215, 0, 255), width=2)
+            tx = (bw - 3 - tw) // 2 - b_box[0]
+            ty = (bh - 3 - th) // 2 - b_box[1]
+            bdg_d.text((tx, ty), badge_clean, font=f_badge, fill=(255, 255, 255, 255))
             overlay.paste(bdg, badge_pos, bdg)
 
         # 5. Lưu kết quả JPEG chất lượng cao 95%
