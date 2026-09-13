@@ -33,6 +33,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "media_files": [],
     "shuffle_media": True,
     "avoid_repeat": True,
+    "delete_audio_after_render": False,
     "intro_file": "",
     "outro_file": "",
     "logo_file": "",

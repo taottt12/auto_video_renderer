@@ -151,6 +151,7 @@ class RenderWorker(QThread):
         max_workers = self._max_workers()
         self.log_signal.emit(f"Bắt đầu queue với {max_workers} luồng render song song.")
         bgm_assignments = self._build_bgm_assignments(len(self.audio_files))
+        delete_audio = bool(self.settings.get("delete_audio_after_render", False))
         futures = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for idx, (row, audio) in enumerate(zip(self.rows, self.audio_files)):
@@ -164,6 +165,15 @@ class RenderWorker(QThread):
                     if result.success:
                         self.row_update_signal.emit(row, "Hoàn thành", "Xong", 100, str(result.output_file))
                         self.log_signal.emit(f"[Dòng {row + 1}] Hoàn thành: {result.output_file}")
+
+                        if delete_audio:
+                            try:
+                                audio_p = Path(result.audio_file)
+                                if audio_p.exists():
+                                    audio_p.unlink(missing_ok=True)
+                                    self.log_signal.emit(f"[Dòng {row + 1}] 🗑 Đã xóa file MP3 nguồn: {audio_p.name}")
+                            except Exception as ex_del:
+                                self.log_signal.emit(f"[Dòng {row + 1}] ⚠️ Không thể xóa file MP3 nguồn ({result.audio_file}): {ex_del}")
                     else:
                         status = "Đã dừng" if self.cancel_event.is_set() else "Lỗi"
                         self.row_update_signal.emit(row, status, result.message, 0, "")
@@ -415,6 +425,11 @@ class RenderTab(QWidget):
         self.change_out_btn = QPushButton("📂 Đổi thư mục xuất")
         self.change_out_btn.clicked.connect(self._change_output_folder)
 
+        self.chk_delete_audio_after_render = QCheckBox("🗑 Xóa file MP3 nguồn khi render xong")
+        self.chk_delete_audio_after_render.setToolTip("Khi render video hoàn tất thành công, tự động xóa file MP3 audio nguồn để giải phóng dung lượng ổ đĩa.")
+        self.chk_delete_audio_after_render.setStyleSheet("color: #ff9800; font-weight: bold; font-size: 11px;")
+        self.chk_delete_audio_after_render.stateChanged.connect(self._on_render_options_changed)
+
         self.project_info_label = QLabel("Dự án: Chưa lưu")
         self.project_info_label.setStyleSheet("color: #2e7d32; font-weight: bold; font-size: 11px;")
         self.out_info_label = QLabel("")
@@ -434,6 +449,8 @@ class RenderTab(QWidget):
         buttons.addWidget(self.change_out_btn)
         buttons.addWidget(self.project_info_label)
         buttons.addWidget(self.out_info_label)
+        buttons.addSpacing(10)
+        buttons.addWidget(self.chk_delete_audio_after_render)
         buttons.addSpacing(15)
         buttons.addWidget(self.remove_btn)
         buttons.addWidget(self.clear_btn)
@@ -694,6 +711,11 @@ class RenderTab(QWidget):
         if not self._lock_sync:
             self._sync_media_settings()
 
+    def _on_render_options_changed(self) -> None:
+        if not self._lock_sync:
+            self.settings["delete_audio_after_render"] = self.chk_delete_audio_after_render.isChecked()
+            self.settings_changed.emit(self.settings)
+
     def _sync_audio_settings(self) -> None:
         audios = [self.audio_list.item(i).text() for i in range(self.audio_list.count())]
         self.settings["audio_files"] = audios
@@ -794,6 +816,7 @@ class RenderTab(QWidget):
 
         self.shuffle_checkbox.setChecked(bool(settings.get("shuffle_media", True)))
         self.avoid_repeat_checkbox.setChecked(bool(settings.get("avoid_repeat", True)))
+        self.chk_delete_audio_after_render.setChecked(bool(settings.get("delete_audio_after_render", False)))
 
         self.audio_count_label.setText(f"Tổng: {self.audio_list.count()} audio")
         self.media_count_label.setText(f"{self.media_list.count()} media")
@@ -814,11 +837,14 @@ class RenderTab(QWidget):
             QMessageBox.information(self, "Đang render", "Tool đang render, hãy dừng hoặc đợi hoàn thành.")
             return
 
+        self._stop_playback()
+
         media_files = [self.media_list.item(i).text() for i in range(self.media_list.count())]
         if not media_files:
             QMessageBox.warning(self, "Thiếu media", "Bạn chưa chọn ảnh/video nền trong danh sách Media.")
             return
         self.settings["media_files"] = media_files
+        self.settings["delete_audio_after_render"] = self.chk_delete_audio_after_render.isChecked()
 
         rows = self.selected_rows() or list(range(self.table.rowCount()))
         audio_files = [str(self.table.item(row, 0).data(Qt.UserRole) or self.table.item(row, 0).text()) for row in rows]
