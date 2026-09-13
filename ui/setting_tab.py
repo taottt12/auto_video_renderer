@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.media_utils import AUDIO_EXTENSIONS
+from ui.subtitle_widget import SubtitleBoxSelectorWidget
 
 
 class LayoutPreviewWidget(QWidget):
@@ -217,6 +218,43 @@ class LayoutPreviewWidget(QWidget):
             for idx, line in enumerate(lines):
                 line_y = ty + pad_y + fm.ascent() + idx * fm.lineSpacing()
                 painter.drawText(tx + pad_x, line_y, line)
+
+        # 4b. Phụ đề Video (Subtitle Overlay Preview)
+        sub_cfg = self.settings.get("subtitle", {}) or {}
+        if sub_cfg.get("enabled"):
+            sub_x = float(sub_cfg.get("box_x", 0.15))
+            sub_y = float(sub_cfg.get("box_y", 0.70))
+            sub_w = float(sub_cfg.get("box_w", 0.70))
+            sub_h = float(sub_cfg.get("box_h", 0.20))
+            s_rect = QRect(
+                canvas_x + int(sub_x * canvas_w),
+                canvas_y + int(sub_y * canvas_h),
+                max(20, int(sub_w * canvas_w)),
+                max(15, int(sub_h * canvas_h))
+            )
+            painter.fillRect(s_rect, QColor(0, 200, 255, 30))
+            painter.setPen(QPen(QColor("#00e5ff"), 1, Qt.DashLine))
+            painter.drawRect(s_rect)
+
+            sub_font_fam = str(sub_cfg.get("font_family", "Arial") or "Arial")
+            sub_font_size = max(7, int(int(sub_cfg.get("font_size", 38)) * (canvas_h / max(1, ratio_h))))
+            sub_font = QFont(sub_font_fam, sub_font_size)
+            sub_font.setBold(bool(sub_cfg.get("bold", True)))
+            sub_font.setItalic(bool(sub_cfg.get("italic", False)))
+            painter.setFont(sub_font)
+
+            s_text = "Phụ đề mẫu (Subtitle)"
+            sfm = painter.fontMetrics()
+            st_w = sfm.horizontalAdvance(s_text)
+            st_x = s_rect.left() + (s_rect.width() - st_w) // 2
+            st_y = s_rect.bottom() - 4
+
+            spath = QPainterPath()
+            spath.addText(st_x, st_y, sub_font, s_text)
+            out_w = float(sub_cfg.get("outline_width", 2.0) or 2.0)
+            if out_w > 0:
+                painter.strokePath(spath, QPen(QColor(str(sub_cfg.get("outline_color", "#000000"))), max(1.0, out_w)))
+            painter.fillPath(spath, QBrush(QColor(str(sub_cfg.get("font_color", "#FFFFFF")))))
 
         # 5. Khung viền và thông số tỉ lệ
         painter.setPen(QPen(QColor("#00bcd4"), 2))
@@ -764,6 +802,7 @@ class SettingTab(QWidget):
 
         root.addWidget(CollapsibleBox("Intro / Outro / Logo / Watermark", self._build_extra_group(), collapsed=False))
         root.addWidget(CollapsibleBox("Text Overlay", self._build_text_group(), collapsed=True))
+        root.addWidget(CollapsibleBox("Phụ đề Video (Subtitle)", self._build_subtitle_group(), collapsed=False))
         root.addWidget(CollapsibleBox("Nhạc nền (Background Music)", self._build_background_music_group(), collapsed=True))
         root.addWidget(CollapsibleBox("Audio quảng bá / chèn giữa video", self._build_promo_audio_group(), collapsed=True))
         root.addWidget(CollapsibleBox("Hiệu ứng thị giác & Chuyển cảnh", self._build_effect_audio_group(), collapsed=False))
@@ -906,6 +945,164 @@ class SettingTab(QWidget):
         )
         self.text_font_color.textChanged.connect(self._update_color_preview)
         return group
+
+    def _build_subtitle_group(self) -> QGroupBox:
+        group = QGroupBox()
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        form = QFormLayout()
+        self.sub_enabled = QCheckBox("Bật chèn phụ đề vào video (Burn-in Subtitle)")
+        self.sub_enabled.setStyleSheet("font-weight: bold; color: #00e5ff;")
+
+        folder_row = QHBoxLayout()
+        self.sub_folder_edit = QLineEdit()
+        self.sub_folder_edit.setPlaceholderText("Để trống = tự động tìm file .srt cùng tên trong thư mục audio")
+        self.sub_folder_btn = QPushButton("Chọn thư mục...")
+        self.sub_folder_btn.clicked.connect(self._choose_sub_folder)
+        folder_row.addWidget(self.sub_folder_edit, 1)
+        folder_row.addWidget(self.sub_folder_btn)
+
+        font_row = QHBoxLayout()
+        self.sub_font_family = QComboBox()
+        fonts = ["Arial", "Roboto", "Montserrat", "Segoe UI", "Tahoma", "Times New Roman", "Verdana", "UTM Alexander", "UTM Bebas"]
+        self.sub_font_family.addItems(fonts)
+        self.sub_font_family.setEditable(True)
+
+        self.sub_font_size = QSpinBox()
+        self.sub_font_size.setRange(12, 120)
+        self.sub_font_size.setValue(38)
+        self.sub_font_size.setToolTip("Cỡ chữ chuẩn ở độ phân giải 1080p")
+
+        self.sub_bold = QCheckBox("In đậm (Bold)")
+        self.sub_bold.setChecked(True)
+        self.sub_italic = QCheckBox("In nghiêng (Italic)")
+        self.sub_italic.setChecked(False)
+
+        font_row.addWidget(self.sub_font_family, 2)
+        font_row.addWidget(QLabel("Cỡ:"))
+        font_row.addWidget(self.sub_font_size, 1)
+        font_row.addWidget(self.sub_bold)
+        font_row.addWidget(self.sub_italic)
+
+        color_row = QHBoxLayout()
+        self.sub_font_color = QLineEdit("#FFFFFF")
+        self.sub_font_color.setFixedWidth(80)
+        self.sub_color_btn = QPushButton("Màu chữ")
+        self.sub_color_btn.clicked.connect(self._choose_sub_font_color)
+        self.sub_color_preview = QLabel()
+        self.sub_color_preview.setFixedSize(24, 24)
+
+        self.sub_outline_color = QLineEdit("#000000")
+        self.sub_outline_color.setFixedWidth(80)
+        self.sub_outline_color_btn = QPushButton("Màu viền")
+        self.sub_outline_color_btn.clicked.connect(self._choose_sub_outline_color)
+        self.sub_outline_color_preview = QLabel()
+        self.sub_outline_color_preview.setFixedSize(24, 24)
+
+        self.sub_outline_width = QDoubleSpinBox()
+        self.sub_outline_width.setRange(0.0, 15.0)
+        self.sub_outline_width.setSingleStep(0.5)
+        self.sub_outline_width.setValue(2.5)
+
+        color_row.addWidget(QLabel("Màu:"))
+        color_row.addWidget(self.sub_font_color)
+        color_row.addWidget(self.sub_color_btn)
+        color_row.addWidget(self.sub_color_preview)
+        color_row.addSpacing(10)
+        color_row.addWidget(QLabel("Viền:"))
+        color_row.addWidget(self.sub_outline_color)
+        color_row.addWidget(self.sub_outline_color_btn)
+        color_row.addWidget(self.sub_outline_color_preview)
+        color_row.addWidget(QLabel("Dày:"))
+        color_row.addWidget(self.sub_outline_width)
+
+        auto_row = QHBoxLayout()
+        self.sub_auto_transcribe = QCheckBox("⚡ Tự động quét giọng nói & tạo phụ đề khi Render (Whisper AI)")
+        self.sub_auto_transcribe.setStyleSheet("color: #ffca28; font-weight: bold;")
+        self.sub_auto_transcribe.setToolTip("Khi bật, lúc nhấn 'Chạy render' hệ thống sẽ tự động nghe MP3 để nhận diện ngôn ngữ nước đó và tạo file .srt rồi gắn vào video. Nếu tắt thì trực tiếp render luôn.")
+        self.sub_whisper_model = QComboBox()
+        self.sub_whisper_model.addItem("tiny (Siêu tốc)", "tiny")
+        self.sub_whisper_model.addItem("base (Cân bằng - Khuyên dùng)", "base")
+        self.sub_whisper_model.addItem("small (Chính xác cao)", "small")
+        self.sub_whisper_model.setCurrentIndex(1)
+        auto_row.addWidget(self.sub_auto_transcribe, 2)
+        auto_row.addWidget(QLabel("Model:"))
+        auto_row.addWidget(self.sub_whisper_model, 1)
+
+        form.addRow("Trạng thái", self.sub_enabled)
+        form.addRow("Quét Sub tự động", auto_row)
+        form.addRow("Thư mục Sub (.srt)", folder_row)
+        form.addRow("Phông chữ & Kiểu", font_row)
+        form.addRow("Màu & Độ dày viền", color_row)
+        layout.addLayout(form)
+
+        # Bounding box selector widget
+        box_desc = QLabel("Vùng hiển thị phụ đề (Kéo thả khung để định vị & co giãn; Mặc định: 2 bên 15%, cao 20%, cách đáy 10%):")
+        box_desc.setStyleSheet("color: #00e5ff; font-weight: bold; font-size: 11px; margin-top: 4px;")
+        layout.addWidget(box_desc)
+
+        self.sub_box_selector = SubtitleBoxSelectorWidget()
+        self.sub_box_selector.setMinimumHeight(240)
+        layout.addWidget(self.sub_box_selector)
+
+        # Connect signals
+        self.sub_box_selector.box_changed.connect(lambda x, y, w, h: self._emit())
+        self.sub_font_color.textChanged.connect(self._update_sub_color_previews)
+        self.sub_outline_color.textChanged.connect(self._update_sub_color_previews)
+
+        for w in (self.sub_enabled, self.sub_auto_transcribe, self.sub_whisper_model, self.sub_folder_edit, self.sub_font_family, self.sub_font_size,
+                  self.sub_bold, self.sub_italic, self.sub_font_color, self.sub_outline_color, self.sub_outline_width):
+            if hasattr(w, "stateChanged"):
+                w.stateChanged.connect(self._on_sub_style_changed)
+            elif hasattr(w, "currentIndexChanged"):
+                w.currentIndexChanged.connect(self._on_sub_style_changed)
+            elif hasattr(w, "valueChanged"):
+                w.valueChanged.connect(self._on_sub_style_changed)
+            elif hasattr(w, "textChanged"):
+                w.textChanged.connect(self._on_sub_style_changed)
+
+        self._update_sub_color_previews()
+        return group
+
+    def _choose_sub_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục chứa file phụ đề (.srt)", self.sub_folder_edit.text().strip())
+        if folder:
+            self.sub_folder_edit.setText(folder)
+            self._emit()
+
+    def _choose_sub_font_color(self) -> None:
+        c = QColorDialog.getColor(QColor(self.sub_font_color.text().strip() or "#FFFFFF"), self, "Chọn màu chữ phụ đề")
+        if c.isValid():
+            self.sub_font_color.setText(c.name().upper())
+            self._on_sub_style_changed()
+
+    def _choose_sub_outline_color(self) -> None:
+        c = QColorDialog.getColor(QColor(self.sub_outline_color.text().strip() or "#000000"), self, "Chọn màu viền phụ đề")
+        if c.isValid():
+            self.sub_outline_color.setText(c.name().upper())
+            self._on_sub_style_changed()
+
+    def _update_sub_color_previews(self) -> None:
+        fc = self.sub_font_color.text().strip() or "#FFFFFF"
+        oc = self.sub_outline_color.text().strip() or "#000000"
+        self.sub_color_preview.setStyleSheet(f"background-color: {fc}; border: 1px solid #555; border-radius: 3px;")
+        self.sub_outline_color_preview.setStyleSheet(f"background-color: {oc}; border: 1px solid #555; border-radius: 3px;")
+
+    def _on_sub_style_changed(self) -> None:
+        self._update_sub_color_previews()
+        if hasattr(self, "sub_box_selector"):
+            self.sub_box_selector.set_style(
+                font_family=self.sub_font_family.currentText(),
+                font_size=self.sub_font_size.value(),
+                font_color=self.sub_font_color.text().strip() or "#FFFFFF",
+                outline_color=self.sub_outline_color.text().strip() or "#000000",
+                outline_width=self.sub_outline_width.value(),
+                bold=self.sub_bold.isChecked(),
+                italic=self.sub_italic.isChecked(),
+            )
+        self._emit()
 
     def _build_background_music_group(self) -> QGroupBox:
         group = QGroupBox()
@@ -1480,6 +1677,23 @@ class SettingTab(QWidget):
                 "box_enabled": self.text_box_enabled.isChecked(),
                 "box_opacity": self.text_box_opacity.value(),
             },
+            "subtitle": {
+                "enabled": self.sub_enabled.isChecked() if hasattr(self, "sub_enabled") else False,
+                "auto_transcribe": self.sub_auto_transcribe.isChecked() if hasattr(self, "sub_auto_transcribe") else False,
+                "whisper_model": self.sub_whisper_model.currentData() if hasattr(self, "sub_whisper_model") else "base",
+                "folder": self.sub_folder_edit.text().strip() if hasattr(self, "sub_folder_edit") else "",
+                "font_family": self.sub_font_family.currentText() if hasattr(self, "sub_font_family") else "Arial",
+                "font_size": self.sub_font_size.value() if hasattr(self, "sub_font_size") else 38,
+                "font_color": self.sub_font_color.text().strip() or "#FFFFFF" if hasattr(self, "sub_font_color") else "#FFFFFF",
+                "outline_color": self.sub_outline_color.text().strip() or "#000000" if hasattr(self, "sub_outline_color") else "#000000",
+                "outline_width": self.sub_outline_width.value() if hasattr(self, "sub_outline_width") else 2.5,
+                "bold": self.sub_bold.isChecked() if hasattr(self, "sub_bold") else True,
+                "italic": self.sub_italic.isChecked() if hasattr(self, "sub_italic") else False,
+                "box_x": (self.sub_box_selector.get_box()[0]) if hasattr(self, "sub_box_selector") else 0.15,
+                "box_y": (self.sub_box_selector.get_box()[1]) if hasattr(self, "sub_box_selector") else 0.70,
+                "box_w": (self.sub_box_selector.get_box()[2]) if hasattr(self, "sub_box_selector") else 0.70,
+                "box_h": (self.sub_box_selector.get_box()[3]) if hasattr(self, "sub_box_selector") else 0.20,
+            },
             "export": {
                 "ratio": ratio,
                 "width": width,
@@ -1596,11 +1810,54 @@ class SettingTab(QWidget):
         self.text_box_enabled.setChecked(bool(text_cfg.get("box_enabled", True)))
         self.text_box_opacity.setValue(float(text_cfg.get("box_opacity", 0.45)))
 
+        sub_cfg = settings.get("subtitle", {}) or {}
+        if hasattr(self, "sub_enabled"):
+            self.sub_enabled.setChecked(bool(sub_cfg.get("enabled", False)))
+            if hasattr(self, "sub_auto_transcribe"):
+                self.sub_auto_transcribe.setChecked(bool(sub_cfg.get("auto_transcribe", False)))
+            if hasattr(self, "sub_whisper_model"):
+                self._set_combo_by_data(self.sub_whisper_model, sub_cfg.get("whisper_model", "base"))
+            self.sub_folder_edit.setText(str(sub_cfg.get("folder", "") or ""))
+            font_fam = str(sub_cfg.get("font_family", "Arial") or "Arial")
+            idx = self.sub_font_family.findText(font_fam)
+            if idx >= 0:
+                self.sub_font_family.setCurrentIndex(idx)
+            else:
+                self.sub_font_family.setEditText(font_fam)
+            self.sub_font_size.setValue(int(sub_cfg.get("font_size", 38) or 38))
+            self.sub_bold.setChecked(bool(sub_cfg.get("bold", True)))
+            self.sub_italic.setChecked(bool(sub_cfg.get("italic", False)))
+            self.sub_font_color.setText(str(sub_cfg.get("font_color", "#FFFFFF") or "#FFFFFF"))
+            self.sub_outline_color.setText(str(sub_cfg.get("outline_color", "#000000") or "#000000"))
+            self.sub_outline_width.setValue(float(sub_cfg.get("outline_width", 2.5) or 2.5))
+            self._update_sub_color_previews()
+
+            bx = float(sub_cfg.get("box_x", 0.15))
+            by = float(sub_cfg.get("box_y", 0.70))
+            bw = float(sub_cfg.get("box_w", 0.70))
+            bh = float(sub_cfg.get("box_h", 0.20))
+            if hasattr(self, "sub_box_selector"):
+                self.sub_box_selector.set_box(bx, by, bw, bh)
+                self.sub_box_selector.set_style(
+                    font_family=font_fam,
+                    font_size=self.sub_font_size.value(),
+                    font_color=self.sub_font_color.text().strip(),
+                    outline_color=self.sub_outline_color.text().strip(),
+                    outline_width=self.sub_outline_width.value(),
+                    bold=self.sub_bold.isChecked(),
+                    italic=self.sub_italic.isChecked(),
+                )
+
         export = settings.get("export", {})
         self.fps_spin.setValue(int(export.get("fps", 30)))
         self.output_edit.setText(export.get("output_folder", "output"))
         self._set_ratio(export.get("width", 1920), export.get("height", 1080))
         self._set_combo_by_data(self.quality_combo, export.get("quality", "standard"))
+
+        if hasattr(self, "sub_box_selector") and hasattr(self, "ratio_combo"):
+            r_data = self.ratio_combo.currentData()
+            if r_data:
+                self.sub_box_selector.set_aspect_ratio(r_data[2], r_data[0], r_data[1])
 
         self._update_effect_demo()
         self.layout_preview.update_settings(settings)
@@ -1710,6 +1967,10 @@ class SettingTab(QWidget):
     def _emit(self, *args: Any) -> None:
         if self._lock_emit:
             return
+        if hasattr(self, "sub_box_selector") and hasattr(self, "ratio_combo"):
+            r_data = self.ratio_combo.currentData()
+            if r_data:
+                self.sub_box_selector.set_aspect_ratio(r_data[2], r_data[0], r_data[1])
         settings = self.collect_settings()
         self.settings = settings
         self.settings_changed.emit(settings)

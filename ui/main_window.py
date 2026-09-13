@@ -182,7 +182,8 @@ class MainWindow(QMainWindow):
         self.settings.update(settings)
         self.settings_manager.save(self.settings)
         self.render_tab.update_settings(self.settings)
-        self.youtube_tab.load_settings(self.settings)
+        if self.sender() != self.youtube_tab:
+            self.youtube_tab.load_settings(self.settings)
 
     def open_project_dialog(self) -> None:
         dlg = ProjectDialog(self, self.settings)

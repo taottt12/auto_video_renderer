@@ -414,6 +414,7 @@ class RenderTab(QWidget):
         self.project_btn = QPushButton("📁 Dự án")
         self.change_out_btn = QPushButton("📂 Đổi thư mục xuất")
         self.change_out_btn.clicked.connect(self._change_output_folder)
+
         self.project_info_label = QLabel("Dự án: Chưa lưu")
         self.project_info_label.setStyleSheet("color: #2e7d32; font-weight: bold; font-size: 11px;")
         self.out_info_label = QLabel("")

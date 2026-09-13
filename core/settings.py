@@ -97,6 +97,27 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "box_enabled": True,
         "box_opacity": 0.45
     },
+    "subtitle": {
+        "enabled": False,
+        "auto_detect_srt": True,
+        "custom_sub_file": "",
+        "font_name": "Arial",
+        "font_size": 28,
+        "font_color": "#FFFFFF",
+        "outline_color": "#000000",
+        "outline_width": 2.5,
+        "bold": True,
+        "italic": False,
+        "shadow_offset": 1.0,
+        "shadow_color": "#000000",
+        "bg_box_enabled": False,
+        "bg_box_color": "#000000",
+        "bg_box_opacity": 0.5,
+        "box_x": 0.15,
+        "box_y": 0.70,
+        "box_w": 0.70,
+        "box_h": 0.20
+    },
     "export": {
         "ratio": "9:16",
         "width": 1080,

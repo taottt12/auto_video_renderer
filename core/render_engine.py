@@ -18,6 +18,7 @@ from .media_utils import choose_media_sequence, get_duration_seconds, is_image, 
 from .overlay_generator import get_overlay_file, ensure_default_overlays
 from .paths import TEMP_DIR, ensure_dirs, find_binary
 from .process_utils import popen_hidden, run_hidden
+from .subtitle_utils import find_subtitle_file, srt_to_ass, transcribe_audio_to_srt
 
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, str], None]
@@ -127,18 +128,53 @@ class RenderEngine:
             self.progress(15, "Tạo clip từ ảnh/video")
             clips, clip_durations = self._create_media_clips(media_sequence, job_temp, width, height, fps, image_duration, render_duration)
 
+            # Xử lý phụ đề Subtitle (nếu được bật)
+            sub_cfg = self.settings.get("subtitle", {}) or {}
+            sub_ass_file: Path | None = None
+            if sub_cfg.get("enabled"):
+                sub_folder = sub_cfg.get("folder", "")
+                raw_sub = find_subtitle_file(original_audio_path, sub_folder)
+
+                # NẾU BẬT TỰ ĐỘNG QUÉT TẠO SUB (auto_transcribe) VÀ CHƯA CÓ FILE SUB:
+                if (not raw_sub or not raw_sub.exists()) and sub_cfg.get("auto_transcribe", False):
+                    self.progress(12, "Whisper AI nhận diện giọng nói & tạo sub")
+                    self.log(f"⚡ Bật tự động tạo Sub: Đang dùng Whisper AI quét audio {original_audio_path.name}...")
+                    model_size = str(sub_cfg.get("whisper_model", "base") or "base")
+                    auto_srt_path = original_audio_path.with_suffix(".srt")
+                    try:
+                        raw_sub, detected_lang = transcribe_audio_to_srt(
+                            audio_path=original_audio_path,
+                            out_srt_path=auto_srt_path,
+                            model_size=model_size,
+                            log_callback=self.log
+                        )
+                    except Exception as ex:
+                        self.log(f"Lỗi khi tự động tạo phụ đề Whisper: {ex}")
+                        raw_sub = None
+
+                if raw_sub and raw_sub.exists():
+                    self.log(f"Tìm thấy phụ đề: {raw_sub.name}")
+                    sub_ass_file = job_temp / "subtitles.ass"
+                    if raw_sub.suffix.lower() == ".ass":
+                        shutil.copy2(raw_sub, sub_ass_file)
+                    else:
+                        srt_to_ass(raw_sub, sub_ass_file, width, height, sub_cfg)
+                    self.log(f"Đã biên dịch ASS subtitle sẵn sàng gắn vào video")
+                else:
+                    self.log(f"Không có file phụ đề cho: {original_audio_path.name}")
+
             transition_mode = str(self.settings.get("transition_mode", "fade") or "none")
             can_single_pass = (
                 transition_mode != "none"
                 and len(clips) > 1
                 and len(clips) <= self._transition_batch_size()
-                and self._has_visual_overlays()
+                and self._has_visual_overlays(sub_ass_file=sub_ass_file)
             )
 
             if can_single_pass:
                 self.progress(50, "Nối transition & gắn overlay (1-pass siêu tốc)")
                 visual_out = job_temp / "visual_video.mp4"
-                self._concat_and_overlay_single_pass(clips, visual_out, clip_durations, width, height)
+                self._concat_and_overlay_single_pass(clips, visual_out, clip_durations, width, height, sub_ass_file=sub_ass_file)
                 self._delete_temp_files(clips, "clip tạm sau khi nối 1-pass")
                 current_video = visual_out
             else:
@@ -148,14 +184,14 @@ class RenderEngine:
                 self._delete_temp_files(clips, "clip tạm sau khi nối")
                 current_video = base_video
 
-                if self._has_visual_overlays():
+                if self._has_visual_overlays(sub_ass_file=sub_ass_file):
                     self.progress(72, "Gắn visual overlay 1 lần")
                     visual_out = job_temp / "visual_video.mp4"
-                    self._apply_visual_overlays(base_video, visual_out, width, height)
+                    self._apply_visual_overlays(base_video, visual_out, width, height, sub_ass_file=sub_ass_file)
                     current_video = visual_out
                     self._delete_temp_file(base_video, "base_video sau khi gắn visual overlay")
                 else:
-                    self.log("Không bật logo/watermark/text: bỏ qua pass overlay để tiết kiệm thời gian.")
+                    self.log("Không bật logo/watermark/text/sub: bỏ qua pass overlay để tiết kiệm thời gian.")
 
             self.progress(80, "Chuẩn bị/mix audio")
             final_audio = self._build_final_audio(audio_path, job_temp, render_duration, audio_speed)
@@ -1538,18 +1574,21 @@ class RenderEngine:
         self._run(build(self._video_encode_args()), "Concat intro/main/outro safe fallback", True, lambda: build(self._fallback_cpu_encode_args()))
 
 
-    def _has_visual_overlays(self) -> bool:
+    def _has_visual_overlays(self, sub_ass_file: Path | None = None) -> bool:
         text = self.settings.get("text_overlay", {}) or {}
+        sub = self.settings.get("subtitle", {}) or {}
         fx_mode = str(self.settings.get("video_effect_mode", "none") or "none")
         fx_enabled = bool(self.settings.get("video_effect_enabled", True))
         custom_fx_file = str(self.settings.get("video_effect_custom_file", "") or "").strip()
         has_video_fx = fx_enabled and fx_mode != "none"
         if has_video_fx and fx_mode == "custom" and not (custom_fx_file and Path(custom_fx_file).exists()):
             has_video_fx = False
+        has_sub = bool(sub_ass_file and sub_ass_file.exists()) if sub_ass_file is not None else bool(sub.get("enabled"))
         return bool(
             (self.settings.get("watermark_enabled") and self.settings.get("watermark_file"))
             or (self.settings.get("logo_enabled") and self.settings.get("logo_file"))
             or (text.get("enabled") and str(text.get("content", "")).strip())
+            or has_sub
             or has_video_fx
         )
 
@@ -1569,7 +1608,7 @@ class RenderEngine:
             return filters["auto_cinematic"]
         return ""
 
-    def _apply_visual_overlays(self, video: Path, out: Path, width: int, height: int) -> None:
+    def _apply_visual_overlays(self, video: Path, out: Path, width: int, height: int, sub_ass_file: Path | None = None) -> None:
         """Gộp watermark + logo + text + hiệu ứng video vào một lần encode video.
 
         Đây là pass quan trọng của V5.0: thay vì encode lại nhiều lần riêng lẻ,
@@ -1668,6 +1707,14 @@ class RenderEngine:
             last = out_label
             stage += 1
 
+        # Subtitle overlay via ASS
+        if sub_ass_file and sub_ass_file.exists():
+            out_label = f"[v{stage}]"
+            ass_path_escaped = str(sub_ass_file.resolve()).replace("\\", "/").replace(":", "\\:")
+            filters.append(f"{last}ass='{ass_path_escaped}'{out_label}")
+            last = out_label
+            stage += 1
+
         filters.append(f"{last}format=yuv420p[v]")
 
         duration = get_duration_seconds(video)
@@ -1684,6 +1731,7 @@ class RenderEngine:
         clip_durations: List[float],
         width: int,
         height: int,
+        sub_ass_file: Path | None = None,
     ) -> None:
         """Gộp XFade transitions và toàn bộ visual overlays (Logo, Watermark, Text, Layer mask) thành 1 pass duy nhất.
 
@@ -1795,6 +1843,14 @@ class RenderEngine:
         if text_cfg.get("enabled") and content:
             out_label = f"[v_stage{stage}]"
             filters.append(f"{last}{self._drawtext_filter_body(text_cfg, content)}{out_label}")
+            last = out_label
+            stage += 1
+
+        # Subtitle overlay via ASS
+        if sub_ass_file and sub_ass_file.exists():
+            out_label = f"[v_stage{stage}]"
+            ass_path_escaped = str(sub_ass_file.resolve()).replace("\\", "/").replace(":", "\\:")
+            filters.append(f"{last}ass='{ass_path_escaped}'{out_label}")
             last = out_label
             stage += 1
 

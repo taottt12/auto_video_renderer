@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import datetime
 import os
 import re
@@ -11,7 +12,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit,
-    QPushButton, QComboBox, QSpinBox, QDateEdit, QCheckBox, QTableWidget,
+    QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QCheckBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox, QProgressBar,
     QGroupBox, QSplitter, QFrame, QDialog, QTabWidget, QRadioButton, QButtonGroup,
     QScrollArea
@@ -20,45 +21,19 @@ from PySide6.QtWidgets import (
 from core.gemini_assistant import (
     GeminiAssistant, OfflineSEOAssistant, CustomAIAssistant,
     clean_story_title, clean_episode_badge, extract_clean_video_title,
-    to_hashtag, format_tags_string
+    extract_highlight_from_title, ThumbnailPromptGenerator, detect_9router_api_key
 )
+from core.image_generator import AIImageGenerator
 from core.settings import PROJECTS_DIR, SettingsManager
 from core.thumbnail_builder import ThumbnailBuilder
 from core.youtube_auth import YouTubeAuthManager
 from core.youtube_uploader import YouTubeUploader
 
 
-class AspectRatioLabel(QLabel):
-    """QLabel duy trì tỷ lệ 16:9 của Thumbnail YouTube và luôn giãn sát mép 2 bên, không có viền đen thừa."""
-
-    def __init__(self, text: str = "Chưa có Thumbnail", parent=None) -> None:
-        super().__init__(text, parent)
-        self.setAlignment(Qt.AlignCenter)
-        self.setMinimumHeight(140)
-        self._orig_pixmap: Optional[QPixmap] = None
-        self.setStyleSheet("background-color: #1e1e1e; color: #888; border: 1px solid #444; border-radius: 4px;")
-
-    def set_thumbnail_pixmap(self, pixmap: QPixmap) -> None:
-        self._orig_pixmap = pixmap
-        self._update_display()
-
-    def clear_thumbnail(self, placeholder: str = "Chưa có Thumbnail") -> None:
-        self._orig_pixmap = None
-        self.clear()
-        self.setText(placeholder)
-        self.setFixedHeight(180)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._update_display()
-
-    def _update_display(self) -> None:
-        if self._orig_pixmap and not self._orig_pixmap.isNull():
-            w = max(120, self.width())
-            h = int(w * 9 / 16)
-            self.setFixedHeight(h)
-            scaled = self._orig_pixmap.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-            self.setPixmap(scaled)
+def natural_sort_key(s: str) -> list:
+    """Tách số và chữ để sắp xếp tự nhiên: P1, P2, ... P9, P10, P32 thay vì P1, P10, P2."""
+    name = Path(s).name
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", name)]
 
 
 class AddChannelKeyDialog(QDialog):
@@ -263,6 +238,7 @@ class ContentWorker(QThread):
         custom_base_url: str,
         tasks: List[Dict[str, Any]],
         channel_name: str,
+        target_language: str = "vi",
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -271,42 +247,140 @@ class ContentWorker(QThread):
         self.custom_base_url = custom_base_url
         self.tasks = tasks
         self.channel_name = channel_name
+        self.target_language = target_language
         self._is_cancelled = False
 
     def cancel(self) -> None:
         self._is_cancelled = True
 
     def run(self) -> None:
+        # 1. Nhận diện và chuẩn hóa tên gốc của từng task
+        task_base_names = []
+        for task in self.tasks:
+            raw_title = task.get("story_title", "") or ""
+            badge = task.get("episode_badge") or ""
+            clean_base = extract_clean_video_title(raw_title)
+            if not clean_base or clean_base.lower() in ["video", "audio"]:
+                clean_base = clean_story_title(raw_title)
+            if badge and badge.lower() in clean_base.lower():
+                clean_base = re.sub(rf"\b{re.escape(badge)}\b", "", clean_base, flags=re.IGNORECASE).strip(" :-_")
+            task_base_names.append(clean_base or raw_title)
+
+        # 2. Đếm tần suất xuất hiện của tên gốc để phân loại Series vs Video đơn lẻ
+        base_counts = {}
+        for b in task_base_names:
+            k = b.strip().lower()
+            base_counts[k] = base_counts.get(k, 0) + 1
+
+        # Cache metadata chuẩn cho từng bộ Series / Playlist
+        series_cache: Dict[str, Dict[str, Any]] = {}
+
         for idx, task in enumerate(self.tasks):
             if self._is_cancelled:
                 break
-            story_title = task.get("story_title", "")
+            raw_title = task.get("story_title", "")
             ep = task.get("episode_badge") if task.get("episode_badge") is not None else ""
             ep_idx = task.get("episode_index")
+            base_name = task_base_names[idx]
+            base_key = base_name.strip().lower()
+
+            is_series = (base_counts.get(base_key, 0) >= 2) or bool(ep)
+
             try:
-                if self.provider == "offline":
-                    data = OfflineSEOAssistant.generate_video_metadata(
-                        story_title=story_title,
-                        episode_name=ep,
-                        channel_name=self.channel_name,
-                        episode_index=ep_idx,
-                    )
-                elif self.provider in ["custom", "9router"]:
-                    assistant = CustomAIAssistant(self.api_key, self.custom_base_url, self.model)
-                    data = assistant.generate_video_metadata(
-                        story_title=story_title,
-                        episode_name=ep,
-                        channel_name=self.channel_name,
-                        episode_index=ep_idx,
-                    )
+                if is_series:
+                    # Tạo hoặc lấy master metadata của Series
+                    if base_key not in series_cache:
+                        if self.provider == "offline":
+                            master_data = OfflineSEOAssistant.generate_video_metadata(
+                                story_title=base_name,
+                                episode_name="",
+                                channel_name=self.channel_name,
+                                episode_index=None,
+                                target_language=self.target_language,
+                            )
+                        elif self.provider in ["custom", "9router"]:
+                            assistant = CustomAIAssistant(self.api_key, self.custom_base_url, self.model)
+                            master_data = assistant.generate_video_metadata(
+                                story_title=base_name,
+                                episode_name="",
+                                channel_name=self.channel_name,
+                                episode_index=None,
+                                target_language=self.target_language,
+                            )
+                        else:
+                            assistant = GeminiAssistant(self.api_key, self.model)
+                            master_data = assistant.generate_video_metadata(
+                                story_title=base_name,
+                                episode_name="",
+                                channel_name=self.channel_name,
+                                episode_index=None,
+                                target_language=self.target_language,
+                            )
+                        series_cache[base_key] = master_data
+
+                    master = series_cache[base_key]
+                    master_title = master.get("title", base_name)
+                    ch_clean = self.channel_name.split("(")[0].strip()
+                    core_title = master_title
+                    if ch_clean and core_title.endswith(f"| {ch_clean}"):
+                        core_title = core_title[:-len(f"| {ch_clean}")].strip()
+                    if ep:
+                        core_title = re.sub(rf"^(?:\[?{re.escape(ep)}\]?|Tập\s*\d+|P\d+)[\s:\-_]+", "", core_title, flags=re.IGNORECASE).strip()
+
+                    # Tiêu đề cố định theo Playlist + Số tập
+                    if ep:
+                        final_title = f"{ep}: {core_title}"
+                        if ch_clean and len(f"{final_title} | {ch_clean}") <= 98:
+                            final_title = f"{final_title} | {ch_clean}"
+                    else:
+                        final_title = f"{core_title} | {ch_clean}" if ch_clean and len(f"{core_title} | {ch_clean}") <= 98 else core_title
+
+                    if len(final_title) > 98:
+                        final_title = final_title[:95] + "..."
+
+                    # Tags đồng bộ
+                    tags_base = master.get("tags", "")
+                    if ep and ep.lower() not in tags_base.lower():
+                        tags_base = f"{tags_base}, {ep.lower()}, {core_title.lower()} {ep.lower()}"
+
+                    data = {
+                        "title": final_title,
+                        "description": master.get("description", ""),
+                        "tags": tags_base.strip(", "),
+                        "thumbnail_badge": ep,
+                        "thumbnail_highlight": master.get("thumbnail_highlight", extract_highlight_from_title(core_title)),
+                        "thumbnail_ai_prompt": master.get("thumbnail_ai_prompt", ""),
+                        "provider_used": master.get("provider_used", self.provider),
+                    }
                 else:
-                    assistant = GeminiAssistant(self.api_key, self.model)
-                    data = assistant.generate_video_metadata(
-                        story_title=story_title,
-                        episode_name=ep,
-                        channel_name=self.channel_name,
-                        episode_index=ep_idx,
-                    )
+                    # Video đơn lẻ (Standalone): Sinh tiêu đề & mô tả độc lập
+                    if self.provider == "offline":
+                        data = OfflineSEOAssistant.generate_video_metadata(
+                            story_title=raw_title,
+                            episode_name=ep,
+                            channel_name=self.channel_name,
+                            episode_index=ep_idx,
+                            target_language=self.target_language,
+                        )
+                    elif self.provider in ["custom", "9router"]:
+                        assistant = CustomAIAssistant(self.api_key, self.custom_base_url, self.model)
+                        data = assistant.generate_video_metadata(
+                            story_title=raw_title,
+                            episode_name=ep,
+                            channel_name=self.channel_name,
+                            episode_index=ep_idx,
+                            target_language=self.target_language,
+                        )
+                    else:
+                        assistant = GeminiAssistant(self.api_key, self.model)
+                        data = assistant.generate_video_metadata(
+                            story_title=raw_title,
+                            episode_name=ep,
+                            channel_name=self.channel_name,
+                            episode_index=ep_idx,
+                            target_language=self.target_language,
+                        )
+
                 self.item_finished_sig.emit(idx, True, "Thành công", data)
             except Exception as e:
                 self.item_finished_sig.emit(idx, False, str(e), {})
@@ -322,6 +396,7 @@ class UploadWorker(QThread):
     progress_sig = Signal(int, str, float)
     log_sig = Signal(str)
     item_finished_sig = Signal(int, bool, str)
+    item_updated_sig = Signal(int, dict)
     all_finished_sig = Signal()
 
     def __init__(
@@ -329,15 +404,134 @@ class UploadWorker(QThread):
         uploader: YouTubeUploader,
         tasks: List[Dict[str, Any]],
         channel_id: str,
+        ai_config: Optional[Dict[str, Any]] = None,
+        thumb_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.uploader = uploader
         self.tasks = tasks
         self.channel_id = channel_id
+        self.ai_config = ai_config or {}
+        self.thumb_config = thumb_config or {}
         self._is_cancelled = False
 
     def cancel(self) -> None:
         self._is_cancelled = True
+
+    def _generate_metadata(self, task: Dict[str, Any]) -> Dict[str, str]:
+        if not self.ai_config:
+            return {}
+        provider = self.ai_config.get("provider", "offline")
+        api_key = self.ai_config.get("api_key", "")
+        model = self.ai_config.get("model", "")
+        custom_base_url = self.ai_config.get("custom_base_url", "")
+        channel_name = self.ai_config.get("channel_name", "")
+        target_language = self.ai_config.get("target_language", "vi")
+
+        story_title = task.get("story_title") or task.get("title") or Path(task["video_path"]).stem
+        clean_title = extract_clean_video_title(story_title)
+        ep = task.get("episode_badge") or ""
+        ep_idx = task.get("episode_index")
+
+        try:
+            if provider == "offline":
+                return OfflineSEOAssistant.generate_video_metadata(
+                    story_title=clean_title,
+                    episode_name=ep,
+                    channel_name=channel_name,
+                    episode_index=ep_idx,
+                    target_language=target_language,
+                )
+            elif provider in ["custom", "9router"]:
+                assistant = CustomAIAssistant(api_key, custom_base_url, model)
+                return assistant.generate_video_metadata(
+                    story_title=clean_title,
+                    episode_name=ep,
+                    channel_name=channel_name,
+                    episode_index=ep_idx,
+                    target_language=target_language,
+                )
+            else:
+                assistant = GeminiAssistant(api_key, model)
+                return assistant.generate_video_metadata(
+                    story_title=clean_title,
+                    episode_name=ep,
+                    channel_name=channel_name,
+                    episode_index=ep_idx,
+                    target_language=target_language,
+                )
+        except Exception as e:
+            self.log_sig.emit(f"   ⚠ Lỗi gọi AI SEO ({provider}): {e}")
+            return OfflineSEOAssistant.generate_video_metadata(
+                story_title=clean_title,
+                episode_name=ep,
+                channel_name=channel_name,
+                episode_index=ep_idx,
+                target_language=target_language,
+            )
+
+    def _build_thumbnail(self, task: Dict[str, Any]) -> Optional[Path]:
+        if not self.thumb_config:
+            return None
+        mode = self.thumb_config.get("mode", "frame")
+        out_dir = Path(self.thumb_config.get("out_dir", "temp"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        v_path = Path(task["video_path"])
+        row_idx = task.get("row_idx", 0)
+        out_thumb = out_dir / f"thumbnail_tap_{row_idx + 1}.jpg"
+
+        bg_img: Optional[Path] = None
+        if mode == "frame":
+            sec = self.thumb_config.get("frame_sec", 3.0)
+            frame_out = out_dir / f"frame_tap_{row_idx + 1}.jpg"
+            try:
+                bg_img = ThumbnailBuilder.extract_frame_from_video(v_path, time_sec=sec, out_path=frame_out)
+            except Exception as ex:
+                self.log_sig.emit(f"   ⚠ Không thể trích xuất frame: {ex}")
+                bg_img = None
+        elif mode == "playlist":
+            pl_p = self.thumb_config.get("playlist_thumb")
+            if pl_p and Path(pl_p).exists():
+                bg_img = Path(pl_p)
+        else:
+            cust = task.get("custom_thumb_bg")
+            if cust and Path(cust).exists():
+                bg_img = Path(cust)
+
+        if not bg_img or not bg_img.exists():
+            candidates = self.thumb_config.get("candidates", [])
+            if candidates:
+                bg_img = candidates[row_idx % len(candidates)]
+
+        if not bg_img or not bg_img.exists():
+            return None
+
+        badge = task.get("episode_badge") or f"P{row_idx + 1}"
+        hl = task.get("thumbnail_hl") or extract_highlight_from_title(task.get("title", ""))
+        ch_name = self.thumb_config.get("channel_name", "")
+        font_style = task.get("thumb_font") or self.thumb_config.get("font_style", "drama")
+        position = task.get("thumb_pos") or self.thumb_config.get("position", "split_lr")
+        badge_pos = task.get("thumb_badge_pos") or self.thumb_config.get("badge_position", "top_left")
+
+        enable_badge = bool(self.thumb_config.get("enable_badge", True))
+        enable_hl = bool(self.thumb_config.get("enable_highlight", True))
+
+        try:
+            return ThumbnailBuilder.create_thumbnail(
+                bg_image=bg_img,
+                output_path=out_thumb,
+                badge_text=badge,
+                highlight_title=hl,
+                subtitle=ch_name,
+                font_style=font_style,
+                position=position,
+                badge_position=badge_pos,
+                enable_badge=enable_badge,
+                enable_highlight=enable_hl,
+            )
+        except Exception as ex:
+            self.log_sig.emit(f"   ⚠ Lỗi vẽ thumbnail: {ex}")
+            return None
 
     def run(self) -> None:
         total = len(self.tasks)
@@ -347,17 +541,61 @@ class UploadWorker(QThread):
                 break
 
             v_path = task["video_path"]
-            title = task["title"]
-            desc = task["description"]
-            tags = task["tags"]
+            row_idx = task.get("row_idx", idx)
+            title = task.get("title", "")
+            desc = task.get("description", "")
+            tags = task.get("tags", "")
+
+            # 1. TỰ ĐỘNG SINH TIÊU ĐỀ & MÔ TẢ SEO (NẾU CHƯA CÓ HOẶC MÔ TẢ TRỐNG)
+            if not desc or not desc.strip():
+                self.log_sig.emit(f"[{idx+1}/{total}] 🤖 Đang tự động sinh Tiêu đề, Mô tả, Tags SEO...")
+                try:
+                    meta = self._generate_metadata(task)
+                    if meta:
+                        if meta.get("title"):
+                            title = meta["title"]
+                            task["title"] = title
+                        if meta.get("description"):
+                            desc = meta["description"]
+                            task["description"] = desc
+                        if meta.get("tags"):
+                            tags = meta["tags"]
+                            task["tags"] = tags
+                        if meta.get("thumbnail_highlight"):
+                            task["thumbnail_hl"] = meta["thumbnail_highlight"]
+                        self.item_updated_sig.emit(row_idx, {
+                            "title": title,
+                            "description": desc,
+                            "tags": tags,
+                        })
+                        self.log_sig.emit(f"   ✔ Đã sinh SEO: {title}")
+                except Exception as ex_m:
+                    self.log_sig.emit(f"   ⚠ Lỗi tự sinh SEO: {ex_m}")
+
+            # 2. TỰ ĐỘNG TẠO THUMBNAIL THEO CHẾ ĐỘ ĐÃ CHỌN
+            thumb = task.get("thumbnail_path")
+            if not thumb or not Path(thumb).exists():
+                self.log_sig.emit(f"[{idx+1}/{total}] 🎨 Đang tự động tạo Thumbnail...")
+                try:
+                    thumb_res = self._build_thumbnail(task)
+                    if thumb_res and Path(thumb_res).exists():
+                        thumb = str(thumb_res)
+                        task["thumbnail_path"] = thumb
+                        self.item_updated_sig.emit(row_idx, {
+                            "thumbnail_path": thumb,
+                        })
+                        self.log_sig.emit(f"   ✔ Đã tạo Thumbnail: {Path(thumb).name}")
+                except Exception as ex_t:
+                    self.log_sig.emit(f"   ⚠ Lỗi tạo Thumbnail: {ex_t}")
+
+            # 3. TIẾN HÀNH TẢI LÊN YOUTUBE
             privacy = task["privacy_status"]
             publish_at = task.get("publish_at")
             is_premiere = task.get("is_premiere", False)
-            thumb = task.get("thumbnail_path")
             playlist_name = task.get("playlist_name", "")
             playlist_id = task.get("playlist_id", None)
 
-            self.log_sig.emit(f"[{idx+1}/{total}] Bắt đầu tải lên: {Path(v_path).name}")
+            self.log_sig.emit(f"[{idx+1}/{total}] 🚀 Bắt đầu tải lên: {Path(v_path).name}")
             self.log_sig.emit(f"   Tiêu đề: {title}")
             if publish_at:
                 self.log_sig.emit(f"   Lịch đăng: {publish_at.strftime('%d/%m/%Y %H:%M')}")
@@ -390,21 +628,127 @@ class UploadWorker(QThread):
         self.all_finished_sig.emit()
 
 
-def detect_9router_api_key() -> str:
-    """Tự động đọc API Key sẵn có từ cơ sở dữ liệu 9Router cục bộ."""
-    try:
-        db_path = Path.home() / "AppData/Roaming/9router/db/data.sqlite"
-        if db_path.exists():
-            import sqlite3
-            with sqlite3.connect(str(db_path)) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT key FROM apiKeys ORDER BY rowid DESC LIMIT 1;")
-                r = cur.fetchone()
-                if r and r[0]:
-                    return r[0]
-    except Exception:
-        pass
-    return ""
+class AIImageWorker(QThread):
+    finished_sig = Signal(bool, str, str)  # ok, msg, out_path
+
+    def __init__(
+        self,
+        prompt: str,
+        output_path: Path,
+        model_name: str = "flux",
+        api_key: str = "",
+        base_url: str = "",
+    ) -> None:
+        super().__init__()
+        self.prompt = prompt
+        self.output_path = output_path
+        self.model_name = model_name
+        self.api_key = api_key
+        self.base_url = base_url
+
+    def run(self) -> None:
+        try:
+            res = AIImageGenerator.generate_image(
+                prompt=self.prompt,
+                output_path=self.output_path,
+                model_name=self.model_name,
+                api_key=self.api_key,
+                base_url=self.base_url,
+            )
+            self.finished_sig.emit(True, "Thành công", str(res))
+        except Exception as e:
+            self.finished_sig.emit(False, str(e), "")
+
+
+class BatchAIImageWorker(QThread):
+    progress_sig = Signal(int, int, str)
+    item_done_sig = Signal(int, bool, str, str)
+    all_done_sig = Signal()
+
+    def __init__(
+        self,
+        tasks: List[Dict[str, Any]],
+        model_name: str = "flux",
+        api_key: str = "",
+        base_url: str = "",
+        provider: str = "9router",
+        sample_images: Optional[List[Path]] = None,
+        auto_stamp: bool = True,
+        target_language: str = "vi",
+    ) -> None:
+        super().__init__()
+        self.tasks = tasks
+        self.model_name = model_name
+        self.api_key = api_key
+        self.base_url = base_url
+        self.provider = provider
+        self.sample_images = sample_images or []
+        self.auto_stamp = auto_stamp
+        self.target_language = target_language
+        self._is_cancelled = False
+
+    def cancel(self) -> None:
+        self._is_cancelled = True
+
+    def run(self) -> None:
+        total = len(self.tasks)
+        for i, task in enumerate(self.tasks):
+            if self._is_cancelled:
+                break
+            row_idx = task["row_idx"]
+            out_p = task["out_path"]
+            prompt = task.get("prompt", "").strip()
+
+            if not prompt:
+                title = task.get("title", "")
+                desc = task.get("desc", "")
+                ch_name = task.get("channel_name", "")
+                self.progress_sig.emit(i + 1, total, f"Đang tạo prompt AI cho tập {row_idx + 1}...")
+                prompt = ThumbnailPromptGenerator.generate_prompt(
+                    title=title,
+                    description=desc,
+                    sample_images=self.sample_images,
+                    provider=self.provider,
+                    api_key=self.api_key,
+                    model=self.model_name,
+                    custom_base_url=self.base_url,
+                    channel_name=ch_name,
+                    target_language=self.target_language,
+                )
+
+            self.progress_sig.emit(i + 1, total, f"Đang vẽ ảnh AI tập {row_idx + 1}/{total}...")
+            try:
+                res = AIImageGenerator.generate_image(
+                    prompt=prompt,
+                    output_path=out_p,
+                    model_name=self.model_name,
+                    api_key=self.api_key,
+                    base_url=self.base_url,
+                )
+                if res and Path(res).exists():
+                    try:
+                        title_val = task.get("title", "")
+                        hl_val = task.get("item", {}).get("thumbnail_highlight") or task.get("item", {}).get("thumbnail_hl") or extract_highlight_from_title(title_val)
+                        badge_val = task.get("item", {}).get("episode_badge") or f"TẬP {row_idx + 1}"
+                        ch_name = task.get("channel_name", "") or "Gã Đạo Tặc"
+                        font_st = "drama" if self.sample_images else (task.get("font_style") or "drama")
+                        pos_st = task.get("position") or "split_lr"
+                        ThumbnailBuilder.create_thumbnail(
+                            bg_image=res,
+                            output_path=res,
+                            badge_text=badge_val,
+                            highlight_title=hl_val,
+                            subtitle=ch_name,
+                            font_style=font_st,
+                            position=pos_st,
+                        )
+                    except Exception as ex_st:
+                        print(f"Batch stamp error: {ex_st}")
+                self.item_done_sig.emit(row_idx, True, "Thành công", str(res))
+            except Exception as e:
+                self.item_done_sig.emit(row_idx, False, str(e), "")
+
+        self.all_done_sig.emit()
 
 
 class YouTubeTab(QWidget):
@@ -424,10 +768,15 @@ class YouTubeTab(QWidget):
         self._current_project_dir: Optional[Path] = None
         self._current_project_media: List[Path] = []
         self.current_thumbnail_path: Optional[Path] = None
+        self._playlist_common_thumb: Optional[Path] = None
+        self.sample_image_paths: List[Path] = []
+        self._is_loading_settings: bool = False
 
         self._upload_worker: Optional[UploadWorker] = None
         self._oauth_worker: Optional[OAuthWorker] = None
         self._content_worker: Optional[ContentWorker] = None
+        self._ai_img_worker: Optional[AIImageWorker] = None
+        self._batch_img_worker: Optional[BatchAIImageWorker] = None
 
         self._init_ui()
         self.load_settings(self.settings)
@@ -435,25 +784,9 @@ class YouTubeTab(QWidget):
         self.refresh_projects()
 
     def _init_ui(self) -> None:
-        overall_layout = QVBoxLayout(self)
-        overall_layout.setContentsMargins(8, 8, 8, 8)
-        overall_layout.setSpacing(6)
-
-        # Thanh công cụ trên cùng với bộ chuyển đổi bố cục Studio
-        top_bar = QHBoxLayout()
-        top_bar.setContentsMargins(0, 0, 0, 2)
-        lbl_studio = QLabel("🎬 <b>STUDIO ĐĂNG YOUTUBE & QUẢN LÝ VIDEO ĐA KÊNH</b>")
-        lbl_studio.setStyleSheet("font-size: 13px; color: #4a90e2;")
-        top_bar.addWidget(lbl_studio)
-        top_bar.addStretch()
-
-        top_bar.addWidget(QLabel("Bố cục Studio:"))
-        self.layout_mode_combo = QComboBox()
-        self.layout_mode_combo.addItem("📐 3 Cột Song Song (Studio Chuẩn)", "3_col")
-        self.layout_mode_combo.addItem("📐 2 Cột Rộng Rãi (Danh Sách Dài)", "2_col")
-        self.layout_mode_combo.currentIndexChanged.connect(self._on_layout_mode_changed)
-        top_bar.addWidget(self.layout_mode_combo)
-        overall_layout.addLayout(top_bar)
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
 
         # ==========================================
         # 1. KÊNH YOUTUBE
@@ -519,11 +852,9 @@ class YouTubeTab(QWidget):
         h_header.setSectionResizeMode(3, QHeaderView.Stretch)
         h_header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         h_header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        self.video_table.setColumnWidth(0, 45)
-        self.video_table.setColumnWidth(1, 55)
-        self.video_table.setColumnWidth(2, 280)
-        self.video_table.setColumnWidth(4, 80)
-        self.video_table.setColumnWidth(5, 80)
+        self.video_table.setColumnWidth(2, 190)
+        self.video_table.setColumnWidth(4, 85)
+        self.video_table.setColumnWidth(5, 75)
         h_header.setSectionsMovable(True)
         h_header.setHighlightSections(True)
         self.video_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -531,32 +862,55 @@ class YouTubeTab(QWidget):
         self.video_table.cellChanged.connect(self._on_table_cell_changed)
         lay_proj.addWidget(self.video_table)
 
+        row_sort_btns = QHBoxLayout()
+        self.btn_sort_natural = QPushButton("Sắp xếp tự nhiên (P1, P2...)")
+        self.btn_sort_natural.setToolTip("Sắp xếp video thông minh theo số tập: P1 ➔ P2 ➔ P10 ➔ P32")
+        self.btn_sort_natural.clicked.connect(self._sort_videos_natural)
+
+        self.btn_sort_az = QPushButton("A ➔ Z")
+        self.btn_sort_az.setToolTip("Sắp xếp theo tên file A ➔ Z")
+        self.btn_sort_az.clicked.connect(self._sort_videos_az)
+
+        self.btn_sort_za = QPushButton("Z ➔ A")
+        self.btn_sort_za.setToolTip("Sắp xếp theo tên file Z ➔ A")
+        self.btn_sort_za.clicked.connect(self._sort_videos_za)
+
+        self.btn_move_up = QPushButton("▲ Lên")
+        self.btn_move_up.setToolTip("Di chuyển video đang chọn lên trên")
+        self.btn_move_up.clicked.connect(self._move_video_up)
+
+        self.btn_move_down = QPushButton("▼ Xuống")
+        self.btn_move_down.setToolTip("Di chuyển video đang chọn xuống dưới")
+        self.btn_move_down.clicked.connect(self._move_video_down)
+
+        row_sort_btns.addWidget(self.btn_sort_natural)
+        row_sort_btns.addWidget(self.btn_sort_az)
+        row_sort_btns.addWidget(self.btn_sort_za)
+        row_sort_btns.addWidget(self.btn_move_up)
+        row_sort_btns.addWidget(self.btn_move_down)
+        lay_proj.addLayout(row_sort_btns)
+
         row_tbl_btns = QHBoxLayout()
         self.select_all_btn = QPushButton("Chọn tất cả")
-        self.select_all_btn.setFixedHeight(28)
-        self.select_all_btn.setFixedWidth(90)
         self.select_all_btn.clicked.connect(self._select_all_videos)
-
         self.unselect_all_btn = QPushButton("Bỏ chọn")
-        self.unselect_all_btn.setFixedHeight(28)
-        self.unselect_all_btn.setFixedWidth(80)
         self.unselect_all_btn.clicked.connect(self._unselect_all_videos)
-
         self.btn_pick_external_videos = QPushButton("📁 Thêm video ngoài...")
-        self.btn_pick_external_videos.setFixedHeight(28)
-        self.btn_pick_external_videos.setFixedWidth(160)
         self.btn_pick_external_videos.setToolTip("Nạp thêm video MP4 từ thư mục bất kỳ")
         self.btn_pick_external_videos.clicked.connect(self._pick_external_videos)
-
+        self.btn_tbl_export_csv = QPushButton("📥 Xuất CSV...")
+        self.btn_tbl_export_csv.setToolTip("Xuất danh sách video, Tiêu đề, Chữ Thumbnail, Prompt AI, Mô tả, Tags ra file CSV (Excel)")
+        self.btn_tbl_export_csv.setStyleSheet("font-weight: bold; background-color: #1f6feb; color: white;")
+        self.btn_tbl_export_csv.clicked.connect(self._export_to_csv)
         row_tbl_btns.addWidget(self.select_all_btn)
         row_tbl_btns.addWidget(self.unselect_all_btn)
         row_tbl_btns.addWidget(self.btn_pick_external_videos)
-        row_tbl_btns.addStretch()
+        row_tbl_btns.addWidget(self.btn_tbl_export_csv)
         lay_proj.addLayout(row_tbl_btns)
 
-        # Cụm Kênh YouTube + Danh sách Video MP4
-        self.left_top_widget = QWidget()
-        left_top_layout = QVBoxLayout(self.left_top_widget)
+        # Cụm nửa trên cột trái: Kênh YouTube + Danh sách Video MP4
+        left_top_widget = QWidget()
+        left_top_layout = QVBoxLayout(left_top_widget)
         left_top_layout.setContentsMargins(0, 0, 0, 0)
         left_top_layout.setSpacing(6)
         left_top_layout.addWidget(grp_channel)
@@ -580,6 +934,23 @@ class YouTubeTab(QWidget):
         self.ai_provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         row_provider.addWidget(self.ai_provider_combo, 1)
         lay_ai.addLayout(row_provider)
+
+        row_lang = QHBoxLayout()
+        row_lang.addWidget(QLabel("🌐 Ngôn ngữ đích:"))
+        self.ai_target_lang_combo = QComboBox()
+        self.ai_target_lang_combo.addItem("Tiếng Việt (Vietnam)", "vi")
+        self.ai_target_lang_combo.addItem("Tiếng Tagalog / Philippines (Drama)", "tl")
+        self.ai_target_lang_combo.addItem("Tiếng Anh (English)", "en")
+        self.ai_target_lang_combo.addItem("Tiếng Thái (Thai)", "th")
+        self.ai_target_lang_combo.addItem("Tiếng Indonesia (Bahasa)", "id")
+        self.ai_target_lang_combo.addItem("Tiếng Tây Ban Nha (Español)", "es")
+        self.ai_target_lang_combo.addItem("Tiếng Bồ Đào Nha (Português)", "pt")
+        self.ai_target_lang_combo.addItem("Tiếng Nhật (Japanese)", "ja")
+        self.ai_target_lang_combo.addItem("Tiếng Hàn (Korean)", "ko")
+        self.ai_target_lang_combo.addItem("Tiếng Trung (Chinese)", "zh")
+        self.ai_target_lang_combo.currentIndexChanged.connect(self._save_ui_settings)
+        row_lang.addWidget(self.ai_target_lang_combo, 1)
+        lay_ai.addLayout(row_lang)
 
         # Container tùy chọn theo Provider
         self.provider_stack = QFrame()
@@ -707,26 +1078,37 @@ class YouTubeTab(QWidget):
 
         lay_ai.addWidget(self.provider_stack)
 
+        row_ai_actions = QHBoxLayout()
         self.btn_batch_ai_gen = QPushButton("✨ Tự Động Sinh Tiêu Đề, Mô Tả & Tags Cho Các Tập Đã Chọn")
         self.btn_batch_ai_gen.setStyleSheet("font-weight: bold; background-color: #2b5797; color: white; padding: 7px; border-radius: 4px;")
         self.btn_batch_ai_gen.clicked.connect(self._generate_all_content)
-        lay_ai.addWidget(self.btn_batch_ai_gen)
+        row_ai_actions.addWidget(self.btn_batch_ai_gen, 3)
+
+        self.btn_export_csv_ai = QPushButton("📥 Xuất CSV")
+        self.btn_export_csv_ai.setStyleSheet("font-weight: bold; background-color: #1f6feb; color: white; padding: 7px 12px; border-radius: 4px;")
+        self.btn_export_csv_ai.setToolTip("Xuất danh sách Tiêu đề, Mô tả, Tags, Chữ Thumbnail & Prompt AI ra file CSV (Excel)")
+        self.btn_export_csv_ai.clicked.connect(self._export_to_csv)
+        row_ai_actions.addWidget(self.btn_export_csv_ai, 1)
+        lay_ai.addLayout(row_ai_actions)
 
         # Box 4: Nội dung Video xuất bản (Theo từng tập)
         grp_meta = QGroupBox("4. Nội dung Video xuất bản (Tập đang chọn)")
         lay_meta = QVBoxLayout(grp_meta)
 
+        row_edit_top = QHBoxLayout()
         self.editing_video_label = QLabel("Đang chỉnh sửa: Chưa chọn tập nào")
         self.editing_video_label.setStyleSheet("color: #4a90e2; font-weight: bold; font-size: 11px;")
-        lay_meta.addWidget(self.editing_video_label)
+        row_edit_top.addWidget(self.editing_video_label, 1)
+
+        self.btn_copy_episode_info = QPushButton("📋 Sao chép Thông tin / Prompt")
+        self.btn_copy_episode_info.setToolTip("Sao chép Tiêu đề, Chữ Thumbnail, Prompt AI, Mô tả của tập này vào bộ nhớ tạm (Clipboard)")
+        self.btn_copy_episode_info.setStyleSheet("font-size: 11px; font-weight: bold; padding: 2px 8px;")
+        self.btn_copy_episode_info.clicked.connect(self._copy_current_episode_info)
+        row_edit_top.addWidget(self.btn_copy_episode_info)
+        lay_meta.addLayout(row_edit_top)
 
         row_title_lbl = QHBoxLayout()
         row_title_lbl.addWidget(QLabel("Tiêu đề (Title):"))
-        self.btn_ai_rewrite_title = QPushButton("✨ AI Viết Lại Tiêu Đề Cuốn Hút")
-        self.btn_ai_rewrite_title.setStyleSheet("font-size: 11px; padding: 2px 8px; font-weight: bold; background-color: #0288d1; color: white; border-radius: 3px;")
-        self.btn_ai_rewrite_title.setToolTip("Dùng AI tự động phân tích và viết lại tiêu đề thành câu hook giật gân, cuốn hút người xem")
-        self.btn_ai_rewrite_title.clicked.connect(self._ai_rewrite_current_title)
-        row_title_lbl.addWidget(self.btn_ai_rewrite_title)
         self.title_len_label = QLabel("0/100")
         self.title_len_label.setStyleSheet("color: #888; font-size: 11px;")
         row_title_lbl.addWidget(self.title_len_label, 0, Qt.AlignRight)
@@ -844,7 +1226,7 @@ class YouTubeTab(QWidget):
 
         lay_meta.addLayout(lay_pub)
 
-        # Ghép Cụm 3 & Cụm 4 vào khu vực AI SEO & Nội dung xuất bản (bọc trong ScrollArea)
+        # Ghép Cụm 3 & Cụm 4 vào nửa dưới của cột bên trái (bọc trong ScrollArea)
         left_bottom_widget = QWidget()
         left_bottom_layout = QVBoxLayout(left_bottom_widget)
         left_bottom_layout.setContentsMargins(0, 0, 4, 0)
@@ -852,14 +1234,17 @@ class YouTubeTab(QWidget):
         left_bottom_layout.addWidget(grp_ai)
         left_bottom_layout.addWidget(grp_meta)
 
-        self.left_bottom_scroll = QScrollArea()
-        self.left_bottom_scroll.setWidgetResizable(True)
-        self.left_bottom_scroll.setFrameShape(QFrame.NoFrame)
-        self.left_bottom_scroll.setWidget(left_bottom_widget)
+        left_bottom_scroll = QScrollArea()
+        left_bottom_scroll.setWidgetResizable(True)
+        left_bottom_scroll.setFrameShape(QFrame.NoFrame)
+        left_bottom_scroll.setWidget(left_bottom_widget)
 
-        # Splitter dọc dự phòng cho chế độ 2 cột
-        self.left_splitter = QSplitter(Qt.Vertical)
-        self.left_splitter.setChildrenCollapsible(False)
+        # Splitter dọc bên trái: Nửa trên (Kênh + Danh sách Video), Nửa dưới (AI SEO + Metadata)
+        left_splitter = QSplitter(Qt.Vertical)
+        left_splitter.setChildrenCollapsible(False)
+        left_splitter.addWidget(left_top_widget)
+        left_splitter.addWidget(left_bottom_scroll)
+        left_splitter.setSizes([380, 420])
 
         # ==========================================
         # CỘT PHẢI: THUMBNAIL STUDIO & TIẾN TRÌNH UPLOAD
@@ -867,47 +1252,139 @@ class YouTubeTab(QWidget):
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 4, 0)
-        right_layout.setSpacing(8)
+        right_layout.setSpacing(6)
 
         # Box 5: Thumbnail Studio
         grp_thumb = QGroupBox("5. Thumbnail Studio (1280x720 Từng Tập)")
         lay_thumb = QVBoxLayout(grp_thumb)
+        lay_thumb.setSpacing(6)
 
-        # Preview tự động canh sát mép 2 bên tỷ lệ chuẩn 16:9
-        self.thumb_preview = AspectRatioLabel("Chưa có Thumbnail")
+        self.thumb_preview = QLabel("Chưa có Thumbnail")
+        self.thumb_preview.setAlignment(Qt.AlignCenter)
+        self.thumb_preview.setFixedHeight(290)
+        self.thumb_preview.setStyleSheet("background-color: #1a1a1a; color: #888; border: 1px solid #444; border-radius: 6px;")
         lay_thumb.addWidget(self.thumb_preview)
 
-        # Hàng 1: Chế độ vẽ & Nút Quét Chữ Tự Động
-        row_mode = QHBoxLayout()
-        row_mode.addWidget(QLabel("Chế độ:"))
-        self.thumb_mode_combo = QComboBox()
-        self.thumb_mode_combo.addItem("🔍 Tự động quét (Ảnh có chữ -> Chỉ đóng Huy hiệu)", "auto")
-        self.thumb_mode_combo.addItem("🏷️ Chỉ đóng Huy hiệu tập (Ảnh ĐÃ CÓ CHỮ SẴN)", "badge_only")
-        self.thumb_mode_combo.addItem("🌟 Vẽ đầy đủ (Huy hiệu + Tiêu đề nghệ thuật)", "full")
-        self.thumb_mode_combo.currentIndexChanged.connect(self._on_thumb_mode_changed)
-        row_mode.addWidget(self.thumb_mode_combo, 1)
+        # Bộ chuyển đổi chế độ Thumbnail: Thiết kế Thumbnail vs AI (Coming Soon)
+        row_source = QHBoxLayout()
+        self.rad_thumb_custom = QRadioButton("🎨 Thiết Kế Thumbnail (Trích xuất Frame / Ảnh có sẵn)")
+        self.rad_thumb_custom.setStyleSheet("font-weight: bold; color: #7ee787;")
+        self.rad_thumb_custom.setChecked(True)
 
-        self.btn_scan_img = QPushButton("🔍 Quét ảnh")
-        self.btn_scan_img.setToolTip("Quét nhanh xem ảnh nền của tập này đã có sẵn chữ hay là ảnh mộc")
-        self.btn_scan_img.setStyleSheet("padding: 3px 8px; font-weight: bold;")
-        self.btn_scan_img.clicked.connect(self._scan_current_image)
-        row_mode.addWidget(self.btn_scan_img)
-        lay_thumb.addLayout(row_mode)
+        self.rad_thumb_ai = QRadioButton("🤖 Tạo Thumbnail bằng AI (Coming Soon ⏳)")
+        self.rad_thumb_ai.setStyleSheet("font-weight: bold; color: #888;")
+        self.rad_thumb_ai.setEnabled(False)
 
-        # Nhãn hiển thị kết quả quét / trạng thái
-        self.lbl_scan_info = QLabel("💡 Tự động quét sẽ phát hiện chữ có sẵn trên ảnh để tránh vẽ đè tiêu đề.")
-        self.lbl_scan_info.setStyleSheet("color: #64b5f6; font-size: 10px;")
-        self.lbl_scan_info.setWordWrap(True)
-        lay_thumb.addWidget(self.lbl_scan_info)
+        self.thumb_source_group = QButtonGroup(self)
+        self.thumb_source_group.addButton(self.rad_thumb_custom)
+        self.thumb_source_group.addButton(self.rad_thumb_ai)
 
-        # Hàng 2: Huy hiệu tập & Vị trí đặt Huy hiệu
+        row_source.addWidget(self.rad_thumb_custom)
+        row_source.addWidget(self.rad_thumb_ai)
+        row_source.addStretch(1)
+        lay_thumb.addLayout(row_source)
+
+        # -----------------------------------------------
+        # KHUNG CHỌN NGUỒN ẢNH NỀN THUMBNAIL
+        # -----------------------------------------------
+        self.custom_thumb_box = QWidget()
+        lay_cust_th = QVBoxLayout(self.custom_thumb_box)
+        lay_cust_th.setContentsMargins(0, 2, 0, 2)
+        lay_cust_th.setSpacing(6)
+
+        grp_src = QGroupBox("Nguồn ảnh nền Thumbnail:")
+        grp_src.setStyleSheet("QGroupBox { font-weight: bold; color: #58a6ff; }")
+        lay_src = QVBoxLayout(grp_src)
+        lay_src.setSpacing(6)
+
+        # Chế độ 1: Trích xuất Frame từ Video (Khuyên dùng)
+        self.rad_src_frame = QRadioButton("🎞 Trích xuất Frame từ Video (Khuyên dùng - Nhanh & Sắc nét 1080p)")
+        self.rad_src_frame.setStyleSheet("font-weight: bold; color: #58a6ff;")
+        self.rad_src_frame.setChecked(True)
+        lay_src.addWidget(self.rad_src_frame)
+
+        self.frame_opt_widget = QWidget()
+        lay_fo = QHBoxLayout(self.frame_opt_widget)
+        lay_fo.setContentsMargins(20, 0, 0, 0)
+        lay_fo.addWidget(QLabel("Chụp tại giây thứ:"))
+        self.spin_frame_sec = QDoubleSpinBox()
+        self.spin_frame_sec.setRange(0.5, 60.0)
+        self.spin_frame_sec.setSingleStep(0.5)
+        self.spin_frame_sec.setValue(3.0)
+        self.spin_frame_sec.setSuffix(" s")
+        self.spin_frame_sec.setStyleSheet("font-weight: bold; color: #58a6ff;")
+        lay_fo.addWidget(self.spin_frame_sec)
+        lbl_fo_tip = QLabel("(Tự động lấy khung hình ở giây 2s-5s của video làm nền ghép chữ)")
+        lbl_fo_tip.setStyleSheet("color: #888; font-size: 10px; font-style: italic;")
+        lay_fo.addWidget(lbl_fo_tip, 1)
+        lay_src.addWidget(self.frame_opt_widget)
+
+        # Chế độ 2: Dùng 1 ảnh chung cho toàn bộ Playlist
+        self.rad_src_playlist = QRadioButton("🖼 Dùng 1 ảnh chung cho toàn bộ Playlist")
+        self.rad_src_playlist.setStyleSheet("font-weight: bold; color: #f1e05a;")
+        lay_src.addWidget(self.rad_src_playlist)
+
+        self.pl_opt_widget = QWidget()
+        lay_po = QHBoxLayout(self.pl_opt_widget)
+        lay_po.setContentsMargins(20, 0, 0, 0)
+        self.btn_pick_pl_img = QPushButton("📁 Chọn ảnh chung cho Playlist")
+        self.btn_pick_pl_img.setStyleSheet("padding: 3px 8px; font-weight: bold;")
+        self.btn_pick_pl_img.clicked.connect(self._pick_playlist_thumbnail)
+        lay_po.addWidget(self.btn_pick_pl_img)
+
+        self.lbl_pl_img_name = QLabel("Chưa chọn ảnh poster chung")
+        self.lbl_pl_img_name.setStyleSheet("color: #888; font-size: 11px;")
+        lay_po.addWidget(self.lbl_pl_img_name, 1)
+        lay_src.addWidget(self.pl_opt_widget)
+        self.pl_opt_widget.setVisible(False)
+
+        # Chế độ 3: Chọn ảnh riêng cho từng tập / Nạp DS ảnh
+        self.rad_src_custom = QRadioButton("📂 Chọn ảnh riêng / Nạp danh sách ảnh theo video")
+        self.rad_src_custom.setStyleSheet("font-weight: bold; color: #c9d1d9;")
+        lay_src.addWidget(self.rad_src_custom)
+
+        self.cust_opt_widget = QWidget()
+        lay_co = QHBoxLayout(self.cust_opt_widget)
+        lay_co.setContentsMargins(20, 0, 0, 0)
+        self.btn_pick_thumb = QPushButton("📁 Chọn ảnh cho tập này")
+        self.btn_pick_thumb.clicked.connect(self._pick_custom_thumbnail)
+        lay_co.addWidget(self.btn_pick_thumb)
+
+        self.btn_batch_pick_thumbs = QPushButton("📂 Nạp DS ảnh theo thứ tự video")
+        self.btn_batch_pick_thumbs.clicked.connect(self._pick_batch_custom_thumbnails)
+        lay_co.addWidget(self.btn_batch_pick_thumbs)
+        lay_co.addStretch(1)
+        lay_src.addWidget(self.cust_opt_widget)
+        self.cust_opt_widget.setVisible(False)
+
+        self.thumb_src_group = QButtonGroup(self)
+        self.thumb_src_group.addButton(self.rad_src_frame)
+        self.thumb_src_group.addButton(self.rad_src_playlist)
+        self.thumb_src_group.addButton(self.rad_src_custom)
+        self.rad_src_frame.toggled.connect(self._on_thumb_src_mode_changed)
+        self.rad_src_playlist.toggled.connect(self._on_thumb_src_mode_changed)
+        self.rad_src_custom.toggled.connect(self._on_thumb_src_mode_changed)
+
+        lay_cust_th.addWidget(grp_src)
+
+        # -----------------------------------------------
+        # TUỲ CHỈNH CHỮ VÀ BỐ CỤC CHO TẬP ĐANG CHỌN
+        # -----------------------------------------------
+        # Checkbox & Tuỳ chỉnh Huy hiệu tập
+        self.chk_enable_badge = QCheckBox("Chèn Huy hiệu tập (P1, P2...):")
+        self.chk_enable_badge.setStyleSheet("font-weight: bold; color: #58a6ff;")
+        self.chk_enable_badge.setChecked(True)
+        self.chk_enable_badge.toggled.connect(self._on_enable_badge_toggled)
+        lay_cust_th.addWidget(self.chk_enable_badge)
+
         row_badge = QHBoxLayout()
-        row_badge.addWidget(QLabel("Huy hiệu tập:"))
+        row_badge.setContentsMargins(15, 0, 0, 0)
+        row_badge.addWidget(QLabel("Tên huy hiệu:"))
         self.thumb_badge_edit = QLineEdit("P1")
         self.thumb_badge_edit.textChanged.connect(self._on_badge_changed)
         row_badge.addWidget(self.thumb_badge_edit, 1)
 
-        row_badge.addWidget(QLabel("Vị trí Huy hiệu:"))
+        row_badge.addWidget(QLabel("Vị trí:"))
         self.thumb_badge_pos_combo = QComboBox()
         self.thumb_badge_pos_combo.addItem("📌 Góc Trái Trên", "top_left")
         self.thumb_badge_pos_combo.addItem("📌 Góc Phải Trên", "top_right")
@@ -915,25 +1392,29 @@ class YouTubeTab(QWidget):
         self.thumb_badge_pos_combo.addItem("📌 Góc Phải Dưới", "bottom_right")
         self.thumb_badge_pos_combo.currentIndexChanged.connect(self._on_thumb_style_or_pos_changed)
         row_badge.addWidget(self.thumb_badge_pos_combo, 1)
-        lay_thumb.addLayout(row_badge)
+        lay_cust_th.addLayout(row_badge)
 
-        # Container cho Cụm Tiêu Đề Nghệ Thuật (tự ẩn/hiện theo chế độ)
-        self.full_title_box = QWidget()
-        lay_ft = QVBoxLayout(self.full_title_box)
-        lay_ft.setContentsMargins(0, 0, 0, 0)
-        lay_ft.setSpacing(6)
+        # Checkbox & Tuỳ chỉnh Chữ to nổi bật
+        self.chk_enable_hl = QCheckBox("Chèn Chữ to nổi bật & Tiêu đề:")
+        self.chk_enable_hl.setStyleSheet("font-weight: bold; color: #58a6ff;")
+        self.chk_enable_hl.setChecked(True)
+        self.chk_enable_hl.toggled.connect(self._on_enable_hl_toggled)
+        lay_cust_th.addWidget(self.chk_enable_hl)
 
         row_hl = QHBoxLayout()
-        row_hl.addWidget(QLabel("Chữ to nổi bật:"))
+        row_hl.setContentsMargins(15, 0, 0, 0)
+        row_hl.addWidget(QLabel("Chữ nổi bật:"))
         self.thumb_hl_edit = QLineEdit("TIÊU ĐỀ NỔI BẬT")
         self.thumb_hl_edit.textChanged.connect(self._on_thumb_hl_changed)
         row_hl.addWidget(self.thumb_hl_edit)
-        lay_ft.addLayout(row_hl)
+        lay_cust_th.addLayout(row_hl)
 
-        # Hàng chọn phong cách phối font & vị trí né mặt nhân vật
+        # Hàng chọn phong cách phối font & vị trí bố cục
         row_font_pos = QHBoxLayout()
+        row_font_pos.setContentsMargins(15, 0, 0, 0)
         row_font_pos.addWidget(QLabel("Phối Font:"))
         self.thumb_font_combo = QComboBox()
+        self.thumb_font_combo.addItem("YouTube Drama / Tâm Lý (Đỏ Cyan + Vàng + Full Episode)", "drama")
         self.thumb_font_combo.addItem("Bút Pháp Kiếm Hiệp (Mềm mại, không thô)", "but_phap")
         self.thumb_font_combo.addItem("Đồng Bộ Cọ Xước (Nhất quán 100%)", "dong_bo")
         self.thumb_font_combo.addItem("Thư Pháp Cổ Trang (Á Đông Bay Bổng)", "thu_phap")
@@ -951,7 +1432,7 @@ class YouTubeTab(QWidget):
         self.thumb_pos_combo.addItem("🛠 Tùy Chỉnh Tọa Độ...", "custom")
         self.thumb_pos_combo.currentIndexChanged.connect(self._on_thumb_style_or_pos_changed)
         row_font_pos.addWidget(self.thumb_pos_combo, 1)
-        lay_ft.addLayout(row_font_pos)
+        lay_cust_th.addLayout(row_font_pos)
 
         # Khung tọa độ tùy chỉnh tự do (khi người dùng muốn tự tay căn chỉnh)
         self.custom_pos_box = QFrame()
@@ -982,40 +1463,18 @@ class YouTubeTab(QWidget):
         lay_cp.addWidget(self.thumb_scale_spin)
 
         self.custom_pos_box.setVisible(False)
-        lay_ft.addWidget(self.custom_pos_box)
-        lay_thumb.addWidget(self.full_title_box)
+        lay_cust_th.addWidget(self.custom_pos_box)
 
-        self.btn_gen_all_thumbs = QPushButton("🎨 Tự Tạo Thumbnail Cho Tất Cả Tập (Mỗi tập 1 ảnh)")
-        self.btn_gen_all_thumbs.setStyleSheet("font-weight: bold; background-color: #d9534f; color: white; padding: 6px; border-radius: 4px;")
-        self.btn_gen_all_thumbs.clicked.connect(self._create_all_thumbnails)
-        lay_thumb.addWidget(self.btn_gen_all_thumbs)
-
+        # Nút Ghép Thử Thumbnail Tập Này (chỉ áp dụng tập đang chọn, không reset về mặc định)
         row_single_thumb = QHBoxLayout()
-        self.btn_gen_single_thumb = QPushButton("🎨 Tạo Thumbnail Tập Này")
+        self.btn_gen_single_thumb = QPushButton("🎨 Ghép Thử Thumbnail Tập Này")
+        self.btn_gen_single_thumb.setStyleSheet("font-weight: bold; background-color: #238636; color: white; padding: 7px 14px; border-radius: 4px;")
+        self.btn_gen_single_thumb.setToolTip("Trích xuất frame hoặc lấy ảnh nền theo nguồn đã chọn rồi ghép chữ để xem trước")
         self.btn_gen_single_thumb.clicked.connect(self._create_single_thumbnail)
-        self.btn_pick_thumb = QPushButton("📁 Chọn ảnh có sẵn")
-        self.btn_pick_thumb.clicked.connect(self._pick_custom_thumbnail)
         row_single_thumb.addWidget(self.btn_gen_single_thumb)
-        row_single_thumb.addWidget(self.btn_pick_thumb)
-        lay_thumb.addLayout(row_single_thumb)
+        lay_cust_th.addLayout(row_single_thumb)
 
-        # Hàng công cụ nâng cao: AI Render ảnh nghệ thuật & Chụp từ video gốc
-        row_ai_thumb = QHBoxLayout()
-        self.btn_ai_render_thumb = QPushButton("✨ AI Render Ảnh Cuốn Hút (FLUX)")
-        self.btn_ai_render_thumb.setStyleSheet("font-weight: bold; background-color: #6200ea; color: white; padding: 6px; border-radius: 4px;")
-        self.btn_ai_render_thumb.setToolTip("Dùng AI FLUX vẽ ảnh bìa nghệ thuật mới hoàn toàn, siêu nét chuẩn 1280x720")
-        self.btn_ai_render_thumb.clicked.connect(self._generate_ai_thumbnail_art)
-
-        self.btn_extract_frame = QPushButton("📸 Chụp Ảnh Từ Video (FFmpeg)")
-        self.btn_extract_frame.setStyleSheet("font-weight: bold; background-color: #00796b; color: white; padding: 6px; border-radius: 4px;")
-        self.btn_extract_frame.setToolTip("Trích xuất khung hình độ nét cao trực tiếp từ video gốc")
-        self.btn_extract_frame.clicked.connect(self._extract_frame_from_current_video)
-
-        row_ai_thumb.addWidget(self.btn_ai_render_thumb)
-        row_ai_thumb.addWidget(self.btn_extract_frame)
-        lay_thumb.addLayout(row_ai_thumb)
-
-        right_layout.addWidget(grp_thumb)
+        lay_thumb.addWidget(self.custom_thumb_box)
 
         # Box 6: Nút Bắt đầu Upload & Log
         grp_upload = QGroupBox("6. Tiến trình Tải lên YouTube")
@@ -1046,87 +1505,34 @@ class YouTubeTab(QWidget):
         self.upload_log.setStyleSheet("background-color: #1a1a1a; color: #a9b7c6; font-family: Consolas, monospace; font-size: 11px;")
         lay_up.addWidget(self.upload_log)
 
-        right_layout.addWidget(grp_upload, 1)
+        # -----------------------------------------------
+        # GHÉP CỘT 2: QSplitter DỌC (70% Thumbnail Studio : 30% Log)
+        # -----------------------------------------------
+        right_splitter = QSplitter(Qt.Vertical)
+        right_splitter.setChildrenCollapsible(False)
+        right_splitter.addWidget(grp_thumb)
+        right_splitter.addWidget(grp_upload)
+        right_splitter.setSizes([680, 240])
+        right_splitter.setStretchFactor(0, 7)
+        right_splitter.setStretchFactor(1, 3)
+        right_layout.addWidget(right_splitter)
 
-        self.right_scroll = QScrollArea()
-        self.right_scroll.setWidgetResizable(True)
-        self.right_scroll.setFrameShape(QFrame.NoFrame)
-        self.right_scroll.setWidget(right_widget)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.NoFrame)
+        right_scroll.setWidget(right_widget)
 
-        # Splitter chính: Hỗ trợ linh hoạt chuyển đổi giữa 3 cột song song và 2 cột rộng
-        self.main_splitter = QSplitter(Qt.Horizontal)
-        self.main_splitter.setChildrenCollapsible(False)
-        overall_layout.addWidget(self.main_splitter, 1)
-
-        # Mặc định kích hoạt chế độ 3 Cột Song Song hiện đại
-        self._apply_layout_mode("3_col")
+        # Splitter chính nằm ngang: Cột Trái (Kênh + Video + AI + Meta) | Cột Phải (Thumbnail + Upload)
+        main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.setChildrenCollapsible(False)
+        main_splitter.addWidget(left_splitter)
+        main_splitter.addWidget(right_scroll)
+        main_splitter.setSizes([640, 560])
+        main_splitter.setStretchFactor(0, 1)
+        main_splitter.setStretchFactor(1, 1)
+        main_layout.addWidget(main_splitter)
         self._update_provider_visibility()
-
-    # ==========================
-    # LOGIC: BỐ CỤC STUDIO (3 CỘT / 2 CỘT)
-    # ==========================
-    def _on_layout_mode_changed(self) -> None:
-        mode = self.layout_mode_combo.currentData() or "3_col"
-        self._apply_layout_mode(mode)
-        self._save_ui_settings()
-
-    def _apply_layout_mode(self, mode: str) -> None:
-        self.left_top_widget.setParent(None)
-        self.left_bottom_scroll.setParent(None)
-        self.right_scroll.setParent(None)
-        self.left_splitter.setParent(None)
-
-        if mode == "3_col":
-            self.left_splitter.setVisible(False)
-            self.main_splitter.addWidget(self.left_top_widget)
-            self.main_splitter.addWidget(self.left_bottom_scroll)
-            self.main_splitter.addWidget(self.right_scroll)
-
-            self.left_top_widget.setMinimumWidth(320)
-            self.left_bottom_scroll.setMinimumWidth(320)
-            self.right_scroll.setMinimumWidth(320)
-
-            self.main_splitter.setSizes([420, 440, 420])
-            self.main_splitter.setStretchFactor(0, 3)
-            self.main_splitter.setStretchFactor(1, 3)
-            self.main_splitter.setStretchFactor(2, 3)
-        else:
-            self.left_splitter.setVisible(True)
-            self.left_splitter.addWidget(self.left_top_widget)
-            self.left_splitter.addWidget(self.left_bottom_scroll)
-            self.left_splitter.setSizes([380, 420])
-
-            self.main_splitter.addWidget(self.left_splitter)
-            self.main_splitter.addWidget(self.right_scroll)
-
-            self.left_splitter.setMinimumWidth(340)
-            self.right_scroll.setMinimumWidth(340)
-
-            self.main_splitter.setSizes([750, 450])
-            self.main_splitter.setStretchFactor(0, 3)
-            self.main_splitter.setStretchFactor(1, 2)
-
-        QTimer.singleShot(50, self._refresh_current_preview)
-
-    def _refresh_current_preview(self) -> None:
-        if self.current_thumbnail_path and self.current_thumbnail_path.exists():
-            self._set_thumbnail_preview(self.current_thumbnail_path)
-
-    def _ai_rewrite_current_title(self) -> None:
-        if self.current_video_idx < 0 or self.current_video_idx >= len(self.video_items):
-            QMessageBox.warning(self, "Chưa chọn video", "Vui lòng chọn 1 video để viết lại tiêu đề.")
-            return
-
-        item = self.video_items[self.current_video_idx]
-        cur_title = self.title_edit.text().strip() or item.get("file_name", "")
-        badge = item.get("episode_badge", "")
-
-        new_title = OfflineSEOAssistant.enhance_catchy_title(cur_title)
-        if badge and not new_title.upper().startswith(f"{badge.upper()}:"):
-            new_title = f"{badge}: {new_title}"
-
-        self.title_edit.setText(new_title[:95])
-        self._log(f"✨ [AI Viết Lại Tiêu Đề]: {new_title}")
+        self._update_thumb_source_visibility()
 
     # ==========================
     # LOGIC: AI PROVIDER UI
@@ -1334,11 +1740,6 @@ class YouTubeTab(QWidget):
                 except Exception:
                     pass
 
-        if "(Thư mục ngoài)" in raw_proj_name:
-            is_external = True
-            self._current_project_media = []
-        self._is_external_project = is_external
-
         if not output_dir:
             output_dir = Path(self.settings.get("export", {}).get("output_folder", "output"))
 
@@ -1352,7 +1753,7 @@ class YouTubeTab(QWidget):
             self.video_items = []
             return
 
-        mp4_files = sorted(list(output_dir.glob("*.mp4")), key=lambda p: p.name)
+        mp4_files = sorted(list(output_dir.glob("*.mp4")), key=lambda p: natural_sort_key(p.name))
         self._load_mp4_files_into_table(mp4_files, clean_title, is_external=is_external)
 
     def _load_mp4_files_into_table(self, mp4_files: List[Path], story_title: str, is_external: bool = False) -> None:
@@ -1377,23 +1778,11 @@ class YouTubeTab(QWidget):
                 clean_name = f.stem
 
             if is_external:
-                # Video mở ngoài: Tự động dùng AI viết lại tiêu đề cuốn hút nếu tiêu đề cụt lủn hoặc chưa rành mạch
-                catchy_title = OfflineSEOAssistant.enhance_catchy_title(clean_name)
+                # Video mở ngoài: ưu tiên lấy tên video sạch của chính nó
                 if badge:
-                    item_title = f"{badge}: {catchy_title}"
+                    item_title = f"{badge}: {clean_name}"
                 else:
-                    item_title = catchy_title
-
-                # Tự động trích xuất khung hình từ video làm thumbnail nếu chưa có ảnh
-                if not thumb_path:
-                    try:
-                        thumb_candidate = f.parent / f"frame_{f.stem}.jpg"
-                        if not thumb_candidate.exists():
-                            ThumbnailBuilder.extract_video_frame(f, thumb_candidate, timestamp_sec=3.0)
-                        if thumb_candidate.exists():
-                            thumb_path = str(thumb_candidate)
-                    except Exception:
-                        pass
+                    item_title = clean_name
             else:
                 # Dự án nội bộ
                 if clean_name and clean_name.lower() != story_title.lower() and clean_name.lower() != "video":
@@ -1410,11 +1799,9 @@ class YouTubeTab(QWidget):
             if len(item_title) > 95:
                 item_title = item_title[:95]
 
-            # Thẻ tags: Bắt buộc định dạng #tagkhongdau, #tagkhongcach
-            tag_list = [clean_name, story_title or "video", "truyen audio"]
+            tag_base = f"{clean_name.lower()}, {story_title.lower() if story_title else ''}, truyen audio"
             if badge:
-                tag_list.append(badge)
-            formatted_tags = format_tags_string(tag_list)
+                tag_base += f", {badge.lower()}"
 
             item_data = {
                 "video_path": str(f),
@@ -1424,9 +1811,9 @@ class YouTubeTab(QWidget):
                 "episode_index": row + 1 if badge else None,
                 "title": item_title,
                 "description": "",
-                "tags": formatted_tags,
+                "tags": tag_base.strip(", "),
                 "thumbnail_path": thumb_path,
-                "thumbnail_hl": (clean_name or story_title or f.stem).upper()[:40],
+                "thumbnail_hl": extract_highlight_from_title(item_title),
             }
             self.video_items.append(item_data)
 
@@ -1481,7 +1868,7 @@ class YouTubeTab(QWidget):
         )
         if not files:
             return
-        mp4_files = [Path(f) for f in files]
+        mp4_files = sorted([Path(f) for f in files], key=lambda p: natural_sort_key(p.name))
         folder = mp4_files[0].parent
         folder_name = folder.name
 
@@ -1501,9 +1888,96 @@ class YouTubeTab(QWidget):
         self.proj_combo.blockSignals(False)
 
         self._current_project_dir = folder
-        self._is_external_project = True
-        self._current_project_media = []
         self._load_mp4_files_into_table(mp4_files, story_title=folder_name, is_external=True)
+
+    def _sort_videos_natural(self) -> None:
+        if not hasattr(self, "video_items") or not self.video_items:
+            return
+        self.video_items.sort(key=lambda it: natural_sort_key(it.get("file_name", "")))
+        self._reload_video_table_from_items()
+        self._log("✔ Đã sắp xếp danh sách video theo thứ tự tự nhiên (P1, P2, P10...)")
+
+    def _sort_videos_az(self) -> None:
+        if not hasattr(self, "video_items") or not self.video_items:
+            return
+        self.video_items.sort(key=lambda it: it.get("file_name", "").lower())
+        self._reload_video_table_from_items()
+        self._log("✔ Đã sắp xếp danh sách video theo thứ tự A ➔ Z")
+
+    def _sort_videos_za(self) -> None:
+        if not hasattr(self, "video_items") or not self.video_items:
+            return
+        self.video_items.sort(key=lambda it: it.get("file_name", "").lower(), reverse=True)
+        self._reload_video_table_from_items()
+        self._log("✔ Đã sắp xếp danh sách video theo thứ tự Z ➔ A")
+
+    def _move_video_up(self) -> None:
+        if not hasattr(self, "video_items") or not self.video_items:
+            return
+        row = self.current_video_idx
+        if row > 0 and row < len(self.video_items):
+            item = self.video_items.pop(row)
+            self.video_items.insert(row - 1, item)
+            self._reload_video_table_from_items(selected_row=row - 1)
+
+    def _move_video_down(self) -> None:
+        if not hasattr(self, "video_items") or not self.video_items:
+            return
+        row = self.current_video_idx
+        if 0 <= row < len(self.video_items) - 1:
+            item = self.video_items.pop(row)
+            self.video_items.insert(row + 1, item)
+            self._reload_video_table_from_items(selected_row=row + 1)
+
+    def _reload_video_table_from_items(self, selected_row: Optional[int] = None) -> None:
+        if not hasattr(self, "video_items"):
+            return
+        self.video_table.blockSignals(True)
+        self.video_table.setRowCount(len(self.video_items))
+        for row, item_data in enumerate(self.video_items):
+            chk_item = QTableWidgetItem()
+            chk_item.setCheckState(Qt.Checked)
+            chk_item.setData(Qt.UserRole, row)
+            chk_item.setFlags(chk_item.flags() & ~Qt.ItemIsEditable)
+            self.video_table.setItem(row, 0, chk_item)
+
+            badge = item_data.get("episode_badge", "")
+            it_badge = QTableWidgetItem(badge)
+            it_badge.setTextAlignment(Qt.AlignCenter)
+            self.video_table.setItem(row, 1, it_badge)
+
+            f_name = item_data.get("file_name", "")
+            it_name = QTableWidgetItem(f_name)
+            it_name.setToolTip(f_name)
+            it_name.setFlags(it_name.flags() & ~Qt.ItemIsEditable)
+            self.video_table.setItem(row, 2, it_name)
+
+            it_title = QTableWidgetItem(item_data.get("title", ""))
+            it_title.setToolTip(item_data.get("title", ""))
+            self.video_table.setItem(row, 3, it_title)
+
+            thumb_path = item_data.get("thumbnail_path")
+            thumb_status = "✔ Đã có" if thumb_path else "Chưa tạo"
+            it_thumb = QTableWidgetItem(thumb_status)
+            it_thumb.setTextAlignment(Qt.AlignCenter)
+            it_thumb.setFlags(it_thumb.flags() & ~Qt.ItemIsEditable)
+            if thumb_path:
+                it_thumb.setForeground(Qt.green)
+            else:
+                it_thumb.setForeground(Qt.gray)
+            self.video_table.setItem(row, 4, it_thumb)
+
+            sz_mb = item_data.get("size_mb", 0.0)
+            it_sz = QTableWidgetItem(f"{sz_mb:.1f} MB")
+            it_sz.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            it_sz.setFlags(it_sz.flags() & ~Qt.ItemIsEditable)
+            self.video_table.setItem(row, 5, it_sz)
+
+        self.video_table.blockSignals(False)
+
+        if len(self.video_items) > 0:
+            target_r = selected_row if (selected_row is not None and 0 <= selected_row < len(self.video_items)) else 0
+            self._select_video_row(target_r)
 
     def _select_all_videos(self) -> None:
         for r in range(self.video_table.rowCount()):
@@ -1549,21 +2023,40 @@ class YouTubeTab(QWidget):
 
         self.thumb_hl_edit.blockSignals(True)
         saved_hl = item.get("thumbnail_hl")
-        if saved_hl:
-            self.thumb_hl_edit.setText(saved_hl)
-        else:
-            default_hl = clean_story_title(item.get("title", "") or self.proj_combo.currentText())
-            self.thumb_hl_edit.setText(default_hl.upper()[:40])
-            item["thumbnail_hl"] = default_hl.upper()[:40]
+        if not saved_hl or not item.get("user_edited_hl"):
+            saved_hl = extract_highlight_from_title(item.get("title", "") or self.proj_combo.currentText())
+            item["thumbnail_hl"] = saved_hl
+        self.thumb_hl_edit.setText(saved_hl)
         self.thumb_hl_edit.blockSignals(False)
+
+        # Cập nhật style/bố cục nếu tập này đã có cấu hình riêng
+        if item.get("thumb_font"):
+            idx_f = self.thumb_font_combo.findData(item["thumb_font"])
+            if idx_f >= 0:
+                self.thumb_font_combo.blockSignals(True)
+                self.thumb_font_combo.setCurrentIndex(idx_f)
+                self.thumb_font_combo.blockSignals(False)
+        if item.get("thumb_pos"):
+            idx_p = self.thumb_pos_combo.findData(item["thumb_pos"])
+            if idx_p >= 0:
+                self.thumb_pos_combo.blockSignals(True)
+                self.thumb_pos_combo.setCurrentIndex(idx_p)
+                self.thumb_pos_combo.blockSignals(False)
+        if item.get("thumb_badge_pos"):
+            idx_bp = self.thumb_badge_pos_combo.findData(item["thumb_badge_pos"])
+            if idx_bp >= 0:
+                self.thumb_badge_pos_combo.blockSignals(True)
+                self.thumb_badge_pos_combo.setCurrentIndex(idx_bp)
+                self.thumb_badge_pos_combo.blockSignals(False)
 
         # Cập nhật preview Thumbnail
         thumb_p = item.get("thumbnail_path")
         if thumb_p and Path(thumb_p).exists():
             self._set_thumbnail_preview(Path(thumb_p))
         else:
+            self.thumb_preview.clear()
             badge_note = f"\n({badge_val})" if badge_val else ""
-            self.thumb_preview.clear_thumbnail(f"Chưa có Thumbnail{badge_note}")
+            self.thumb_preview.setText(f"Chưa có Thumbnail{badge_note}\nBấm '🎨 Ghép Thử Thumbnail Tập Này' để tạo preview")
             self.current_thumbnail_path = None
 
     def _on_title_changed(self, text: str) -> None:
@@ -1583,6 +2076,14 @@ class YouTubeTab(QWidget):
                 tbl_it.setToolTip(text)
                 self.video_table.blockSignals(False)
 
+            # Tự động phân tích cụm chữ to nổi bật từ tiêu đề nếu người dùng chưa sửa thủ công
+            if not self.video_items[self.current_video_idx].get("user_edited_hl"):
+                new_hl = extract_highlight_from_title(text)
+                self.thumb_hl_edit.blockSignals(True)
+                self.thumb_hl_edit.setText(new_hl)
+                self.thumb_hl_edit.blockSignals(False)
+                self.video_items[self.current_video_idx]["thumbnail_hl"] = new_hl
+
     def _on_desc_changed(self) -> None:
         if 0 <= self.current_video_idx < len(self.video_items):
             self.video_items[self.current_video_idx]["description"] = self.desc_edit.toPlainText()
@@ -1593,71 +2094,61 @@ class YouTubeTab(QWidget):
 
     def _on_badge_changed(self, text: str) -> None:
         if 0 <= self.current_video_idx < len(self.video_items):
-            self.video_items[self.current_video_idx]["episode_badge"] = text
+            val = text.strip()
+            self.video_items[self.current_video_idx]["episode_badge"] = val
             tbl_it = self.video_table.item(self.current_video_idx, 1)
-            if tbl_it:
-                tbl_it.setText(text)
+            if tbl_it and tbl_it.text() != val:
+                self.video_table.blockSignals(True)
+                tbl_it.setText(val)
+                self.video_table.blockSignals(False)
 
     def _on_thumb_hl_changed(self, text: str) -> None:
         if 0 <= self.current_video_idx < len(self.video_items):
-            self.video_items[self.current_video_idx]["thumbnail_hl"] = text
+            self.video_items[self.current_video_idx]["thumbnail_hl"] = text.strip()
+            self.video_items[self.current_video_idx]["user_edited_hl"] = True
 
     def _on_thumb_style_or_pos_changed(self) -> None:
         is_custom = (self.thumb_pos_combo.currentData() == "custom")
         self.custom_pos_box.setVisible(is_custom)
-        self._save_ui_settings()
         if 0 <= self.current_video_idx < len(self.video_items):
-            self._create_single_thumbnail(silent=True)
-
-    def _on_thumb_mode_changed(self) -> None:
-        mode = self.thumb_mode_combo.currentData() or "auto"
-        is_badge_only = (mode == "badge_only")
-        self.full_title_box.setVisible(not is_badge_only)
-        if is_badge_only:
-            self.lbl_scan_info.setText("🏷️ Chế độ Chỉ Đóng Huy Hiệu: Giữ nguyên 100% ảnh gốc, không vẽ đè tiêu đề.")
-        elif mode == "full":
-            self.lbl_scan_info.setText("🌟 Chế độ Vẽ Đầy Đủ: Vẽ cả Huy hiệu tập + Tiêu đề nghệ thuật kiếm hiệp.")
-        else:
-            self.lbl_scan_info.setText("🔍 Chế độ Tự Động Quét: Tự nhận diện ảnh có chữ -> Chỉ đóng Huy hiệu tập.")
+            self.video_items[self.current_video_idx]["thumb_font"] = self.thumb_font_combo.currentData()
+            self.video_items[self.current_video_idx]["thumb_pos"] = self.thumb_pos_combo.currentData()
+            self.video_items[self.current_video_idx]["thumb_badge_pos"] = self.thumb_badge_pos_combo.currentData()
         self._save_ui_settings()
-        if 0 <= self.current_video_idx < len(self.video_items):
-            self._create_single_thumbnail(silent=True)
+    def _on_enable_badge_toggled(self, checked: bool) -> None:
+        self.thumb_badge_edit.setEnabled(checked)
+        self.thumb_badge_pos_combo.setEnabled(checked)
+        if not getattr(self, "_is_loading_settings", False):
+            self._save_ui_settings()
 
-    def _scan_current_image(self) -> None:
-        if self.current_video_idx < 0 or self.current_video_idx >= len(self.video_items):
-            QMessageBox.warning(self, "Chưa chọn tập", "Vui lòng chọn 1 tập trong bảng danh sách để quét ảnh.")
-            return
-        candidates = list(self._current_project_media)
-        if not candidates and self._current_project_dir and self._current_project_dir.exists():
-            candidates = sorted(list(self._current_project_dir.glob("*.png")) + list(self._current_project_dir.glob("*.jpg")))
-        if not candidates:
-            candidates = [Path(m) for m in self.settings.get("media_files", []) if Path(m).exists()]
+    def _on_enable_hl_toggled(self, checked: bool) -> None:
+        self.thumb_hl_edit.setEnabled(checked)
+        self.thumb_font_combo.setEnabled(checked)
+        self.thumb_pos_combo.setEnabled(checked)
+        self.custom_pos_box.setEnabled(checked and self.thumb_pos_combo.currentData() == "custom")
+        if not getattr(self, "_is_loading_settings", False):
+            self._save_ui_settings()
 
-        bg_img = candidates[self.current_video_idx % len(candidates)] if candidates else None
-        if not bg_img or not bg_img.exists():
-            QMessageBox.warning(self, "Không tìm thấy ảnh", "Chưa có file ảnh nền nào cho tập này để quét.")
-            return
+    def _on_thumb_src_mode_changed(self) -> None:
+        is_frame = self.rad_src_frame.isChecked()
+        is_pl = self.rad_src_playlist.isChecked()
+        is_cust = self.rad_src_custom.isChecked()
 
-        has_text, info = ThumbnailBuilder.detect_text_in_image(bg_img)
-        if has_text:
-            msg = (
-                f"🔍 KẾT QUẢ QUÉT: Ảnh của tập này ĐÃ CÓ CHỮ TIÊU ĐỀ SẴN!\n"
-                f"({info})\n\n"
-                f"💡 Khuyên dùng: Chế độ 'Chỉ đóng Huy hiệu tập' sẽ giữ trọn 100% hình gốc và không bị đè chữ làm xấu ảnh."
-            )
-            self.lbl_scan_info.setText("🔍 Phát hiện ảnh ĐÃ CÓ SẴN CHỮ: Khuyên dùng Chỉ Đóng Huy Hiệu.")
-            idx = self.thumb_mode_combo.findData("badge_only")
-            if idx >= 0:
-                self.thumb_mode_combo.setCurrentIndex(idx)
-            QMessageBox.information(self, "Kết quả quét ảnh", msg)
-        else:
-            msg = (
-                f"🌟 KẾT QUẢ QUÉT: Ảnh mộc, CHƯA CÓ CHỮ TIÊU ĐỀ!\n"
-                f"({info})\n\n"
-                f"💡 Bạn có thể dùng chế độ 'Vẽ đầy đủ' để tạo chữ kiếm hiệp nghệ thuật hoành tráng."
-            )
-            self.lbl_scan_info.setText("🌟 Ảnh mộc chưa có chữ: Vẽ đầy đủ nghệ thuật.")
-            QMessageBox.information(self, "Kết quả quét ảnh", msg)
+        self.frame_opt_widget.setVisible(is_frame)
+        self.pl_opt_widget.setVisible(is_pl)
+        self.cust_opt_widget.setVisible(is_cust)
+        if not getattr(self, "_is_loading_settings", False):
+            self._save_ui_settings()
+
+    def _pick_playlist_thumbnail(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Chọn 1 ảnh poster chung cho toàn bộ Playlist", "", "Hình ảnh (*.jpg *.jpeg *.png *.webp)"
+        )
+        if path:
+            self._playlist_common_thumb = Path(path)
+            self.lbl_pl_img_name.setText(f"✔ {self._playlist_common_thumb.name}")
+            self.lbl_pl_img_name.setStyleSheet("color: #7ee787; font-weight: bold;")
+            self._log(f"✔ Đã chọn ảnh nền chung cho toàn bộ Playlist: {self._playlist_common_thumb.name}")
 
     # ==========================
     # LOGIC: SINH NỘI DUNG AI
@@ -1717,6 +2208,7 @@ class YouTubeTab(QWidget):
         self.btn_batch_ai_gen.setEnabled(False)
         self.btn_batch_ai_gen.setText(f"⏳ Đang tạo nội dung cho {len(tasks)} tập...")
 
+        target_lang = self.ai_target_lang_combo.currentData() or "vi"
         self._content_worker = ContentWorker(
             provider=provider,
             api_key=api_key,
@@ -1724,6 +2216,7 @@ class YouTubeTab(QWidget):
             custom_base_url=custom_url,
             tasks=tasks,
             channel_name=ch_name,
+            target_language=target_lang,
         )
 
         def on_item_finished(task_idx: int, ok: bool, msg: str, data: dict) -> None:
@@ -1749,11 +2242,21 @@ class YouTubeTab(QWidget):
                         self.video_table.setItem(row_idx, 1, QTableWidgetItem(badge))
                     self.video_table.blockSignals(False)
 
-                    if "thumbnail_highlight" in data and data["thumbnail_highlight"]:
-                        item["thumbnail_hl"] = data["thumbnail_highlight"].strip().upper()
+                    hl_val = data.get("thumbnail_highlight")
+                    if not hl_val or " - " not in hl_val:
+                        hl_val = extract_highlight_from_title(item.get("title", ""))
+                    item["thumbnail_hl"] = hl_val
+                    item["thumbnail_highlight"] = hl_val
+                    item["user_edited_hl"] = False
+
+                    if "thumbnail_ai_prompt" in data and data["thumbnail_ai_prompt"]:
+                        item["ai_image_prompt"] = data["thumbnail_ai_prompt"].strip()
 
                     if row_idx == self.current_video_idx:
                         self._select_video_row(row_idx)
+                        self.thumb_hl_edit.blockSignals(True)
+                        self.thumb_hl_edit.setText(hl_val)
+                        self.thumb_hl_edit.blockSignals(False)
 
                     bdg_tag = f"[{item['episode_badge']}] " if item.get('episode_badge') else ""
                     self._log(f"✔ Đã tạo nội dung cho {bdg_tag}{item['title']}")
@@ -1773,116 +2276,146 @@ class YouTubeTab(QWidget):
     def _generate_with_gemini(self) -> None:
         self._generate_all_content()
 
-    # ==========================
-    # LOGIC: THUMBNAIL STUDIO TỪNG TẬP
-    # ==========================
-    def _create_all_thumbnails(self) -> None:
-        if not self.video_items:
-            QMessageBox.warning(self, "Chưa có video", "Không có video nào trong danh sách để tạo Thumbnail.")
+    def _copy_current_episode_info(self) -> None:
+        if not hasattr(self, "video_items") or self.current_video_idx < 0 or self.current_video_idx >= len(self.video_items):
+            QMessageBox.warning(self, "Chưa chọn tập", "Vui lòng chọn 1 tập video trong bảng để sao chép thông tin.")
             return
 
-        # Tìm các ảnh minh họa nội dung truyện từ project media_files
-        candidates = list(self._current_project_media)
-        if not candidates and self._current_project_dir and self._current_project_dir.exists():
-            candidates = sorted(list(self._current_project_dir.glob("*.png")) + list(self._current_project_dir.glob("*.jpg")))
+        item = self.video_items[self.current_video_idx]
+        badge = item.get("episode_badge", "")
+        title = item.get("title", "")
+        thumb_hl = item.get("thumbnail_hl", "")
+        prompt = item.get("ai_image_prompt", "")
+        desc = item.get("description", "")
+        tags = item.get("tags", "")
 
-        if not candidates:
-            global_media = self.settings.get("media_files", [])
-            candidates = [Path(m) for m in global_media if Path(m).exists()]
+        lines = []
+        if badge:
+            lines.append(f"Tập: {badge}")
+        lines.append(f"Tiêu đề: {title}")
+        if thumb_hl:
+            lines.append(f"Chữ nổi bật Thumbnail: {thumb_hl}")
+        if prompt:
+            lines.append(f"Prompt tạo ảnh AI:\n{prompt}")
+        if desc:
+            lines.append(f"Mô tả:\n{desc}")
+        if tags:
+            lines.append(f"Tags: {tags}")
 
-        raw_story_title = self.proj_combo.currentText()
-        clean_title = clean_story_title(raw_story_title).upper()
-        ch_name = self.channel_combo.currentText().split("(")[0].strip()
+        clipboard_text = "\n\n".join(lines)
+        QApplication.clipboard().setText(clipboard_text)
+        self._log(f"📋 Đã sao chép toàn bộ thông tin & Prompt của tập {badge or (self.current_video_idx + 1)} vào bộ nhớ tạm.")
+        QMessageBox.information(
+            self,
+            "Đã sao chép",
+            f"Đã sao chép thông tin tập {badge or (self.current_video_idx + 1)} vào Clipboard!\nBạn có thể dán (Ctrl+V) ngay sang Midjourney, Photoshop, Canva, v.v."
+        )
 
-        out_dir = self._current_project_dir or Path("D:/auto_video_renderer/auto_video_renderer/temp")
-        out_dir.mkdir(parents=True, exist_ok=True)
+    def _export_to_csv(self) -> None:
+        if not hasattr(self, "video_items") or not self.video_items:
+            QMessageBox.warning(self, "Chưa có dữ liệu", "Danh sách video đang trống. Vui lòng chọn dự án hoặc thêm video trước khi xuất CSV.")
+            return
 
-        mode = self.thumb_mode_combo.currentData() or "auto"
-        badge_pos = self.thumb_badge_pos_combo.currentData() or "top_left"
-        font_style = self.thumb_font_combo.currentData() or "but_phap"
-        position = self.thumb_pos_combo.currentData() or "split_lr"
-        pos_x = self.thumb_x_spin.value() if position == "custom" else None
-        pos_y = self.thumb_y_spin.value() if position == "custom" else None
-        font_scale = (self.thumb_scale_spin.value() / 100.0) if position == "custom" else 0.68
+        # Kiểm tra các tập đang được tick chọn
+        selected_rows = []
+        for r in range(self.video_table.rowCount()):
+            chk_it = self.video_table.item(r, 0)
+            if chk_it and chk_it.checkState() == Qt.Checked and r < len(self.video_items):
+                selected_rows.append(r)
 
-        count = 0
-        badge_only_count = 0
-        for idx, item in enumerate(self.video_items):
-            badge = item.get("episode_badge") if item.get("episode_badge") is not None else ""
-            out_thumb = out_dir / f"thumbnail_tap_{idx+1}.jpg"
+        # Nếu không có tập nào tick thì xuất toàn bộ bảng
+        if not selected_rows:
+            target_indices = list(range(len(self.video_items)))
+            scope_desc = f"toàn bộ {len(target_indices)} tập"
+        else:
+            target_indices = selected_rows
+            scope_desc = f"{len(target_indices)} tập đã chọn"
 
-            # Xác định ảnh nền: Nếu là thư mục ngoài, dùng frame video hoặc thumbnail đã có, không lấy ảnh truyện cũ
-            if self._is_external_project:
-                v_p = Path(item["video_path"])
-                base_frame = out_dir / f"frame_{v_p.stem}.jpg"
-                if not base_frame.exists():
-                    try:
-                        ThumbnailBuilder.extract_video_frame(v_p, base_frame, 3.0)
-                    except Exception:
-                        pass
-                if base_frame.exists():
-                    bg_img = base_frame
-                elif item.get("thumbnail_path") and Path(item["thumbnail_path"]).exists():
-                    bg_img = Path(item["thumbnail_path"])
-                else:
-                    bg_img = Path("temp/preview_fx_bubbles.png")
-            else:
-                bg_img = candidates[idx % len(candidates)] if candidates else Path("temp/preview_fx_bubbles.png")
+        # Gợi ý tên file mặc định theo tên dự án / truyện
+        raw_title = self.proj_combo.currentText().strip() or "youtube_videos"
+        safe_title = re.sub(r'[\\/*?:"<>|]', "", raw_title).strip().replace(" ", "_")
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_filename = f"{safe_title}_metadata_{ts}.csv"
 
-            # Xác định badge_only theo chế độ đã chọn
-            is_badge_only = False
-            if mode == "badge_only":
-                is_badge_only = True
-            elif mode == "auto":
-                has_text, info = ThumbnailBuilder.detect_text_in_image(bg_img)
-                if has_text:
-                    is_badge_only = True
-                    bdg_info = f"[{badge}]" if badge else "Huy hiệu"
-                    self._log(f"🔍 [Tập {idx+1}] Ảnh ĐÃ CÓ CHỮ SẴN ({info}) -> Tự động chỉ đóng {bdg_info}.")
-                else:
-                    is_badge_only = False
-            else:
-                is_badge_only = False
+        default_dir = ""
+        if getattr(self, "_current_project_dir", None) and self._current_project_dir.exists():
+            default_dir = str(self._current_project_dir)
+        elif self.video_items and self.video_items[0].get("video_path"):
+            default_dir = str(Path(self.video_items[0]["video_path"]).parent)
 
-            if is_badge_only:
-                badge_only_count += 1
+        initial_path = os.path.join(default_dir, default_filename) if default_dir else default_filename
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            f"Lưu danh sách {scope_desc} ra file CSV",
+            initial_path,
+            "CSV Files (*.csv);;All Files (*.*)"
+        )
+        if not file_path:
+            return
 
-            # Tự động lấy chữ to nổi bật cho thumbnail từ tên truyện/tiêu đề video
-            hl_text = item.get("thumbnail_hl") or clean_story_title(item.get("title", "") or raw_story_title).upper()
+        try:
+            # Ghi file chuẩn utf-8-sig (BOM) để Microsoft Excel trên Windows tự nhận dạng Unicode không bị lỗi font
+            with open(file_path, mode="w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                # Header row
+                writer.writerow([
+                    "STT",
+                    "Tập",
+                    "Tiêu đề YouTube",
+                    "Chữ nổi bật Thumbnail",
+                    "Prompt tạo ảnh AI",
+                    "Mô tả (Description)",
+                    "Thẻ từ khóa (Tags)",
+                    "Tên file MP4",
+                    "Đường dẫn video",
+                    "Ảnh Thumbnail hiện tại",
+                ])
 
-            try:
-                thumb_res = ThumbnailBuilder.create_thumbnail(
-                    bg_image=bg_img,
-                    output_path=out_thumb,
-                    badge_text=badge,
-                    highlight_title=hl_text,
-                    subtitle=ch_name,
-                    font_style=font_style,
-                    position=position,
-                    pos_x=pos_x,
-                    pos_y=pos_y,
-                    font_scale=font_scale,
-                    badge_only=is_badge_only,
-                    badge_position=badge_pos,
-                )
-                item["thumbnail_path"] = str(thumb_res)
-                
-                # Cập nhật ô hiển thị Thumbnail trong bảng
-                it_tb = QTableWidgetItem("✔ Đã tạo")
-                it_tb.setTextAlignment(Qt.AlignCenter)
-                it_tb.setForeground(Qt.green)
-                self.video_table.setItem(idx, 4, it_tb)
+                for out_stt, idx in enumerate(target_indices, start=1):
+                    item = self.video_items[idx]
+                    writer.writerow([
+                        out_stt,
+                        item.get("episode_badge", ""),
+                        item.get("title", ""),
+                        item.get("thumbnail_hl", ""),
+                        item.get("ai_image_prompt", ""),
+                        item.get("description", ""),
+                        item.get("tags", ""),
+                        item.get("file_name", ""),
+                        item.get("video_path", ""),
+                        item.get("thumbnail_path", "") or "",
+                    ])
 
-                if idx == self.current_video_idx:
-                    self._set_thumbnail_preview(thumb_res)
-                count += 1
-            except Exception as e:
-                self._log(f"❌ Lỗi tạo Thumbnail tập {idx+1}: {e}")
+            self._log(f"✔ Đã xuất thành công {len(target_indices)} tập ra file CSV: {file_path}")
 
-        log_msg = f"🎨 Đã tạo {count} Thumbnail 1280x720 (trong đó {badge_only_count} tập chỉ đóng Huy hiệu né đè chữ)."
-        self._log(log_msg)
-        QMessageBox.information(self, "Thumbnail hoàn tất", log_msg)
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Xuất CSV Thành Công")
+            msg_box.setText(f"Đã xuất thành công <b>{len(target_indices)} tập</b> ra file CSV!<br><br><b>Đường dẫn:</b><br><code>{file_path}</code>")
+            msg_box.setIcon(QMessageBox.Information)
 
+            btn_open_file = msg_box.addButton("📊 Mở File CSV (Excel)", QMessageBox.ActionRole)
+            btn_open_folder = msg_box.addButton("📁 Mở Thư Mục", QMessageBox.ActionRole)
+            msg_box.addButton("Đóng", QMessageBox.RejectRole)
+
+            msg_box.exec()
+
+            if msg_box.clickedButton() == btn_open_file:
+                try:
+                    os.startfile(file_path)
+                except Exception as e:
+                    QMessageBox.warning(self, "Không thể mở file", f"Lỗi mở file:\n{e}")
+            elif msg_box.clickedButton() == btn_open_folder:
+                try:
+                    os.startfile(os.path.dirname(file_path))
+                except Exception as e:
+                    QMessageBox.warning(self, "Không thể mở thư mục", f"Lỗi mở thư mục:\n{e}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi xuất CSV", f"Không thể ghi file CSV:\n{e}")
+
+    # ==========================
+    # LOGIC: THUMBNAIL STUDIO
+    # ==========================
     def _create_single_thumbnail(self, silent: bool = False) -> None:
         if self.current_video_idx < 0 or self.current_video_idx >= len(self.video_items):
             if not silent:
@@ -1890,59 +2423,66 @@ class YouTubeTab(QWidget):
             return
 
         item = self.video_items[self.current_video_idx]
-        candidates = list(self._current_project_media)
-        if not candidates and self._current_project_dir and self._current_project_dir.exists():
-            candidates = sorted(list(self._current_project_dir.glob("*.png")) + list(self._current_project_dir.glob("*.jpg")))
-        if not candidates:
-            candidates = [Path(m) for m in self.settings.get("media_files", []) if Path(m).exists()]
-
+        v_path = Path(item.get("video_path", ""))
         out_dir = self._current_project_dir or Path("D:/auto_video_renderer/auto_video_renderer/temp")
+        out_dir.mkdir(parents=True, exist_ok=True)
         out_thumb = out_dir / f"thumbnail_tap_{self.current_video_idx+1}.jpg"
 
-        if self._is_external_project:
-            v_p = Path(item["video_path"])
-            base_frame = out_dir / f"frame_{v_p.stem}.jpg"
-            if not base_frame.exists():
+        # 1. Xác định ảnh nền theo nguồn đã chọn
+        bg_img: Optional[Path] = None
+        if self.rad_src_frame.isChecked():
+            if v_path.exists():
                 try:
-                    ThumbnailBuilder.extract_video_frame(v_p, base_frame, 3.0)
-                except Exception:
-                    pass
-            if base_frame.exists():
-                bg_img = base_frame
+                    sec = self.spin_frame_sec.value()
+                    frame_out = out_dir / f"frame_tap_{self.current_video_idx+1}.jpg"
+                    bg_img = ThumbnailBuilder.extract_frame_from_video(v_path, time_sec=sec, out_path=frame_out)
+                except Exception as ex_frame:
+                    if not silent:
+                        QMessageBox.warning(self, "Lỗi trích xuất frame", f"Không thể trích xuất frame từ video: {ex_frame}")
+                    return
+            else:
+                if not silent:
+                    QMessageBox.warning(self, "Lỗi video", f"Không tìm thấy file video: {v_path}")
+                return
+        elif self.rad_src_playlist.isChecked():
+            if self._playlist_common_thumb and Path(self._playlist_common_thumb).exists():
+                bg_img = Path(self._playlist_common_thumb)
+            else:
+                if not silent:
+                    QMessageBox.warning(self, "Chưa chọn ảnh Playlist", "Vui lòng bấm '📁 Chọn ảnh chung cho Playlist' trước.")
+                return
+        else: # rad_src_custom
+            if item.get("custom_thumb_bg") and Path(item["custom_thumb_bg"]).exists():
+                bg_img = Path(item["custom_thumb_bg"])
             elif item.get("thumbnail_path") and Path(item["thumbnail_path"]).exists():
                 bg_img = Path(item["thumbnail_path"])
             else:
-                bg_img = Path("temp/preview_fx_bubbles.png")
-        else:
-            bg_img = candidates[self.current_video_idx % len(candidates)] if candidates else Path("temp/preview_fx_bubbles.png")
+                candidates = list(self._current_project_media)
+                if not candidates and self._current_project_dir and self._current_project_dir.exists():
+                    candidates = sorted(list(self._current_project_dir.glob("*.png")) + list(self._current_project_dir.glob("*.jpg")))
+                if not candidates:
+                    candidates = [Path(m) for m in self.settings.get("media_files", []) if Path(m).exists()]
+                if candidates:
+                    bg_img = candidates[self.current_video_idx % len(candidates)]
 
-        badge = self.thumb_badge_edit.text().strip()
-        if not badge and item.get("episode_badge") is not None:
-            badge = item.get("episode_badge", "")
-        hl = self.thumb_hl_edit.text().strip() or item.get("thumbnail_hl") or clean_story_title(item.get("title", "") or self.proj_combo.currentText()).upper()
+        if not bg_img or not bg_img.exists():
+            if not silent:
+                QMessageBox.warning(self, "Thiếu ảnh nền", "Không tìm thấy ảnh nền phù hợp để ghép thumbnail.")
+            return
+
+        badge = self.thumb_badge_edit.text().strip() or item.get("episode_badge") or ""
+        hl = self.thumb_hl_edit.text().strip() or item.get("thumbnail_hl") or extract_highlight_from_title(item.get("title", "") or self.proj_combo.currentText())
         ch_name = self.channel_combo.currentText().split("(")[0].strip()
 
-        mode = self.thumb_mode_combo.currentData() or "auto"
         badge_pos = self.thumb_badge_pos_combo.currentData() or "top_left"
-        is_badge_only = False
-        if mode == "badge_only":
-            is_badge_only = True
-        elif mode == "auto":
-            has_text, info = ThumbnailBuilder.detect_text_in_image(bg_img)
-            if has_text:
-                is_badge_only = True
-                self.lbl_scan_info.setText(f"🔍 Đã quét: Ảnh ĐÃ CÓ CHỮ SẴN ({info}) ➔ Chỉ đóng Huy hiệu [{badge}].")
-            else:
-                is_badge_only = False
-                self.lbl_scan_info.setText(f"🌟 Đã quét: Ảnh mộc chưa có chữ ({info}) ➔ Vẽ đầy đủ Tiêu đề + Huy hiệu.")
-        else:
-            is_badge_only = False
-
-        font_style = self.thumb_font_combo.currentData() or "but_phap"
+        font_style = self.thumb_font_combo.currentData() or "drama"
         position = self.thumb_pos_combo.currentData() or "split_lr"
         pos_x = self.thumb_x_spin.value() if position == "custom" else None
         pos_y = self.thumb_y_spin.value() if position == "custom" else None
         font_scale = (self.thumb_scale_spin.value() / 100.0) if position == "custom" else 0.68
+
+        enable_badge = self.chk_enable_badge.isChecked() if hasattr(self, "chk_enable_badge") else True
+        enable_hl = self.chk_enable_hl.isChecked() if hasattr(self, "chk_enable_hl") else True
 
         try:
             res_path = ThumbnailBuilder.create_thumbnail(
@@ -1956,8 +2496,9 @@ class YouTubeTab(QWidget):
                 pos_x=pos_x,
                 pos_y=pos_y,
                 font_scale=font_scale,
-                badge_only=is_badge_only,
                 badge_position=badge_pos,
+                enable_badge=enable_badge,
+                enable_highlight=enable_hl,
             )
             item["thumbnail_path"] = str(res_path)
             self._set_thumbnail_preview(res_path)
@@ -1967,129 +2508,317 @@ class YouTubeTab(QWidget):
             it_tb.setForeground(Qt.green)
             self.video_table.setItem(self.current_video_idx, 4, it_tb)
             if not silent:
-                note_mode = " (Chỉ đóng Huy hiệu)" if is_badge_only else " (Đầy đủ tiêu đề)"
-                self._log(f"✔ Đã tạo Thumbnail cho [{badge}]: {res_path.name}{note_mode}")
+                self._log(f"✔ Đã tạo Thumbnail cho [{badge}]: {res_path.name}")
         except Exception as e:
             if not silent:
                 QMessageBox.critical(self, "Lỗi tạo Thumbnail", str(e))
 
-    def _create_single_thumbnail_with_base(self, base_img_path: Path) -> None:
-        """Tạo thumbnail với ảnh nền tùy biến (ảnh AI hoặc ảnh frame từ video)."""
+    def _on_thumb_source_changed(self) -> None:
+        self._update_thumb_source_visibility()
+
+    def _update_thumb_source_visibility(self) -> None:
+        if hasattr(self, "custom_thumb_box"):
+            self.custom_thumb_box.setVisible(True)
+        if hasattr(self, "_on_thumb_src_mode_changed"):
+            self._on_thumb_src_mode_changed()
+
+    def _add_sample_images(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Chọn 1 đến 3 ảnh mẫu tham khảo (Vision AI)", "", "Hình ảnh (*.jpg *.jpeg *.png *.webp)"
+        )
+        if files:
+            for f in files:
+                p = Path(f)
+                if len(self.sample_image_paths) < 3 and p not in self.sample_image_paths:
+                    self.sample_image_paths.append(p)
+            self._refresh_sample_previews()
+            idx_drama = self.thumb_font_combo.findData("drama")
+            if idx_drama >= 0:
+                self.thumb_font_combo.setCurrentIndex(idx_drama)
+
+    def _clear_sample_images(self) -> None:
+        self.sample_image_paths.clear()
+        self._refresh_sample_previews()
+
+    def _refresh_sample_previews(self) -> None:
+        while self.lay_sample_previews.count():
+            it = self.lay_sample_previews.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+
+        if not self.sample_image_paths:
+            lbl = QLabel("Chưa chọn ảnh mẫu (Tùy chọn - AI sẽ vẽ ảnh tự do theo Tiêu đề & Mô tả)")
+            lbl.setStyleSheet("color: #888; font-size: 10px; font-style: italic;")
+            self.lay_sample_previews.addWidget(lbl)
+            return
+
+        for idx, p in enumerate(self.sample_image_paths):
+            lbl_img = QLabel()
+            lbl_img.setFixedSize(70, 42)
+            lbl_img.setStyleSheet("border: 1px solid #58a6ff; border-radius: 4px; background-color: #000;")
+            lbl_img.setAlignment(Qt.AlignCenter)
+            pix = QPixmap(str(p))
+            if not pix.isNull():
+                lbl_img.setPixmap(pix.scaled(68, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            lbl_img.setToolTip(f"Ảnh mẫu {idx+1}: {p.name}")
+            self.lay_sample_previews.addWidget(lbl_img)
+        self.lay_sample_previews.addStretch(1)
+
+    def _generate_ai_prompt(self) -> None:
         if self.current_video_idx < 0 or self.current_video_idx >= len(self.video_items):
+            QMessageBox.warning(self, "Chưa chọn tập", "Vui lòng chọn 1 tập video trong bảng để tạo Prompt.")
             return
 
         item = self.video_items[self.current_video_idx]
-        out_dir = self._current_project_dir or Path("D:/auto_video_renderer/auto_video_renderer/temp")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_thumb = out_dir / f"thumbnail_tap_{self.current_video_idx+1}.jpg"
+        title = item.get("title") or self.title_edit.text() or self.proj_combo.currentText()
+        desc = item.get("description") or self.desc_edit.toPlainText()
 
-        badge = self.thumb_badge_edit.text().strip()
-        if not badge and item.get("episode_badge") is not None:
-            badge = item.get("episode_badge", "")
-        hl = self.thumb_hl_edit.text().strip() or item.get("thumbnail_hl") or clean_story_title(item.get("title", "") or self.proj_combo.currentText()).upper()
-        ch_name = self.channel_combo.currentText().split("(")[0].strip()
+        provider = self.ai_provider_combo.currentData() or "9router"
+        api_key = ""
+        model = ""
+        custom_url = ""
+        if provider == "gemini":
+            api_key = self.gemini_key_edit.text().strip()
+            model = self.gemini_model_combo.currentText().strip()
+        elif provider == "9router":
+            api_key = self.nine_key_edit.text().strip()
+            model = self.nine_model_combo.currentText().strip()
+            custom_url = self.nine_url_edit.text().strip()
+        elif provider == "custom":
+            api_key = self.custom_key_edit.text().strip()
+            model = self.custom_model_edit.text().strip()
+            custom_url = self.custom_url_edit.text().strip()
 
-        mode = self.thumb_mode_combo.currentData() or "auto"
-        badge_pos = self.thumb_badge_pos_combo.currentData() or "top_left"
-        is_badge_only = False
-        if mode == "badge_only":
-            is_badge_only = True
-        elif mode == "auto":
-            has_text, info = ThumbnailBuilder.detect_text_in_image(base_img_path)
-            is_badge_only = has_text
-            if has_text:
-                self.lbl_scan_info.setText(f"🔍 Đã quét: Ảnh ĐÃ CÓ CHỮ SẴN ({info}) ➔ Chỉ đóng Huy hiệu [{badge}].")
-            else:
-                self.lbl_scan_info.setText(f"🌟 Đã quét: Ảnh mộc chưa có chữ ({info}) ➔ Vẽ đầy đủ Tiêu đề + Huy hiệu.")
-        else:
-            is_badge_only = False
-
-        font_style = self.thumb_font_combo.currentData() or "but_phap"
-        position = self.thumb_pos_combo.currentData() or "split_lr"
-        pos_x = self.thumb_x_spin.value() if position == "custom" else None
-        pos_y = self.thumb_y_spin.value() if position == "custom" else None
-        font_scale = (self.thumb_scale_spin.value() / 100.0) if position == "custom" else 0.68
-
-        try:
-            res_path = ThumbnailBuilder.create_thumbnail(
-                bg_image=base_img_path,
-                output_path=out_thumb,
-                badge_text=badge,
-                highlight_title=hl,
-                subtitle=ch_name,
-                font_style=font_style,
-                position=position,
-                pos_x=pos_x,
-                pos_y=pos_y,
-                font_scale=font_scale,
-                badge_only=is_badge_only,
-                badge_position=badge_pos,
-            )
-            item["thumbnail_path"] = str(res_path)
-            self._set_thumbnail_preview(res_path)
-
-            it_tb = QTableWidgetItem("✔ Đã tạo")
-            it_tb.setTextAlignment(Qt.AlignCenter)
-            it_tb.setForeground(Qt.green)
-            self.video_table.setItem(self.current_video_idx, 4, it_tb)
-            self._log(f"✔ Đã tạo Thumbnail từ nguồn ảnh mới: {res_path.name}")
-        except Exception as e:
-            self._log(f"❌ Lỗi tạo Thumbnail từ ảnh mới: {e}")
-
-    def _generate_ai_thumbnail_art(self) -> None:
-        """Sinh ảnh nghệ thuật chất lượng cao từ AI FLUX (Pollinations.ai) miễn phí hoàn toàn."""
-        if self.current_video_idx < 0 or self.current_video_idx >= len(self.video_items):
-            QMessageBox.warning(self, "Chưa chọn video", "Vui lòng chọn 1 video trong bảng để vẽ ảnh AI.")
-            return
-
-        item = self.video_items[self.current_video_idx]
-        title_prompt = item.get("title") or self.proj_combo.currentText()
-        clean_p = extract_clean_video_title(title_prompt)
-
-        out_dir = self._current_project_dir or Path("D:/auto_video_renderer/auto_video_renderer/temp")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_art = out_dir / f"ai_art_tap_{self.current_video_idx+1}.jpg"
-
-        self.btn_ai_render_thumb.setEnabled(False)
-        self.btn_ai_render_thumb.setText("⏳ Đang vẽ ảnh AI FLUX...")
+        self.btn_gen_ai_prompt.setEnabled(False)
+        self.btn_gen_ai_prompt.setText("⏳ Đang phân tích Vision...")
         QApplication.processEvents()
 
-        try:
-            art_file = ThumbnailBuilder.generate_ai_thumbnail_image(clean_p, out_art)
-            self._log(f"✨ [AI Render] Đã vẽ ảnh nghệ thuật thành công: {art_file.name}")
-            self._create_single_thumbnail_with_base(art_file)
-            QMessageBox.information(self, "AI Vẽ Ảnh Thành Công", f"Đã render xong ảnh Thumbnail nghệ thuật từ AI FLUX:\n{art_file.name}")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi AI Render", f"Không thể tạo ảnh AI: {e}")
-            self._log(f"❌ Lỗi AI Render: {e}")
-        finally:
-            self.btn_ai_render_thumb.setEnabled(True)
-            self.btn_ai_render_thumb.setText("✨ AI Render Ảnh Cuốn Hút (FLUX)")
+        channel_name = self.channel_combo.currentText().strip() if self.channel_combo.count() > 0 else ""
+        target_lang = self.ai_target_lang_combo.currentData() or "vi"
 
-    def _extract_frame_from_current_video(self) -> None:
-        """Trích xuất khung hình độ nét cao trực tiếp từ video bằng FFmpeg."""
+        try:
+            prompt = ThumbnailPromptGenerator.generate_prompt(
+                title=title,
+                description=desc,
+                sample_images=self.sample_image_paths,
+                provider=provider,
+                api_key=api_key,
+                model=model,
+                custom_base_url=custom_url,
+                channel_name=channel_name,
+                target_language=target_lang,
+            )
+            self.ai_prompt_edit.setPlainText(prompt)
+            item["ai_image_prompt"] = prompt
+            self._log(f"✔ Đã tạo Prompt AI bám sát ảnh mẫu & tiêu đề cho tập {self.current_video_idx + 1}")
+        except Exception as e:
+            QMessageBox.warning(self, "Lỗi tạo Prompt", f"Không thể tạo Prompt:\n{e}")
+        finally:
+            self.btn_gen_ai_prompt.setEnabled(True)
+            self.btn_gen_ai_prompt.setText("✨ Phân Tích Vision & Tự Sinh Prompt")
+
+    def _on_ai_prompt_changed(self) -> None:
+        if 0 <= self.current_video_idx < len(self.video_items):
+            self.video_items[self.current_video_idx]["ai_image_prompt"] = self.ai_prompt_edit.toPlainText().strip()
+
+    def _generate_ai_thumb_single(self) -> None:
         if self.current_video_idx < 0 or self.current_video_idx >= len(self.video_items):
-            QMessageBox.warning(self, "Chưa chọn video", "Vui lòng chọn 1 video để chụp khung hình.")
+            QMessageBox.warning(self, "Chưa chọn tập", "Vui lòng chọn 1 tập video trong bảng để tạo ảnh Thumbnail AI.")
             return
 
         item = self.video_items[self.current_video_idx]
-        v_path = Path(item["video_path"])
-        if not v_path.exists():
-            QMessageBox.warning(self, "File không tồn tại", f"Không tìm thấy file video:\n{v_path}")
+        prompt = self.ai_prompt_edit.toPlainText().strip()
+        if not prompt or (self.sample_image_paths and "Part 1" not in prompt and "foreground on the right" not in prompt):
+            self._generate_ai_prompt()
+            prompt = self.ai_prompt_edit.toPlainText().strip()
+            if not prompt:
+                QMessageBox.warning(self, "Thiếu Prompt", "Vui lòng nhập hoặc sinh Prompt tiếng Anh trước khi tạo ảnh.")
+                return
+
+        out_dir = self._current_project_dir or Path("D:/auto_video_renderer/auto_video_renderer/temp")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_thumb = out_dir / f"thumbnail_ai_tap_{self.current_video_idx + 1}.jpg"
+
+        model_id = self.ai_img_model_combo.currentData() or "flux"
+        api_key = self.gemini_key_edit.text().strip() if model_id == "imagen-3" else self.custom_key_edit.text().strip()
+        base_url = self.custom_url_edit.text().strip()
+
+        self.btn_gen_ai_single.setEnabled(False)
+        self.btn_gen_ai_single.setText("⏳ Đang vẽ ảnh AI...")
+        cur_idx = self.current_video_idx
+
+        def on_done(ok: bool, msg: str, path_str: str) -> None:
+            self.btn_gen_ai_single.setEnabled(True)
+            self.btn_gen_ai_single.setText("🎨 Tạo Ảnh AI Cho Tập Này")
+            if ok and path_str:
+                p = Path(path_str)
+                # Tự động lồng chữ Tiếng Việt nghệ thuật & huy hiệu lên thumbnail
+                try:
+                    title_val = item.get("title", "")
+                    hl_val = item.get("thumbnail_highlight") or item.get("thumbnail_hl") or self.thumb_hl_edit.text().strip() or extract_highlight_from_title(title_val)
+                    badge_val = item.get("episode_badge") or self.thumb_badge_edit.text().strip() or f"TẬP {cur_idx + 1}"
+                    font_st = "drama" if (self.sample_image_paths or self.thumb_font_combo.currentData() in ("drama", None)) else (self.thumb_font_combo.currentData() or "drama")
+                    pos_st = self.thumb_pos_combo.currentData() or "split_lr"
+                    channel_name = self.channel_combo.currentText().strip() if (hasattr(self, "channel_combo") and self.channel_combo.count() > 0) else "Gã Đạo Tặc"
+                    ThumbnailBuilder.create_thumbnail(
+                        bg_image=p,
+                        output_path=p,
+                        badge_text=badge_val,
+                        highlight_title=hl_val,
+                        subtitle=channel_name,
+                        font_style=font_st,
+                        position=pos_st,
+                    )
+                except Exception as ex_st:
+                    self._log(f"⚠ Lỗi lồng chữ Tiếng Việt: {ex_st}")
+                item["thumbnail_path"] = str(p)
+                item["is_ai_thumbnail"] = True
+                if cur_idx == self.current_video_idx:
+                    self._set_thumbnail_preview(p)
+                it_tb = QTableWidgetItem("✔ Đã tạo AI")
+                it_tb.setTextAlignment(Qt.AlignCenter)
+                it_tb.setForeground(Qt.green)
+                self.video_table.setItem(cur_idx, 4, it_tb)
+                self._log(f"✔ Đã tạo thành công ảnh Thumbnail AI cho tập {cur_idx + 1}: {p.name}")
+                self.rad_thumb_ai.setChecked(True)
+                self._update_thumb_source_visibility()
+            else:
+                QMessageBox.critical(self, "Lỗi tạo ảnh AI", f"Không thể tạo ảnh AI:\n{msg}")
+                self._log(f"❌ Lỗi tạo ảnh AI tập {cur_idx + 1}: {msg}")
+
+        self._ai_img_worker = AIImageWorker(
+            prompt=prompt,
+            output_path=out_thumb,
+            model_name=model_id,
+            api_key=api_key,
+            base_url=base_url,
+        )
+        self._ai_img_worker.finished_sig.connect(on_done)
+        self._ai_img_worker.start()
+
+    def _generate_ai_thumb_batch(self) -> None:
+        if not self.video_items:
+            QMessageBox.warning(self, "Chưa có video", "Không có video nào trong danh sách để tạo Thumbnail AI.")
+            return
+
+        selected_indices = [
+            r for r in range(self.video_table.rowCount())
+            if self.video_table.item(r, 0) and self.video_table.item(r, 0).checkState() == Qt.Checked
+        ]
+        if not selected_indices:
+            QMessageBox.warning(self, "Chưa chọn video", "Vui lòng tích chọn ít nhất 1 video để tạo ảnh AI.")
             return
 
         out_dir = self._current_project_dir or Path("D:/auto_video_renderer/auto_video_renderer/temp")
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_frame = out_dir / f"frame_{v_path.stem}.jpg"
 
-        try:
-            frame_path = ThumbnailBuilder.extract_video_frame(v_path, out_frame, timestamp_sec=3.0)
-            self._log(f"📸 [FFmpeg] Đã chụp khung hình từ video: {frame_path.name}")
-            self._create_single_thumbnail_with_base(frame_path)
-            QMessageBox.information(self, "Chụp Khung Hình Hoàn Tất", f"Đã trích xuất khung hình từ video thành công:\n{frame_path.name}")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi chụp khung hình", f"Không thể trích xuất khung hình: {e}")
-            self._log(f"❌ Lỗi FFmpeg trích khung hình: {e}")
+        ch_name_str = self.channel_combo.currentText().strip() if self.channel_combo.count() > 0 else ""
+        tasks = []
+        for r_idx in selected_indices:
+            it = self.video_items[r_idx]
+            p_file = out_dir / f"thumbnail_ai_tap_{r_idx + 1}.jpg"
+            tasks.append({
+                "row_idx": r_idx,
+                "item": it,
+                "out_path": p_file,
+                "prompt": it.get("ai_image_prompt", ""),
+                "title": it.get("title", ""),
+                "desc": it.get("description", ""),
+                "channel_name": ch_name_str,
+                "font_style": "drama" if self.sample_image_paths else (self.thumb_font_combo.currentData() or "drama"),
+                "position": self.thumb_pos_combo.currentData() or "split_lr",
+            })
+
+        model_id = self.ai_img_model_combo.currentData() or "flux"
+        api_key = self.gemini_key_edit.text().strip() if model_id == "imagen-3" else self.custom_key_edit.text().strip()
+        base_url = self.custom_url_edit.text().strip()
+        provider = self.ai_provider_combo.currentData() or "9router"
+
+        self.btn_gen_ai_batch.setEnabled(False)
+        self.btn_gen_ai_batch.setText(f"⏳ Đang vẽ ảnh AI cho {len(tasks)} tập...")
+
+        def on_progress(cur: int, tot: int, text: str) -> None:
+            self._log(f"[{cur}/{tot}] {text}")
+
+        def on_item_done(row_idx: int, ok: bool, msg: str, path_str: str) -> None:
+            if ok and path_str:
+                p = Path(path_str)
+                self.video_items[row_idx]["thumbnail_path"] = str(p)
+                self.video_items[row_idx]["is_ai_thumbnail"] = True
+                it_tb = QTableWidgetItem("✔ Đã tạo AI")
+                it_tb.setTextAlignment(Qt.AlignCenter)
+                it_tb.setForeground(Qt.green)
+                self.video_table.setItem(row_idx, 4, it_tb)
+                if row_idx == self.current_video_idx:
+                    self._set_thumbnail_preview(p)
+                self._log(f"✔ Đã tạo Thumbnail AI tập {row_idx + 1}: {p.name}")
+            else:
+                self._log(f"❌ Lỗi tạo Thumbnail AI tập {row_idx + 1}: {msg}")
+
+        def on_all_done() -> None:
+            self.btn_gen_ai_batch.setEnabled(True)
+            self.btn_gen_ai_batch.setText("🚀 Tự Động Tạo Ảnh AI Cho Tất Cả Tập Đã Chọn")
+            QMessageBox.information(self, "Hoàn thành", f"Đã hoàn thành tạo ảnh Thumbnail AI cho {len(tasks)} tập video!")
+
+        auto_stamp = True
+        target_lang = self.ai_target_lang_combo.currentData() or "vi"
+        self._batch_img_worker = BatchAIImageWorker(
+            tasks=tasks,
+            model_name=model_id,
+            api_key=api_key,
+            base_url=base_url,
+            provider=provider,
+            sample_images=self.sample_image_paths,
+            auto_stamp=bool(auto_stamp),
+            target_language=target_lang,
+        )
+        self._batch_img_worker.progress_sig.connect(on_progress)
+        self._batch_img_worker.item_done_sig.connect(on_item_done)
+        self._batch_img_worker.all_done_sig.connect(on_all_done)
+        self._batch_img_worker.start()
+
+    def _pick_batch_custom_thumbnails(self) -> None:
+        if not self.video_items:
+            QMessageBox.warning(self, "Chưa có video", "Không có video nào trong danh sách để gán ảnh.")
+            return
+
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Chọn danh sách ảnh có sẵn theo thứ tự video", "", "Hình ảnh (*.jpg *.jpeg *.png *.webp)"
+        )
+        if not files:
+            return
+
+        # Sắp xếp tự nhiên (natural sort: tap_1.jpg, tap_2.jpg, tap_10.jpg)
+        import re
+        def natural_key(p_str: str):
+            stem = Path(p_str).stem.lower()
+            return [int(text) if text.isdigit() else text for text in re.split(r'(\d+)', stem)]
+
+        sorted_files = sorted(files, key=natural_key)
+
+        count = 0
+        for i, f_path in enumerate(sorted_files):
+            if i < len(self.video_items):
+                p = Path(f_path)
+                self.video_items[i]["thumbnail_path"] = str(p)
+                self.video_items[i]["is_ai_thumbnail"] = False
+                it_tb = QTableWidgetItem("✔ Đã có")
+                it_tb.setTextAlignment(Qt.AlignCenter)
+                it_tb.setForeground(Qt.green)
+                self.video_table.setItem(i, 4, it_tb)
+                count += 1
+
+        if 0 <= self.current_video_idx < len(self.video_items):
+            cur_p = self.video_items[self.current_video_idx].get("thumbnail_path")
+            if cur_p and Path(cur_p).exists():
+                self._set_thumbnail_preview(Path(cur_p))
+
+        self._log(f"✔ Đã nạp và gán {count} ảnh có sẵn khớp 1-1 theo thứ tự video trong danh sách.")
+        QMessageBox.information(
+            self, "Thành công",
+            f"Đã nạp và tự động sắp xếp {count} ảnh có sẵn khớp chính xác theo thứ tự các tập video!"
+        )
 
     def _pick_custom_thumbnail(self) -> None:
         if self.current_video_idx < 0 or self.current_video_idx >= len(self.video_items):
@@ -2100,6 +2829,7 @@ class YouTubeTab(QWidget):
         if path:
             p = Path(path)
             self.video_items[self.current_video_idx]["thumbnail_path"] = str(p)
+            self.video_items[self.current_video_idx]["is_ai_thumbnail"] = False
             self._set_thumbnail_preview(p)
             it_tb = QTableWidgetItem("✔ Đã chọn")
             it_tb.setTextAlignment(Qt.AlignCenter)
@@ -2110,7 +2840,10 @@ class YouTubeTab(QWidget):
         self.current_thumbnail_path = path
         pixmap = QPixmap(str(path))
         if not pixmap.isNull():
-            self.thumb_preview.set_thumbnail_pixmap(pixmap)
+            lbl_w = max(self.thumb_preview.width() - 8, 480)
+            lbl_h = max(self.thumb_preview.height() - 8, 270)
+            scaled = pixmap.scaled(lbl_w, lbl_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.thumb_preview.setPixmap(scaled)
 
     def _on_privacy_changed(self, idx: int) -> None:
         self.schedule_box.setVisible(idx == 0)
@@ -2137,7 +2870,7 @@ class YouTubeTab(QWidget):
         for r in range(self.video_table.rowCount()):
             it = self.video_table.item(r, 0)
             if it and it.checkState() == Qt.Checked and r < len(self.video_items):
-                selected_tasks_info.append(self.video_items[r])
+                selected_tasks_info.append((r, self.video_items[r]))
 
         if not selected_tasks_info:
             QMessageBox.warning(self, "Chưa chọn video", "Hãy tích chọn ít nhất 1 video trong bảng để tải lên.")
@@ -2166,9 +2899,39 @@ class YouTubeTab(QWidget):
                     pl_name = clean_story_title(self.proj_combo.currentText())
 
         is_premiere = self.premiere_chk.isChecked()
-        tasks: List[Dict[str, Any]] = []
+        ch_name = self.channel_combo.currentText().split("(")[0].strip()
 
-        # Chuẩn bị tư liệu ảnh nếu cần tạo Thumbnail tự động cho video chưa có
+        # Chuẩn bị cấu hình AI SEO tự động
+        provider = self.ai_provider_combo.currentData() or "offline"
+        api_key = ""
+        model = ""
+        custom_url = ""
+        if provider == "gemini":
+            api_key = self.gemini_key_edit.text().strip()
+            model = self.gemini_model_combo.currentText().strip()
+        elif provider == "9router":
+            api_key = self.nine_key_edit.text().strip()
+            model = self.nine_model_combo.currentText().strip()
+            custom_url = self.nine_url_edit.text().strip()
+        elif provider == "custom":
+            api_key = self.custom_key_edit.text().strip()
+            model = self.custom_model_edit.text().strip()
+            custom_url = self.custom_url_edit.text().strip()
+
+        target_lang = self.ai_target_lang_combo.currentData() or "vi"
+        ai_config = {
+            "provider": provider,
+            "api_key": api_key,
+            "model": model,
+            "custom_base_url": custom_url,
+            "channel_name": ch_name,
+            "target_language": target_lang,
+        }
+
+        # Chuẩn bị cấu hình Thumbnail tự động
+        src_mode = "frame" if self.rad_src_frame.isChecked() else (
+            "playlist" if self.rad_src_playlist.isChecked() else "custom"
+        )
         candidates = list(self._current_project_media)
         if not candidates and self._current_project_dir and self._current_project_dir.exists():
             candidates = sorted(list(self._current_project_dir.glob("*.png")) + list(self._current_project_dir.glob("*.jpg")))
@@ -2178,87 +2941,42 @@ class YouTubeTab(QWidget):
 
         out_dir = self._current_project_dir or Path("D:/auto_video_renderer/auto_video_renderer/temp")
         out_dir.mkdir(parents=True, exist_ok=True)
-        raw_story_title = self.proj_combo.currentText()
-        ch_name = self.channel_combo.currentText().split("(")[0].strip()
 
-        font_style = self.thumb_font_combo.currentData() or "but_phap"
-        position = self.thumb_pos_combo.currentData() or "split_lr"
-        pos_x = self.thumb_x_spin.value() if position == "custom" else None
-        pos_y = self.thumb_y_spin.value() if position == "custom" else None
-        font_scale = (self.thumb_scale_spin.value() / 100.0) if position == "custom" else 0.68
-        thumb_mode = self.thumb_mode_combo.currentData() or "auto"
-        badge_pos = self.thumb_badge_pos_combo.currentData() or "top_left"
+        thumb_config = {
+            "mode": src_mode,
+            "frame_sec": self.spin_frame_sec.value(),
+            "playlist_thumb": self._playlist_common_thumb,
+            "channel_name": ch_name,
+            "font_style": self.thumb_font_combo.currentData() or "drama",
+            "position": self.thumb_pos_combo.currentData() or "split_lr",
+            "badge_position": self.thumb_badge_pos_combo.currentData() or "top_left",
+            "enable_badge": self.chk_enable_badge.isChecked() if hasattr(self, "chk_enable_badge") else True,
+            "enable_highlight": self.chk_enable_hl.isChecked() if hasattr(self, "chk_enable_hl") else True,
+            "out_dir": out_dir,
+            "candidates": candidates,
+        }
 
-        for idx, item in enumerate(selected_tasks_info):
-            # TỰ ĐỘNG TẠO THUMBNAIL KIẾM HIỆP NẾU CHƯA CÓ
-            thumb_path = item.get("thumbnail_path")
-            if not thumb_path or not Path(thumb_path).exists():
-                ep_idx = item.get("episode_index")
-                badge = item.get("episode_badge") if item.get("episode_badge") is not None else ""
-                if self._is_external_project:
-                    v_p = Path(item["video_path"])
-                    base_frame = out_dir / f"frame_{v_p.stem}.jpg"
-                    if not base_frame.exists():
-                        try:
-                            ThumbnailBuilder.extract_video_frame(v_p, base_frame, 3.0)
-                        except Exception:
-                            pass
-                    bg_img = base_frame if base_frame.exists() else Path("temp/preview_fx_bubbles.png")
-                else:
-                    bg_idx = (ep_idx - 1) if (ep_idx is not None and ep_idx > 0) else idx
-                    bg_img = candidates[bg_idx % len(candidates)] if candidates else Path("temp/preview_fx_bubbles.png")
-                thumb_suffix = f"tap_{ep_idx}" if ep_idx is not None else f"video_{idx+1}"
-                out_thumb = out_dir / f"thumbnail_{thumb_suffix}.jpg"
-                hl_text = item.get("thumbnail_hl") or clean_story_title(item.get("title", "") or raw_story_title).upper()
-
-                is_badge_only = False
-                if thumb_mode == "badge_only":
-                    is_badge_only = True
-                elif thumb_mode == "auto":
-                    has_text, _ = ThumbnailBuilder.detect_text_in_image(bg_img)
-                    is_badge_only = has_text
-                else:
-                    is_badge_only = False
-
-                try:
-                    thumb_res = ThumbnailBuilder.create_thumbnail(
-                        bg_image=bg_img,
-                        output_path=out_thumb,
-                        badge_text=badge,
-                        highlight_title=hl_text,
-                        subtitle=ch_name,
-                        font_style=font_style,
-                        position=position,
-                        pos_x=pos_x,
-                        pos_y=pos_y,
-                        font_scale=font_scale,
-                        badge_only=is_badge_only,
-                        badge_position=badge_pos,
-                    )
-                    thumb_path = str(thumb_res)
-                    item["thumbnail_path"] = thumb_path
-                    # Cập nhật ô hiển thị trong bảng
-                    for r, v in enumerate(self.video_items):
-                        if v.get("video_path") == item.get("video_path"):
-                            it_tb = QTableWidgetItem("✔ Đã tạo")
-                            it_tb.setTextAlignment(Qt.AlignCenter)
-                            it_tb.setForeground(Qt.green)
-                            self.video_table.setItem(r, 4, it_tb)
-                            break
-                    self._log(f"🎨 [Tự Động Tạo] Đã tạo Thumbnail cho [{badge}]: {out_thumb.name}")
-                except Exception as e:
-                    self._log(f"⚠ Không thể tự tạo thumbnail tập {ep_idx}: {e}")
-
+        tasks: List[Dict[str, Any]] = []
+        for idx, (r, item) in enumerate(selected_tasks_info):
             pub_at = schedule_dts[idx] if schedule_dts else None
             tasks.append({
+                "row_idx": r,
                 "video_path": item["video_path"],
-                "title": (item.get("title") or item["file_name"])[:100],
+                "file_name": item["file_name"],
+                "title": item.get("title", ""),
                 "description": item.get("description", ""),
                 "tags": item.get("tags", ""),
+                "episode_badge": item.get("episode_badge", ""),
+                "episode_index": item.get("episode_index"),
+                "thumbnail_path": item.get("thumbnail_path"),
+                "thumbnail_hl": item.get("thumbnail_hl"),
+                "custom_thumb_bg": item.get("custom_thumb_bg"),
+                "thumb_font": item.get("thumb_font"),
+                "thumb_pos": item.get("thumb_pos"),
+                "thumb_badge_pos": item.get("thumb_badge_pos"),
                 "privacy_status": privacy_status,
                 "publish_at": pub_at,
                 "is_premiere": is_premiere,
-                "thumbnail_path": thumb_path,
                 "playlist_name": pl_name or "",
                 "playlist_id": pl_id,
             })
@@ -2266,20 +2984,60 @@ class YouTubeTab(QWidget):
         self.btn_start_upload.setEnabled(False)
         self.btn_cancel_upload.setEnabled(True)
         self.upload_progress.setValue(0)
-        self._log(f"🚀 Bắt đầu tải lên {len(tasks)} video lên kênh {self.channel_combo.currentText()}...")
+        self._log(f"🚀 Bắt đầu tiến trình tự động tải lên {len(tasks)} video lên kênh {self.channel_combo.currentText()}...")
+        mode_desc = "Trích xuất frame từ video" if src_mode == "frame" else ("1 ảnh poster cho playlist" if src_mode == "playlist" else "Ảnh riêng")
+        self._log(f"   ℹ Chế độ Thumbnail: {mode_desc}")
         if self.chk_use_playlist.isChecked():
             if pl_id:
                 self._log(f"   📂 Playlist: {self.playlist_combo.currentText()} (ID: {pl_id})")
             else:
                 self._log(f"   📂 Playlist mới sẽ tạo: {pl_name}")
-        else:
-            self._log("   ℹ Không thêm vào Playlist (đăng video độc lập).")
 
-        self._upload_worker = UploadWorker(self.uploader, tasks, ch_id)
+        self._upload_worker = UploadWorker(
+            uploader=self.uploader,
+            tasks=tasks,
+            channel_id=ch_id,
+            ai_config=ai_config,
+            thumb_config=thumb_config,
+        )
         self._upload_worker.progress_sig.connect(self._on_upload_progress)
         self._upload_worker.log_sig.connect(self._log)
+        self._upload_worker.item_updated_sig.connect(self._on_upload_item_updated)
         self._upload_worker.all_finished_sig.connect(self._on_upload_all_finished)
         self._upload_worker.start()
+
+    def _on_upload_item_updated(self, row_idx: int, data: dict) -> None:
+        if row_idx < 0 or row_idx >= len(self.video_items):
+            return
+        item = self.video_items[row_idx]
+        self.video_table.blockSignals(True)
+        if "title" in data:
+            item["title"] = data["title"]
+            it_t = self.video_table.item(row_idx, 3)
+            if it_t:
+                it_t.setText(data["title"])
+                it_t.setToolTip(data["title"])
+        if "description" in data:
+            item["description"] = data["description"]
+        if "tags" in data:
+            item["tags"] = data["tags"]
+        if "thumbnail_path" in data:
+            item["thumbnail_path"] = data["thumbnail_path"]
+            it_tb = QTableWidgetItem("✔ Đã tạo")
+            it_tb.setTextAlignment(Qt.AlignCenter)
+            it_tb.setForeground(Qt.green)
+            self.video_table.setItem(row_idx, 4, it_tb)
+            if row_idx == self.current_video_idx:
+                self._set_thumbnail_preview(Path(data["thumbnail_path"]))
+        self.video_table.blockSignals(False)
+
+        if row_idx == self.current_video_idx:
+            if "title" in data:
+                self.title_edit.setText(data["title"])
+            if "description" in data:
+                self.desc_edit.setText(data["description"])
+            if "tags" in data:
+                self.tags_edit.setText(data["tags"])
 
     def _on_upload_progress(self, pct: int, msg: str, spd: float) -> None:
         self.upload_progress.setValue(pct)
@@ -2306,8 +3064,11 @@ class YouTubeTab(QWidget):
     # SETTINGS PERSISTENCE
     # ==========================
     def _save_ui_settings(self) -> None:
+        if getattr(self, "_is_loading_settings", False):
+            return
         yt_cfg = self.settings.setdefault("youtube_uploader", {})
         yt_cfg["ai_provider"] = self.ai_provider_combo.currentData() or "offline"
+        yt_cfg["ai_target_lang"] = self.ai_target_lang_combo.currentData() or "vi"
         yt_cfg["9router_base_url"] = self.nine_url_edit.text().strip()
         yt_cfg["9router_api_key"] = self.nine_key_edit.text().strip()
         yt_cfg["9router_model"] = self.nine_model_combo.currentText().strip()
@@ -2322,100 +3083,121 @@ class YouTubeTab(QWidget):
         yt_cfg["is_premiere"] = self.premiere_chk.isChecked()
         yt_cfg["use_playlist"] = self.chk_use_playlist.isChecked()
         yt_cfg["playlist_mode"] = "existing" if self.rad_existing_pl.isChecked() else "new"
-        yt_cfg["thumb_mode"] = self.thumb_mode_combo.currentData() or "auto"
+        yt_cfg["thumb_src_mode"] = "frame" if self.rad_src_frame.isChecked() else ("playlist" if self.rad_src_playlist.isChecked() else "custom")
+        yt_cfg["thumb_frame_sec"] = self.spin_frame_sec.value()
+        yt_cfg["thumb_enable_badge"] = self.chk_enable_badge.isChecked()
+        yt_cfg["thumb_enable_hl"] = self.chk_enable_hl.isChecked()
         yt_cfg["thumb_badge_pos"] = self.thumb_badge_pos_combo.currentData() or "top_left"
-        yt_cfg["thumb_font_style"] = self.thumb_font_combo.currentData() or "but_phap"
+        yt_cfg["thumb_font_style"] = self.thumb_font_combo.currentData() or "drama"
         yt_cfg["thumb_position"] = self.thumb_pos_combo.currentData() or "split_lr"
         yt_cfg["thumb_x"] = self.thumb_x_spin.value()
         yt_cfg["thumb_y"] = self.thumb_y_spin.value()
         yt_cfg["thumb_scale"] = self.thumb_scale_spin.value()
-        yt_cfg["layout_mode"] = self.layout_mode_combo.currentData() or "3_col"
         self.settings_changed.emit(self.settings)
 
     def load_settings(self, settings: Dict[str, Any]) -> None:
-        self.settings = settings
-        yt_cfg = settings.get("youtube_uploader", {}) or {}
+        self._is_loading_settings = True
+        try:
+            self.settings = settings
+            yt_cfg = settings.get("youtube_uploader", {}) or {}
 
-        l_mode = yt_cfg.get("layout_mode", "3_col")
-        idx_lm = self.layout_mode_combo.findData(l_mode)
-        if idx_lm >= 0:
-            self.layout_mode_combo.setCurrentIndex(idx_lm)
+            provider = yt_cfg.get("ai_provider", "9router")
+            idx_p = self.ai_provider_combo.findData(provider)
+            if idx_p >= 0:
+                self.ai_provider_combo.setCurrentIndex(idx_p)
 
-        provider = yt_cfg.get("ai_provider", "9router")
-        idx_p = self.ai_provider_combo.findData(provider)
-        if idx_p >= 0:
-            self.ai_provider_combo.setCurrentIndex(idx_p)
+            target_lang = yt_cfg.get("ai_target_lang", "vi")
+            idx_tl = self.ai_target_lang_combo.findData(target_lang)
+            if idx_tl >= 0:
+                self.ai_target_lang_combo.setCurrentIndex(idx_tl)
 
-        if yt_cfg.get("9router_base_url"):
-            self.nine_url_edit.setText(yt_cfg.get("9router_base_url"))
-        if yt_cfg.get("9router_api_key"):
-            self.nine_key_edit.setText(yt_cfg.get("9router_api_key"))
-        if yt_cfg.get("9router_model"):
-            m_idx = self.nine_model_combo.findText(yt_cfg.get("9router_model"))
-            if m_idx >= 0:
-                self.nine_model_combo.setCurrentIndex(m_idx)
+            if yt_cfg.get("9router_base_url"):
+                self.nine_url_edit.setText(yt_cfg.get("9router_base_url"))
+            if yt_cfg.get("9router_api_key"):
+                self.nine_key_edit.setText(yt_cfg.get("9router_api_key"))
+            if yt_cfg.get("9router_model"):
+                m_idx = self.nine_model_combo.findText(yt_cfg.get("9router_model"))
+                if m_idx >= 0:
+                    self.nine_model_combo.setCurrentIndex(m_idx)
+                else:
+                    self.nine_model_combo.setEditText(yt_cfg.get("9router_model"))
+
+            if yt_cfg.get("gemini_api_key"):
+                self.gemini_key_edit.setText(yt_cfg.get("gemini_api_key"))
+            if yt_cfg.get("gemini_model"):
+                m_idx = self.gemini_model_combo.findText(yt_cfg.get("gemini_model"))
+                if m_idx >= 0:
+                    self.gemini_model_combo.setCurrentIndex(m_idx)
+            if yt_cfg.get("custom_base_url"):
+                self.custom_url_edit.setText(yt_cfg.get("custom_base_url"))
+            if yt_cfg.get("custom_api_key"):
+                self.custom_key_edit.setText(yt_cfg.get("custom_api_key"))
+            if yt_cfg.get("custom_model"):
+                self.custom_model_edit.setText(yt_cfg.get("custom_model"))
+
+            if yt_cfg.get("schedule_videos_per_day"):
+                self.sch_per_day_spin.setValue(int(yt_cfg.get("schedule_videos_per_day", 2)))
+            if yt_cfg.get("schedule_time_slots"):
+                self.sch_slots_edit.setText(str(yt_cfg.get("schedule_time_slots", "11:30, 19:30")))
+
+            self.premiere_chk.setChecked(bool(yt_cfg.get("is_premiere", False)))
+
+            use_pl = bool(yt_cfg.get("use_playlist", False))
+            self.chk_use_playlist.setChecked(use_pl)
+            if yt_cfg.get("playlist_mode") == "new":
+                self.rad_new_pl.setChecked(True)
             else:
-                self.nine_model_combo.setEditText(yt_cfg.get("9router_model"))
+                self.rad_existing_pl.setChecked(True)
 
-        if yt_cfg.get("gemini_api_key"):
-            self.gemini_key_edit.setText(yt_cfg.get("gemini_api_key"))
-        if yt_cfg.get("gemini_model"):
-            m_idx = self.gemini_model_combo.findText(yt_cfg.get("gemini_model"))
-            if m_idx >= 0:
-                self.gemini_model_combo.setCurrentIndex(m_idx)
-        if yt_cfg.get("custom_base_url"):
-            self.custom_url_edit.setText(yt_cfg.get("custom_base_url"))
-        if yt_cfg.get("custom_api_key"):
-            self.custom_key_edit.setText(yt_cfg.get("custom_api_key"))
-        if yt_cfg.get("custom_model"):
-            self.custom_model_edit.setText(yt_cfg.get("custom_model"))
+            # Cấu hình Thumbnail Studio
+            thumb_src = yt_cfg.get("thumb_src_mode", "frame")
+            if thumb_src == "playlist":
+                self.rad_src_playlist.setChecked(True)
+            elif thumb_src == "custom":
+                self.rad_src_custom.setChecked(True)
+            else:
+                self.rad_src_frame.setChecked(True)
+            self._on_thumb_src_mode_changed()
 
-        if yt_cfg.get("schedule_videos_per_day"):
-            self.sch_per_day_spin.setValue(int(yt_cfg.get("schedule_videos_per_day", 2)))
-        if yt_cfg.get("schedule_time_slots"):
-            self.sch_slots_edit.setText(str(yt_cfg.get("schedule_time_slots", "11:30, 19:30")))
+            if yt_cfg.get("thumb_frame_sec"):
+                try:
+                    self.spin_frame_sec.setValue(float(yt_cfg.get("thumb_frame_sec", 3.0)))
+                except Exception:
+                    pass
 
-        self.premiere_chk.setChecked(bool(yt_cfg.get("is_premiere", False)))
+            if "thumb_enable_badge" in yt_cfg:
+                self.chk_enable_badge.setChecked(bool(yt_cfg["thumb_enable_badge"]))
+                self._on_enable_badge_toggled(self.chk_enable_badge.isChecked())
+            if "thumb_enable_hl" in yt_cfg:
+                self.chk_enable_hl.setChecked(bool(yt_cfg["thumb_enable_hl"]))
+                self._on_enable_hl_toggled(self.chk_enable_hl.isChecked())
 
-        use_pl = bool(yt_cfg.get("use_playlist", False))
-        self.chk_use_playlist.setChecked(use_pl)
-        if yt_cfg.get("playlist_mode") == "new":
-            self.rad_new_pl.setChecked(True)
-        else:
-            self.rad_existing_pl.setChecked(True)
+            badge_pos = yt_cfg.get("thumb_badge_pos", "top_left")
+            idx_bp = self.thumb_badge_pos_combo.findData(badge_pos)
+            if idx_bp >= 0:
+                self.thumb_badge_pos_combo.setCurrentIndex(idx_bp)
 
-        # Cấu hình Thumbnail Kiếm Hiệp
-        thumb_mode = yt_cfg.get("thumb_mode", "auto")
-        idx_tm = self.thumb_mode_combo.findData(thumb_mode)
-        if idx_tm >= 0:
-            self.thumb_mode_combo.setCurrentIndex(idx_tm)
+            font_style = yt_cfg.get("thumb_font_style", "drama")
+            idx_fs = self.thumb_font_combo.findData(font_style)
+            if idx_fs >= 0:
+                self.thumb_font_combo.setCurrentIndex(idx_fs)
 
-        badge_pos = yt_cfg.get("thumb_badge_pos", "top_left")
-        idx_bp = self.thumb_badge_pos_combo.findData(badge_pos)
-        if idx_bp >= 0:
-            self.thumb_badge_pos_combo.setCurrentIndex(idx_bp)
+            pos = yt_cfg.get("thumb_position", "split_lr")
+            if pos in ("top_left", "compact_tl"):
+                pos = "compact_tl"
+            elif pos in ("right", "full_right"):
+                pos = "full_right"
+            idx_pos = self.thumb_pos_combo.findData(pos)
+            if idx_pos >= 0:
+                self.thumb_pos_combo.setCurrentIndex(idx_pos)
 
-        font_style = yt_cfg.get("thumb_font_style", "but_phap")
-        if font_style == "co_phong":
-            font_style = "but_phap"
-        idx_fs = self.thumb_font_combo.findData(font_style)
-        if idx_fs >= 0:
-            self.thumb_font_combo.setCurrentIndex(idx_fs)
-
-        position = yt_cfg.get("thumb_position", "split_lr")
-        if position in ("top_left", "compact_tl"):
-            position = "compact_tl"
-        elif position in ("right", "full_right"):
-            position = "full_right"
-        idx_pos = self.thumb_pos_combo.findData(position)
-        if idx_pos >= 0:
-            self.thumb_pos_combo.setCurrentIndex(idx_pos)
-
-        if "thumb_x" in yt_cfg:
-            self.thumb_x_spin.setValue(int(yt_cfg["thumb_x"]))
-        if "thumb_y" in yt_cfg:
-            self.thumb_y_spin.setValue(int(yt_cfg["thumb_y"]))
-        if "thumb_scale" in yt_cfg:
-            self.thumb_scale_spin.setValue(int(yt_cfg["thumb_scale"]))
-        self.custom_pos_box.setVisible(position == "custom")
+            if yt_cfg.get("thumb_x") is not None:
+                self.thumb_x_spin.setValue(int(yt_cfg["thumb_x"]))
+            if yt_cfg.get("thumb_y") is not None:
+                self.thumb_y_spin.setValue(int(yt_cfg["thumb_y"]))
+            if yt_cfg.get("thumb_scale") is not None:
+                self.thumb_scale_spin.setValue(int(yt_cfg["thumb_scale"]))
+            self.custom_pos_box.setVisible(pos == "custom")
+        finally:
+            self._is_loading_settings = False
 
