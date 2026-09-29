@@ -358,6 +358,35 @@ def build_accurate_subtitles(
     return events
 
 
+def _register_cuda_dll_directories() -> None:
+    """Tự động tìm kiếm và nạp các thư mục chứa DLL của CUDA/cuBLAS/cuDNN vào Windows search PATH."""
+    import sys, os
+    if sys.platform != "win32":
+        return
+    added = set()
+    for p in sys.path:
+        if not p or not os.path.exists(p):
+            continue
+        p_path = Path(p)
+        candidates = [
+            p_path / "nvidia" / "cublas" / "bin",
+            p_path / "nvidia" / "cublas" / "lib",
+            p_path / "nvidia" / "cudnn" / "bin",
+            p_path / "nvidia" / "cudnn" / "lib",
+            p_path / "ctranslate2",
+            p_path / "torch" / "lib",
+        ]
+        for c in candidates:
+            if c.exists() and str(c) not in added:
+                try:
+                    if hasattr(os, "add_dll_directory"):
+                        os.add_dll_directory(str(c))
+                    os.environ["PATH"] = str(c) + os.pathsep + os.environ.get("PATH", "")
+                    added.add(str(c))
+                except Exception:
+                    pass
+
+
 def transcribe_audio_to_srt(
     audio_path: str | Path,
     out_srt_path: str | Path,
@@ -366,7 +395,8 @@ def transcribe_audio_to_srt(
     log_callback: Any = None,
     speed: float = 1.0,
 ) -> Tuple[Path, str]:
-    """Tự động nghe audio bằng Whisper AI, nhận diện ngôn ngữ và xuất file .srt chuẩn xác theo từng từ."""
+    """Tự động nghe audio bằng Whisper AI, nhận diện ngôn ngữ và xuất file .srt chuẩn xác theo từng từ với cơ chế Safe Fallback 100%."""
+    _register_cuda_dll_directories()
     p_audio = Path(audio_path)
     p_out = Path(out_srt_path)
     p_out.parent.mkdir(parents=True, exist_ok=True)
@@ -375,11 +405,17 @@ def transcribe_audio_to_srt(
 
     model_size = str(model_size or "base").strip()
 
-    # Tự động phát hiện GPU (NVIDIA CUDA) hay CPU thông qua CTranslate2
-    model = None
-    device_used = "cpu"
-    compute_type_used = "int8"
+    # Chuẩn hóa mã ngôn ngữ (Philippines: tl / fil)
+    target_lang = None
+    if language:
+        lang_clean = str(language).strip().lower()
+        if lang_clean not in ["auto", "none", ""]:
+            if lang_clean in ["tl", "fil", "tagalog", "filipino", "philippines"]:
+                target_lang = "tl"
+            else:
+                target_lang = lang_clean
 
+    # Kiểm tra khả năng hỗ trợ CUDA
     has_cuda = False
     try:
         import ctranslate2
@@ -391,52 +427,63 @@ def transcribe_audio_to_srt(
         except Exception:
             has_cuda = False
 
+    def _do_transcribe(device: str, compute_type: str) -> Tuple[List[Tuple[float, float, str]], str]:
+        if log_callback:
+            if device == "cuda":
+                log_callback(f"🚀 Đang khởi tạo Whisper AI [{model_size}] trên GPU (NVIDIA CUDA / {compute_type})...")
+            else:
+                log_callback(f"💻 Đang xử lý Whisper AI model [{model_size}] trên CPU (An toàn / {compute_type})...")
+
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+
+        lang_msg = f"ngôn ngữ chỉ định: [{target_lang.upper()}]" if target_lang else "chế độ tự động nhận diện ngôn ngữ"
+        if log_callback:
+            log_callback(f"Đang quét giọng nói trong {p_audio.name} ({lang_msg}) bằng {device.upper()}...")
+
+        segments, info = model.transcribe(
+            str(p_audio),
+            beam_size=5,
+            best_of=5,
+            language=target_lang,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=250),
+            word_timestamps=True,
+            condition_on_previous_text=False,
+        )
+
+        detected = target_lang or getattr(info, "language", "unknown") or "unknown"
+        prob = getattr(info, "language_probability", 1.0) * 100
+        if log_callback:
+            log_callback(f"✔ Nhận diện giọng nói hoàn tất: [{detected.upper()}] (độ tin cậy: {prob:.1f}%)")
+
+        # Generator segments chỉ thực sự chạy tính toán CUDA khi duyệt phần tử tại đây:
+        events_list = build_accurate_subtitles(segments, max_words_per_line=6, max_duration_sec=2.8, speed=speed)
+        return events_list, detected
+
+    events: List[Tuple[float, float, str]] = []
+    detected_lang = target_lang or "unknown"
+    used_device = "cpu"
+
+    # Giai đoạn 1: Thử chạy bằng GPU CUDA nếu có
     if has_cuda:
         try:
-            if log_callback:
-                log_callback(f"🚀 Phát hiện Card đồ họa rời (NVIDIA CUDA): Đang khởi tạo Whisper AI [{model_size}] trên GPU...")
-            model = WhisperModel(model_size, device="cuda", compute_type="float16")
-            device_used = "cuda"
-            compute_type_used = "float16"
+            events, detected_lang = _do_transcribe("cuda", "float16")
+            used_device = "cuda"
         except Exception as cuda_ex:
+            if log_callback:
+                log_callback(f"⚠️ GPU CUDA float16 gặp sự cố ({cuda_ex}) -> Thử int8_float16...")
             try:
-                # Thử với compute_type int8_float16 nếu GPU không tương thích hoàn toàn float16
-                model = WhisperModel(model_size, device="cuda", compute_type="int8_float16")
-                device_used = "cuda"
-                compute_type_used = "int8_float16"
-            except Exception:
+                events, detected_lang = _do_transcribe("cuda", "int8_float16")
+                used_device = "cuda"
+            except Exception as cuda_ex2:
                 if log_callback:
-                    log_callback(f"⚠️ GPU CUDA không tương thích ({cuda_ex}) -> Tự động chuyển sang CPU...")
-                model = None
+                    log_callback(f"⚠️ GPU CUDA không thể thực thi ({cuda_ex2}) -> Tự động chuyển ngay sang CPU để đảm bảo 100% có Sub...")
+                events = []
 
-    if model is None:
-        if log_callback and device_used != "cuda":
-            log_callback(f"💻 Đang tải Whisper AI model [{model_size}] trên CPU...")
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
-
-
-    target_lang = language if (language and language not in ["auto", "None", "none", ""]) else None
-
-    if log_callback:
-        lang_msg = f"ngôn ngữ chỉ định: [{target_lang.upper()}]" if target_lang else "chế độ tự động nhận diện ngôn ngữ"
-        log_callback(f"Đang quét giọng nói trong {p_audio.name} ({lang_msg}) bằng {device_used.upper()}...")
-
-    segments, info = model.transcribe(
-        str(p_audio),
-        beam_size=5,
-        language=target_lang,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=200),
-        word_timestamps=True,
-    )
-
-    detected_lang = target_lang or getattr(info, "language", "unknown") or "unknown"
-    prob = getattr(info, "language_probability", 1.0) * 100
-    if log_callback:
-        log_callback(f"✔ Nhận diện giọng nói hoàn tất: [{detected_lang.upper()}] (độ tin cậy: {prob:.1f}%)")
-
-    # Gom nhóm từ chính xác theo cụm câu phát âm thực tế
-    events = build_accurate_subtitles(segments, max_words_per_line=6, max_duration_sec=2.8, speed=speed)
+    # Giai đoạn 2: Nếu chưa có events (không có GPU hoặc GPU thiếu DLL/VRAM), fallback sang CPU 100%
+    if not events:
+        events, detected_lang = _do_transcribe("cpu", "int8")
+        used_device = "cpu"
 
     srt_lines: List[str] = []
     for idx, (start_sec, end_sec, text) in enumerate(events, start=1):
@@ -448,6 +495,7 @@ def transcribe_audio_to_srt(
 
     p_out.write_text("\n".join(srt_lines), encoding="utf-8")
     if log_callback:
-        log_callback(f"✔ Đã tạo file phụ đề .srt chính xác: {p_out.name} (gồm {len(events)} cụm thoại)")
+        log_callback(f"✔ Đã tạo file phụ đề .srt chính xác ({used_device.upper()}): {p_out.name} (gồm {len(events)} cụm thoại)")
 
     return p_out, detected_lang
+

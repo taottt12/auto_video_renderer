@@ -255,7 +255,19 @@ class LayoutCanvasWidget(QWidget):
                         painter.drawText(l_rect, Qt.AlignCenter, f"🖼️ {name}")
 
             elif l_type == "text":
-                content = str(layer.get("text_content", "") or layer.get("content", "Tiêu đề truyện / bài hát"))
+                raw_content = str(layer.get("text_content", "") or layer.get("content", "")).strip()
+                l_name_lower = str(layer.get("name", "")).lower()
+
+                # Xử lý hiển thị trực quan cho thẻ biến số {title} trên Canvas Preview
+                content = raw_content
+                if not content and (l_name_lower in ["tiêu-đề", "tieu de", "title", "tiêu đề", "tieude"]):
+                    content = "[Tên Video / Audio Tự Động]"
+                elif content:
+                    for tag in ["{title}", "{filename}", "{name}", "{audio_name}", "{ten_audio}", "{ten_video}", "{tieu_de}"]:
+                        content = content.replace(tag, "[Tên Video]").replace(tag.upper(), "[Tên Video]")
+                if not content:
+                    content = "Tiêu đề truyện / bài hát"
+
                 font_name = str(layer.get("font_name", "Arial") or "Arial")
                 font_size = int(layer.get("font_size", 32) or 32)
                 font_bold = bool(layer.get("bold", True))
@@ -914,11 +926,34 @@ class LayoutStudioTab(QWidget):
         tp_layout.setContentsMargins(0, 0, 0, 0)
         tp_layout.setSpacing(6)
 
+        text_content_container = QWidget()
+        tc_layout = QVBoxLayout(text_content_container)
+        tc_layout.setContentsMargins(0, 0, 0, 0)
+        tc_layout.setSpacing(4)
+
         self.prop_text_content = QPlainTextEdit()
         self.prop_text_content.setFixedHeight(75)
-        self.prop_text_content.setPlaceholderText("Nhập nội dung chữ... (Nhấn Enter để xuống dòng nhiều câu)")
+        self.prop_text_content.setPlaceholderText("Nhập nội dung chữ... Hoặc nhập {title} để tự động lấy tên video khi render SLL")
         self.prop_text_content.textChanged.connect(self._on_prop_edited)
-        tp_layout.addRow("Nội dung chữ:", self.prop_text_content)
+        tc_layout.addWidget(self.prop_text_content)
+
+        # Thanh nút hỗ trợ chèn biến số động
+        self.tag_helper_widget = QWidget()
+        th_layout = QHBoxLayout(self.tag_helper_widget)
+        th_layout.setContentsMargins(0, 0, 0, 0)
+        th_layout.setSpacing(6)
+
+        self.btn_insert_title_tag = QPushButton("➕ Chèn {Tên Video}")
+        self.btn_insert_title_tag.setToolTip("Chèn thẻ biến {title} để tự động lấy tên file Video/Audio khi render hàng loạt (SLL)")
+        self.btn_insert_title_tag.setStyleSheet("background-color: #2b3d52; color: #5dade2; font-weight: bold; border-radius: 4px; padding: 3px 8px; font-size: 11px;")
+        self.btn_insert_title_tag.clicked.connect(self._insert_title_tag)
+
+        self.lbl_tag_hint = QLabel("<span style='color:#8899a6; font-size:11px;'>⚡ Tự động đổi theo tên file khi render SLL</span>")
+        th_layout.addWidget(self.btn_insert_title_tag)
+        th_layout.addWidget(self.lbl_tag_hint, 1)
+        tc_layout.addWidget(self.tag_helper_widget)
+
+        tp_layout.addRow("Nội dung chữ:", text_content_container)
 
         # Hàng Kiểu Hiển Thị Phụ Đề (Dành riêng cho Layer Subtitle)
         self.sub_mode_row_widget = QWidget()
@@ -1168,6 +1203,12 @@ class LayoutStudioTab(QWidget):
             pass
         return False
 
+    def _insert_title_tag(self) -> None:
+        """Chèn biến {title} vào ô nội dung chữ để tự động lấy tên video/audio khi render hàng loạt."""
+        cursor = self.prop_text_content.textCursor()
+        cursor.insertText("{title}")
+        self.prop_text_content.setFocus()
+
     def _on_prop_sub_mode_changed(self) -> None:
         sm_mode = self.prop_sub_mode_combo.currentData()
         self.prop_sub_highlight_widget.setVisible(sm_mode == "karaoke_highlight")
@@ -1217,6 +1258,7 @@ class LayoutStudioTab(QWidget):
         self.text_props_widget.setVisible(l_type in {"text", "subtitle"})
 
         if l_type in {"text", "subtitle"}:
+            self.tag_helper_widget.setVisible(l_type == "text")
             if l_type == "subtitle":
                 self.sub_mode_row_widget.setVisible(True)
                 self.prop_sub_mode_combo.blockSignals(True)
@@ -1233,7 +1275,7 @@ class LayoutStudioTab(QWidget):
             if l_type == "subtitle":
                 self.prop_text_content.setPlaceholderText("💬 Phụ đề mẫu (Live Preview): Vùng này sẽ tự động thay thế bằng phụ đề khi render")
             else:
-                self.prop_text_content.setPlaceholderText("Nhập nội dung chữ... (Nhấn Enter để xuống dòng nhiều câu)")
+                self.prop_text_content.setPlaceholderText("Nhập nội dung chữ... Hoặc nhập {title} để tự động lấy tên video khi render SLL")
             self.prop_text_content.setPlainText(str(layer.get("text_content", "")))
             self.prop_text_content.blockSignals(False)
 

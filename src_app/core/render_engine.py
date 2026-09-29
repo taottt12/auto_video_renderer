@@ -211,7 +211,7 @@ class RenderEngine:
             if can_single_pass:
                 self.progress(50, "Nối transition & gắn overlay (1-pass siêu tốc)")
                 visual_out = job_temp / "visual_video.mp4"
-                self._concat_and_overlay_single_pass(clips, visual_out, clip_durations, width, height, sub_ass_file=sub_ass_file)
+                self._concat_and_overlay_single_pass(clips, visual_out, clip_durations, width, height, sub_ass_file=sub_ass_file, audio_title=original_audio_path.stem)
                 self._delete_temp_files(clips, "clip tạm sau khi nối 1-pass")
                 current_video = visual_out
             else:
@@ -224,7 +224,7 @@ class RenderEngine:
                 if self._has_visual_overlays(sub_ass_file=sub_ass_file):
                     self.progress(72, "Gắn visual overlay 1 lần")
                     visual_out = job_temp / "visual_video.mp4"
-                    self._apply_visual_overlays(base_video, visual_out, width, height, sub_ass_file=sub_ass_file)
+                    self._apply_visual_overlays(base_video, visual_out, width, height, sub_ass_file=sub_ass_file, audio_title=original_audio_path.stem)
                     current_video = visual_out
                     self._delete_temp_file(base_video, "base_video sau khi gắn visual overlay")
                 else:
@@ -1753,6 +1753,7 @@ class RenderEngine:
         width: int,
         height: int,
         sub_ass_file: Path | None = None,
+        audio_title: str = "",
     ) -> Tuple[str, int]:
         """Tạo chuỗi filtergraph cho toàn bộ các layer (Layout Studio multi-layer) hoặc fallback cũ."""
         last = base_label
@@ -1822,7 +1823,15 @@ class RenderEngine:
                     stage += 1
 
                 elif l_type == "text":
-                    content = str(layer.get("text_content", "") or layer.get("content", "")).strip()
+                    raw_content = str(layer.get("text_content", "") or layer.get("content", "")).strip()
+                    content = raw_content
+                    # Tự động thay thế biến động {title}, {filename}, v.v. bằng tên file audio đang render
+                    if not content and (l_name.lower() in ["tiêu-đề", "tieu de", "title", "tiêu đề", "tieude"]):
+                        content = audio_title
+                    elif audio_title:
+                        for tag in ["{title}", "{filename}", "{name}", "{audio_name}", "{ten_audio}", "{ten_video}", "{tieu_de}"]:
+                            content = content.replace(tag, audio_title).replace(tag.upper(), audio_title)
+
                     if not content:
                         continue
                     font_size = int(layer.get("font_size", 36) or 36)
@@ -1985,7 +1994,13 @@ class RenderEngine:
 
             # Text overlay
             text_cfg = self.settings.get("text_overlay", {}) or {}
-            content = str(text_cfg.get("content", "")).strip()
+            raw_text = str(text_cfg.get("content", "")).strip()
+            content = raw_text
+            if audio_title:
+                for tag in ["{title}", "{filename}", "{name}", "{audio_name}", "{ten_audio}", "{ten_video}", "{tieu_de}"]:
+                    content = content.replace(tag, audio_title).replace(tag.upper(), audio_title)
+            if not content and audio_title:
+                content = audio_title
             if text_cfg.get("enabled") and content:
                 out_label = f"[v_stage{stage}]"
                 filters.append(f"{last}{self._drawtext_filter_body(text_cfg, content)}{out_label}")
@@ -2002,7 +2017,7 @@ class RenderEngine:
 
         return last, input_index
 
-    def _apply_visual_overlays(self, video: Path, out: Path, width: int, height: int, sub_ass_file: Path | None = None) -> None:
+    def _apply_visual_overlays(self, video: Path, out: Path, width: int, height: int, sub_ass_file: Path | None = None, audio_title: str = "") -> None:
         """Gộp visual overlays (Layout Studio đa tầng / Watermark / Logo / Text / Mask) vào một lần encode video."""
         cmd = [self.ffmpeg, "-y", "-i", str(video)]
         filters: List[str] = []
@@ -2015,6 +2030,7 @@ class RenderEngine:
             width=width,
             height=height,
             sub_ass_file=sub_ass_file,
+            audio_title=audio_title,
         )
 
         filters.append(f"{last}format=yuv420p[v]")
@@ -2033,6 +2049,7 @@ class RenderEngine:
         width: int,
         height: int,
         sub_ass_file: Path | None = None,
+        audio_title: str = "",
     ) -> None:
         """Gộp XFade transitions và toàn bộ visual overlays (Layout Studio đa tầng) thành 1 pass duy nhất."""
         transition_mode = str(self.settings.get("transition_mode", "fade") or "none")
@@ -2064,6 +2081,7 @@ class RenderEngine:
             width=width,
             height=height,
             sub_ass_file=sub_ass_file,
+            audio_title=audio_title,
         )
 
         filters.append(f"{last}format=yuv420p[v]")
