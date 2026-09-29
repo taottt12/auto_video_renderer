@@ -111,15 +111,11 @@ class YouTubeUploader:
         start_date: datetime.date,
         time_slots: List[str],
         count: int,
+        tz_offset_hours: float = 7.0,
     ) -> List[datetime.datetime]:
         """Tính toán lịch đăng giãn cách theo số mốc giờ cố định trong ngày cho N video.
 
-        Ví dụ: 2 mốc ['11:30', '19:30'] cho 5 video:
-        - Tập 1: Ngày 1 11:30
-        - Tập 2: Ngày 1 19:30
-        - Tập 3: Ngày 2 11:30
-        - Tập 4: Ngày 2 19:30
-        - Tập 5: Ngày 3 11:30
+        Hỗ trợ gắn Timezone theo quốc gia mục tiêu để quy đổi chính xác sang UTC khi upload.
         """
         if not time_slots:
             time_slots = ["11:30", "19:30"]
@@ -134,13 +130,14 @@ class YouTubeUploader:
 
         slots_per_day = len(parsed_slots)
         results: List[datetime.datetime] = []
+        tz = datetime.timezone(datetime.timedelta(hours=tz_offset_hours))
 
         for i in range(count):
             day_offset = i // slots_per_day
             slot_idx = i % slots_per_day
             target_date = start_date + datetime.timedelta(days=day_offset)
             target_time = parsed_slots[slot_idx]
-            dt = datetime.datetime.combine(target_date, target_time)
+            dt = datetime.datetime.combine(target_date, target_time, tzinfo=tz)
             results.append(dt)
 
         return results
@@ -156,12 +153,17 @@ class YouTubeUploader:
         publish_at: Optional[datetime.datetime] = None,
         is_premiere: bool = False,
         category_id: str = "24",
+        default_language: Optional[str] = None,
+        default_audio_language: Optional[str] = None,
+        location_description: Optional[str] = None,
+        latitude: Optional[float] = None,
+        longitude: Optional[float] = None,
         thumbnail_path: Optional[str | Path] = None,
         playlist_name: str = "",
         playlist_id: Optional[str] = None,
         progress_cb: Optional[ProgressCallback] = None,
     ) -> Dict[str, Any]:
-        """Tải video lên YouTube bằng giao thức Resumable Upload và cấu hình đầy đủ."""
+        """Tải video lên YouTube bằng giao thức Resumable Upload với cấu hình Geo, Ngôn ngữ và Lên lịch chuẩn."""
         v_path = Path(video_path)
         if not v_path.exists():
             raise FileNotFoundError(f"Không tìm thấy file video: {v_path}")
@@ -187,9 +189,32 @@ class YouTubeUploader:
             }
         }
 
+        # Thiết lập ngôn ngữ mặc định & ngôn ngữ âm thanh (Geo-Targeting SEO)
+        if default_language and default_language.strip():
+            body["snippet"]["defaultLanguage"] = default_language.strip().lower()
+        if default_audio_language and default_audio_language.strip():
+            body["snippet"]["defaultAudioLanguage"] = default_audio_language.strip().lower()
+
+        parts = ["snippet", "status"]
+
+        # Thiết lập vị trí địa lý (Geo Location & Recording Details)
+        recording_details: Dict[str, Any] = {}
+        if location_description and location_description.strip():
+            recording_details["locationDescription"] = location_description.strip()
+        if latitude is not None and longitude is not None:
+            recording_details["location"] = {
+                "latitude": float(latitude),
+                "longitude": float(longitude),
+            }
+        if recording_details:
+            body["recordingDetails"] = recording_details
+            parts.append("recordingDetails")
+
         # Nếu có hẹn giờ
         if publish_at is not None and privacy_status == "schedule":
-            # Chuyển sang chuẩn UTC ISO 8601 (Local Time -> UTC)
+            # Chuyển sang chuẩn UTC ISO 8601 (Timezone Aware -> UTC)
+            if publish_at.tzinfo is None:
+                publish_at = publish_at.astimezone()
             utc_dt = publish_at.astimezone(datetime.timezone.utc)
             body["status"]["privacyStatus"] = "private"  # Theo chuẩn YouTube, video hẹn giờ ban đầu phải là private
             body["status"]["publishAt"] = utc_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -200,8 +225,9 @@ class YouTubeUploader:
         chunk_size = 2 * 1024 * 1024
         media = MediaFileUpload(str(v_path), chunksize=chunk_size, resumable=True, mimetype="video/mp4")
 
+        part_str = ",".join(parts)
         request = youtube.videos().insert(
-            part="snippet,status",
+            part=part_str,
             body=body,
             media_body=media
         )

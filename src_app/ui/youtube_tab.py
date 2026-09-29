@@ -3,25 +3,28 @@ from __future__ import annotations
 import csv
 import datetime
 import os
+import random
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import webbrowser
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont, QPixmap
+from PySide6.QtGui import QFont, QPixmap, QAction
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit,
     QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QCheckBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox, QProgressBar,
     QGroupBox, QSplitter, QFrame, QDialog, QTabWidget, QRadioButton, QButtonGroup,
-    QScrollArea
+    QScrollArea, QMenu
 )
 
 from core.gemini_assistant import (
     GeminiAssistant, OfflineSEOAssistant, CustomAIAssistant,
     clean_story_title, clean_episode_badge, extract_clean_video_title,
-    extract_highlight_from_title, ThumbnailPromptGenerator, detect_9router_api_key
+    extract_highlight_from_title, ThumbnailPromptGenerator, detect_9router_api_key,
+    PRESET_COUNTRIES, translate_video_metadata
 )
 from core.image_generator import AIImageGenerator
 from core.settings import PROJECTS_DIR, SettingsManager
@@ -239,6 +242,10 @@ class ContentWorker(QThread):
         tasks: List[Dict[str, Any]],
         channel_name: str,
         target_language: str = "vi",
+        gen_title: bool = True,
+        gen_desc: bool = True,
+        gen_tags: bool = True,
+        gen_thumb: bool = True,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -248,22 +255,24 @@ class ContentWorker(QThread):
         self.tasks = tasks
         self.channel_name = channel_name
         self.target_language = target_language
+        self.gen_title = gen_title
+        self.gen_desc = gen_desc
+        self.gen_tags = gen_tags
+        self.gen_thumb = gen_thumb
         self._is_cancelled = False
 
     def cancel(self) -> None:
         self._is_cancelled = True
 
     def run(self) -> None:
-        # 1. Nhận diện và chuẩn hóa tên gốc của từng task
+        # 1. Nhận diện và chuẩn hóa tên gốc của từng task trực tiếp từ file_name
         task_base_names = []
         for task in self.tasks:
-            raw_title = task.get("story_title", "") or ""
-            badge = task.get("episode_badge") or ""
+            raw_title = task.get("file_name") or task.get("story_title", "") or ""
             clean_base = extract_clean_video_title(raw_title)
             if not clean_base or clean_base.lower() in ["video", "audio"]:
-                clean_base = clean_story_title(raw_title)
-            if badge and badge.lower() in clean_base.lower():
-                clean_base = re.sub(rf"\b{re.escape(badge)}\b", "", clean_base, flags=re.IGNORECASE).strip(" :-_")
+                clean_base = clean_story_title(task.get("story_title", ""))
+            clean_base = clean_story_title(clean_base)
             task_base_names.append(clean_base or raw_title)
 
         # 2. Đếm tần suất xuất hiện của tên gốc để phân loại Series vs Video đơn lẻ
@@ -324,12 +333,12 @@ class ContentWorker(QThread):
                     core_title = master_title
                     if ch_clean and core_title.endswith(f"| {ch_clean}"):
                         core_title = core_title[:-len(f"| {ch_clean}")].strip()
-                    if ep:
-                        core_title = re.sub(rf"^(?:\[?{re.escape(ep)}\]?|Tập\s*\d+|P\d+)[\s:\-_]+", "", core_title, flags=re.IGNORECASE).strip()
+                    core_title = re.sub(r"^(?:\[?(?:p\s*\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?)\]?)[\s:\-_]+", "", core_title, flags=re.IGNORECASE).strip()
+                    core_title = re.sub(r"[\s:\-_]+(?:\[?(?:p\s*\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?)\]?)$", "", core_title, flags=re.IGNORECASE).strip()
 
-                    # Tiêu đề cố định theo Playlist + Số tập
+                    # Tiêu đề cố định theo Playlist 100% đồng bộ tên bộ truyện + Số tập
                     if ep:
-                        final_title = f"{ep}: {core_title}"
+                        final_title = f"{core_title} - {ep}"
                         if ch_clean and len(f"{final_title} | {ch_clean}") <= 98:
                             final_title = f"{final_title} | {ch_clean}"
                     else:
@@ -343,13 +352,15 @@ class ContentWorker(QThread):
                     if ep and ep.lower() not in tags_base.lower():
                         tags_base = f"{tags_base}, {ep.lower()}, {core_title.lower()} {ep.lower()}"
 
+                    # Nếu người dùng tắt tự động tạo tiêu đề -> giữ nguyên tiêu đề ban đầu
+                    actual_title = final_title if self.gen_title else (task.get("original_title") or task.get("story_title") or task.get("file_name", ""))
                     data = {
-                        "title": final_title,
-                        "description": master.get("description", ""),
-                        "tags": tags_base.strip(", "),
+                        "title": actual_title,
+                        "description": master.get("description", "") if self.gen_desc else task.get("description", ""),
+                        "tags": tags_base.strip(", ") if self.gen_tags else task.get("tags", ""),
                         "thumbnail_badge": ep,
-                        "thumbnail_highlight": master.get("thumbnail_highlight", extract_highlight_from_title(core_title)),
-                        "thumbnail_ai_prompt": master.get("thumbnail_ai_prompt", ""),
+                        "thumbnail_highlight": master.get("thumbnail_highlight", extract_highlight_from_title(core_title)) if self.gen_thumb else task.get("thumbnail_hl", ""),
+                        "thumbnail_ai_prompt": master.get("thumbnail_ai_prompt", "") if self.gen_thumb else task.get("ai_image_prompt", ""),
                         "provider_used": master.get("provider_used", self.provider),
                     }
                 else:
@@ -381,6 +392,16 @@ class ContentWorker(QThread):
                             target_language=self.target_language,
                         )
 
+                    if not self.gen_title:
+                        data["title"] = task.get("original_title") or task.get("story_title") or task.get("file_name", "")
+                    if not self.gen_desc:
+                        data["description"] = task.get("description", "")
+                    if not self.gen_tags:
+                        data["tags"] = task.get("tags", "")
+                    if not self.gen_thumb:
+                        data["thumbnail_highlight"] = task.get("thumbnail_hl", "")
+                        data["thumbnail_ai_prompt"] = task.get("ai_image_prompt", "")
+
                 self.item_finished_sig.emit(idx, True, "Thành công", data)
             except Exception as e:
                 self.item_finished_sig.emit(idx, False, str(e), {})
@@ -396,6 +417,7 @@ class UploadWorker(QThread):
     progress_sig = Signal(int, str, float)
     log_sig = Signal(str)
     item_finished_sig = Signal(int, bool, str)
+    item_status_sig = Signal(int, str, str)  # row_idx, status_type ("uploading", "success", "error"), status_text
     item_updated_sig = Signal(int, dict)
     all_finished_sig = Signal()
 
@@ -406,6 +428,8 @@ class UploadWorker(QThread):
         channel_id: str,
         ai_config: Optional[Dict[str, Any]] = None,
         thumb_config: Optional[Dict[str, Any]] = None,
+        geo_config: Optional[Dict[str, Any]] = None,
+        cooldown_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.uploader = uploader
@@ -413,7 +437,10 @@ class UploadWorker(QThread):
         self.channel_id = channel_id
         self.ai_config = ai_config or {}
         self.thumb_config = thumb_config or {}
+        self.geo_config = geo_config or {}
+        self.cooldown_config = cooldown_config or {}
         self._is_cancelled = False
+        self._series_cache: Dict[str, Dict[str, Any]] = {}
 
     def cancel(self) -> None:
         self._is_cancelled = True
@@ -428,47 +455,103 @@ class UploadWorker(QThread):
         channel_name = self.ai_config.get("channel_name", "")
         target_language = self.ai_config.get("target_language", "vi")
 
-        story_title = task.get("story_title") or task.get("title") or Path(task["video_path"]).stem
-        clean_title = extract_clean_video_title(story_title)
+        raw_f = task.get("file_name") or task.get("story_title") or Path(task["video_path"]).stem
+        clean_base = extract_clean_video_title(raw_f)
+        if not clean_base or clean_base.lower() in ["video", "audio"]:
+            clean_base = clean_story_title(task.get("story_title", ""))
+        clean_base = clean_story_title(clean_base)
+
         ep = task.get("episode_badge") or ""
         ep_idx = task.get("episode_index")
+        base_key = clean_base.strip().lower()
 
         try:
-            if provider == "offline":
-                return OfflineSEOAssistant.generate_video_metadata(
-                    story_title=clean_title,
-                    episode_name=ep,
-                    channel_name=channel_name,
-                    episode_index=ep_idx,
-                    target_language=target_language,
-                )
-            elif provider in ["custom", "9router"]:
-                assistant = CustomAIAssistant(api_key, custom_base_url, model)
-                return assistant.generate_video_metadata(
-                    story_title=clean_title,
-                    episode_name=ep,
-                    channel_name=channel_name,
-                    episode_index=ep_idx,
-                    target_language=target_language,
-                )
+            if base_key not in self._series_cache:
+                if provider == "offline":
+                    m_data = OfflineSEOAssistant.generate_video_metadata(
+                        story_title=clean_base,
+                        episode_name="",
+                        channel_name=channel_name,
+                        episode_index=None,
+                        target_language=target_language,
+                    )
+                elif provider in ["custom", "9router"]:
+                    assistant = CustomAIAssistant(api_key, custom_base_url, model)
+                    m_data = assistant.generate_video_metadata(
+                        story_title=clean_base,
+                        episode_name="",
+                        channel_name=channel_name,
+                        episode_index=None,
+                        target_language=target_language,
+                    )
+                else:
+                    assistant = GeminiAssistant(api_key, model)
+                    m_data = assistant.generate_video_metadata(
+                        story_title=clean_base,
+                        episode_name="",
+                        channel_name=channel_name,
+                        episode_index=None,
+                        target_language=target_language,
+                    )
+                self._series_cache[base_key] = m_data
+
+            master = self._series_cache[base_key]
+            master_title = master.get("title", clean_base)
+            ch_clean = channel_name.split("(")[0].strip()
+            core_title = master_title
+            if ch_clean and core_title.endswith(f"| {ch_clean}"):
+                core_title = core_title[:-len(f"| {ch_clean}")].strip()
+            core_title = re.sub(r"^(?:\[?(?:p\s*\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?)\]?)[\s:\-_]+", "", core_title, flags=re.IGNORECASE).strip()
+            core_title = re.sub(r"[\s:\-_]+(?:\[?(?:p\s*\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?)\]?)$", "", core_title, flags=re.IGNORECASE).strip()
+
+            if ep:
+                final_title = f"{core_title} - {ep}"
+                if ch_clean and len(f"{final_title} | {ch_clean}") <= 98:
+                    final_title = f"{final_title} | {ch_clean}"
             else:
-                assistant = GeminiAssistant(api_key, model)
-                return assistant.generate_video_metadata(
-                    story_title=clean_title,
-                    episode_name=ep,
-                    channel_name=channel_name,
-                    episode_index=ep_idx,
-                    target_language=target_language,
-                )
+                final_title = f"{core_title} | {ch_clean}" if ch_clean and len(f"{core_title} | {ch_clean}") <= 98 else core_title
+
+            if len(final_title) > 98:
+                final_title = final_title[:95] + "..."
+
+            tags_base = master.get("tags", "")
+            if ep and ep.lower() not in tags_base.lower():
+                tags_base = f"{tags_base}, {ep.lower()}, {core_title.lower()} {ep.lower()}"
+
+            gen_title_opt = self.ai_config.get("gen_title", True)
+            gen_desc_opt = self.ai_config.get("gen_desc", True)
+            gen_tags_opt = self.ai_config.get("gen_tags", True)
+            gen_thumb_opt = self.ai_config.get("gen_thumb", True)
+
+            actual_title = final_title if gen_title_opt else (task.get("title") or clean_base or raw_f)
+            return {
+                "title": actual_title,
+                "description": master.get("description", "") if gen_desc_opt else task.get("description", ""),
+                "tags": tags_base.strip(", ") if gen_tags_opt else task.get("tags", ""),
+                "thumbnail_badge": ep,
+                "thumbnail_highlight": (master.get("thumbnail_highlight", extract_highlight_from_title(core_title))) if gen_thumb_opt else task.get("thumbnail_hl", ""),
+                "thumbnail_ai_prompt": master.get("thumbnail_ai_prompt", "") if gen_thumb_opt else task.get("ai_image_prompt", ""),
+                "provider_used": master.get("provider_used", provider),
+            }
         except Exception as e:
             self.log_sig.emit(f"   ⚠ Lỗi gọi AI SEO ({provider}): {e}")
-            return OfflineSEOAssistant.generate_video_metadata(
-                story_title=clean_title,
+            fallback_data = OfflineSEOAssistant.generate_video_metadata(
+                story_title=clean_base,
                 episode_name=ep,
                 channel_name=channel_name,
                 episode_index=ep_idx,
                 target_language=target_language,
             )
+            if not self.ai_config.get("gen_title", True):
+                fallback_data["title"] = task.get("title") or clean_base or raw_f
+            if not self.ai_config.get("gen_desc", True):
+                fallback_data["description"] = task.get("description", "")
+            if not self.ai_config.get("gen_tags", True):
+                fallback_data["tags"] = task.get("tags", "")
+            if not self.ai_config.get("gen_thumb", True):
+                fallback_data["thumbnail_highlight"] = task.get("thumbnail_hl", "")
+                fallback_data["thumbnail_ai_prompt"] = task.get("ai_image_prompt", "")
+            return fallback_data
 
     def _build_thumbnail(self, task: Dict[str, Any]) -> Optional[Path]:
         if not self.thumb_config:
@@ -595,14 +678,28 @@ class UploadWorker(QThread):
             playlist_name = task.get("playlist_name", "")
             playlist_id = task.get("playlist_id", None)
 
+            # Thiết lập định danh quốc gia & ngôn ngữ & vị trí
+            default_lang = task.get("default_language") or (self.geo_config.get("language_code") if self.geo_config else None)
+            default_audio_lang = task.get("default_audio_language") or (self.geo_config.get("audio_language") if self.geo_config else None)
+            loc_desc = task.get("location_description") or (self.geo_config.get("location_name") if self.geo_config and self.geo_config.get("enable_geo") else None)
+            lat = task.get("latitude") if "latitude" in task else (self.geo_config.get("latitude") if self.geo_config and self.geo_config.get("enable_geo") else None)
+            lng = task.get("longitude") if "longitude" in task else (self.geo_config.get("longitude") if self.geo_config and self.geo_config.get("enable_geo") else None)
+
             self.log_sig.emit(f"[{idx+1}/{total}] 🚀 Bắt đầu tải lên: {Path(v_path).name}")
             self.log_sig.emit(f"   Tiêu đề: {title}")
+            if default_lang:
+                self.log_sig.emit(f"   🌐 Định danh ngôn ngữ: {default_lang.upper()} | Âm thanh: {(default_audio_lang or default_lang).upper()}")
+            if loc_desc:
+                self.log_sig.emit(f"   📍 Vị trí địa lý: {loc_desc}")
             if publish_at:
                 self.log_sig.emit(f"   Lịch đăng: {publish_at.strftime('%d/%m/%Y %H:%M')}")
+
+            self.item_status_sig.emit(row_idx, "uploading", "Đang tải (0%)")
 
             try:
                 def on_progress(pct: int, msg: str, spd: float) -> None:
                     self.progress_sig.emit(pct, msg, spd)
+                    self.item_status_sig.emit(row_idx, "uploading", f"Đang tải ({pct}%)")
 
                 res = self.uploader.upload_video(
                     channel_id=self.channel_id,
@@ -613,6 +710,11 @@ class UploadWorker(QThread):
                     privacy_status=privacy,
                     publish_at=publish_at,
                     is_premiere=is_premiere,
+                    default_language=default_lang,
+                    default_audio_language=default_audio_lang,
+                    location_description=loc_desc,
+                    latitude=lat,
+                    longitude=lng,
                     thumbnail_path=thumb,
                     playlist_name=playlist_name,
                     playlist_id=playlist_id,
@@ -620,10 +722,28 @@ class UploadWorker(QThread):
                 )
                 video_url = res.get("video_url", "")
                 self.log_sig.emit(f"✔ Hoàn thành: {video_url}")
-                self.item_finished_sig.emit(idx, True, video_url)
+                self.item_status_sig.emit(row_idx, "success", video_url)
+                self.item_finished_sig.emit(row_idx, True, video_url)
             except Exception as e:
                 self.log_sig.emit(f"❌ Lỗi tải lên: {e}")
-                self.item_finished_sig.emit(idx, False, str(e))
+                self.item_status_sig.emit(row_idx, "error", str(e))
+                self.item_finished_sig.emit(row_idx, False, str(e))
+
+            # Giãn cách chống Spam an toàn giữa các video trong hàng đợi
+            if idx < total - 1 and not self._is_cancelled:
+                if self.cooldown_config and self.cooldown_config.get("enabled", False):
+                    min_s = int(self.cooldown_config.get("min_sec", 60))
+                    max_s = int(self.cooldown_config.get("max_sec", 180))
+                    if max_s < min_s:
+                        max_s = min_s
+                    delay_sec = random.randint(min_s, max_s)
+                    self.log_sig.emit(f"⏳ Giãn cách an toàn chống Spam: Nghỉ {delay_sec}s trước khi tải video tiếp theo...")
+                    for remaining in range(delay_sec, 0, -1):
+                        if self._is_cancelled:
+                            break
+                        if remaining % 15 == 0 or remaining <= 5:
+                            self.log_sig.emit(f"   ⏳ Còn {remaining}s...")
+                        time.sleep(1)
 
         self.all_finished_sig.emit()
 
@@ -840,10 +960,10 @@ class YouTubeTab(QWidget):
         row_proj.addWidget(self.refresh_proj_btn)
         lay_proj.addLayout(row_proj)
 
-        # Bảng video 6 cột chi tiết từng tập
-        self.video_table = QTableWidget(0, 6)
+        # Bảng video 7 cột chi tiết từng tập kèm trạng thái tải lên
+        self.video_table = QTableWidget(0, 7)
         self.video_table.setHorizontalHeaderLabels([
-            "Chọn", "Tập", "Tên Video MP4", "Tiêu đề YouTube", "Thumbnail", "Dung lượng"
+            "Chọn", "Tập", "Tên Video MP4", "Tiêu đề YouTube", "Thumbnail", "Dung lượng", "Trạng thái Tải lên"
         ])
         h_header = self.video_table.horizontalHeader()
         h_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -852,15 +972,42 @@ class YouTubeTab(QWidget):
         h_header.setSectionResizeMode(3, QHeaderView.Stretch)
         h_header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         h_header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        self.video_table.setColumnWidth(2, 190)
+        h_header.setSectionResizeMode(6, QHeaderView.Interactive)
+        self.video_table.setColumnWidth(2, 170)
         self.video_table.setColumnWidth(4, 85)
         self.video_table.setColumnWidth(5, 75)
+        self.video_table.setColumnWidth(6, 140)
         h_header.setSectionsMovable(True)
         h_header.setHighlightSections(True)
         self.video_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.video_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.video_table.customContextMenuRequested.connect(self._on_table_context_menu)
         self.video_table.cellClicked.connect(self._on_video_clicked)
+        self.video_table.cellDoubleClicked.connect(self._on_table_cell_double_clicked)
         self.video_table.cellChanged.connect(self._on_table_cell_changed)
         lay_proj.addWidget(self.video_table)
+
+        # Hàng nút thao tác trạng thái hàng đợi (Pending / Unloaded / Retry)
+        row_status_btns = QHBoxLayout()
+        self.btn_set_pending = QPushButton("🟡 Đặt Chờ Tải Lên")
+        self.btn_set_pending.setStyleSheet("font-weight: bold; color: #f1e05a; background-color: #2b303c; padding: 4px;")
+        self.btn_set_pending.setToolTip("Đưa các video được chọn vào hàng đợi tải lên (Status: Pending)")
+        self.btn_set_pending.clicked.connect(self._set_selected_pending)
+
+        self.btn_set_unloaded = QPushButton("⚪ Đặt Chưa Tải")
+        self.btn_set_unloaded.setStyleSheet("font-weight: bold; color: #8b949e; background-color: #21262d; padding: 4px;")
+        self.btn_set_unloaded.setToolTip("Chuyển các video được chọn về trạng thái Chưa Tải (Tạm bỏ qua)")
+        self.btn_set_unloaded.clicked.connect(self._set_selected_unloaded)
+
+        self.btn_retry_failed = QPushButton("🔄 Thử Lại Video Lỗi")
+        self.btn_retry_failed.setStyleSheet("font-weight: bold; color: #ff7b72; background-color: #3b2327; padding: 4px;")
+        self.btn_retry_failed.setToolTip("Tự động chuyển toàn bộ các video bị Lỗi tải lên về Chờ Tải Lên để thử lại")
+        self.btn_retry_failed.clicked.connect(self._retry_all_failed)
+
+        row_status_btns.addWidget(self.btn_set_pending)
+        row_status_btns.addWidget(self.btn_set_unloaded)
+        row_status_btns.addWidget(self.btn_retry_failed)
+        lay_proj.addLayout(row_status_btns)
 
         row_sort_btns = QHBoxLayout()
         self.btn_sort_natural = QPushButton("Sắp xếp tự nhiên (P1, P2...)")
@@ -1078,6 +1225,38 @@ class YouTubeTab(QWidget):
 
         lay_ai.addWidget(self.provider_stack)
 
+        # Hàng checkbox tùy chọn các thành phần AI sẽ sinh:
+        row_ai_opts = QHBoxLayout()
+        row_ai_opts.setSpacing(12)
+
+        self.chk_ai_gen_title = QCheckBox("✍️ Tạo Tiêu Đề (Bỏ chọn để giữ nguyên tên video)")
+        self.chk_ai_gen_title.setChecked(True)
+        self.chk_ai_gen_title.setStyleSheet("font-weight: bold; color: #58a6ff;")
+        self.chk_ai_gen_title.setToolTip("Khi bỏ chọn: AI sẽ KHÔNG viết lại tiêu đề, giữ nguyên tên gốc của video")
+        self.chk_ai_gen_title.stateChanged.connect(self._on_ai_gen_options_changed)
+
+        self.chk_ai_gen_desc = QCheckBox("📝 Tạo Mô Tả")
+        self.chk_ai_gen_desc.setChecked(True)
+        self.chk_ai_gen_desc.setToolTip("Tự động phân tích nội dung để viết mô tả video chuẩn SEO")
+        self.chk_ai_gen_desc.stateChanged.connect(self._on_ai_gen_options_changed)
+
+        self.chk_ai_gen_tags = QCheckBox("🏷️ Tạo Tags")
+        self.chk_ai_gen_tags.setChecked(True)
+        self.chk_ai_gen_tags.setToolTip("Tự động sinh bộ thẻ từ khóa & hashtag SEO")
+        self.chk_ai_gen_tags.stateChanged.connect(self._on_ai_gen_options_changed)
+
+        self.chk_ai_gen_thumb = QCheckBox("🎨 Tạo Chữ & Prompt Thumbnail")
+        self.chk_ai_gen_thumb.setChecked(True)
+        self.chk_ai_gen_thumb.setToolTip("Tự động trích xuất chữ nổi bật và Prompt AI cho ảnh Thumbnail")
+        self.chk_ai_gen_thumb.stateChanged.connect(self._on_ai_gen_options_changed)
+
+        row_ai_opts.addWidget(self.chk_ai_gen_title)
+        row_ai_opts.addWidget(self.chk_ai_gen_desc)
+        row_ai_opts.addWidget(self.chk_ai_gen_tags)
+        row_ai_opts.addWidget(self.chk_ai_gen_thumb)
+        row_ai_opts.addStretch(1)
+        lay_ai.addLayout(row_ai_opts)
+
         row_ai_actions = QHBoxLayout()
         self.btn_batch_ai_gen = QPushButton("✨ Tự Động Sinh Tiêu Đề, Mô Tả & Tags Cho Các Tập Đã Chọn")
         self.btn_batch_ai_gen.setStyleSheet("font-weight: bold; background-color: #2b5797; color: white; padding: 7px; border-radius: 4px;")
@@ -1131,6 +1310,73 @@ class YouTubeTab(QWidget):
         self.tags_edit.setPlaceholderText("tag1, tag2, tag3, truyen audio, kiem hiep...")
         self.tags_edit.textChanged.connect(self._on_tags_changed)
         lay_meta.addWidget(self.tags_edit)
+
+        # 4.3 Định danh Quốc Gia, Bản Địa Hóa & Giãn Cách Chống Spam
+        grp_geo = QGroupBox("4.3 Định danh Quốc gia, Bản Địa Hóa & Giãn cách Spam")
+        grp_geo.setStyleSheet("QGroupBox { font-weight: bold; color: #58a6ff; }")
+        lay_geo = QVBoxLayout(grp_geo)
+        lay_geo.setContentsMargins(6, 6, 6, 6)
+        lay_geo.setSpacing(6)
+
+        row_geo_top = QHBoxLayout()
+        row_geo_top.addWidget(QLabel("Quốc gia mục tiêu:"))
+        self.country_combo = QComboBox()
+        for c_key, c_info in PRESET_COUNTRIES.items():
+            self.country_combo.addItem(c_info["label"], c_key)
+        self.country_combo.currentIndexChanged.connect(self._on_country_changed)
+        row_geo_top.addWidget(self.country_combo, 1)
+
+        self.btn_translate_single = QPushButton("🌐 Dịch Sang Quốc Gia Này")
+        self.btn_translate_single.setStyleSheet("font-weight: bold; background-color: #238636; color: white; padding: 4px 8px; border-radius: 4px;")
+        self.btn_translate_single.setToolTip("AI tự động dịch Tiêu đề, Mô tả và Tags của tập đang chọn sang chuẩn ngôn ngữ & văn hóa của quốc gia đã chọn")
+        self.btn_translate_single.clicked.connect(self._translate_current_episode)
+        row_geo_top.addWidget(self.btn_translate_single)
+        lay_geo.addLayout(row_geo_top)
+
+        # Thông tin định vị & ngôn ngữ
+        self.lbl_geo_detail = QLabel("Mã ngôn ngữ: tl | Múi giờ: GMT+8 (Manila) | Bản địa: Philippines TV Drama")
+        self.lbl_geo_detail.setStyleSheet("color: #7ee787; font-size: 10px; font-style: italic;")
+        lay_geo.addWidget(self.lbl_geo_detail)
+
+        row_geo_loc = QHBoxLayout()
+        self.chk_enable_geo = QCheckBox("Gắn vị trí địa lý (recordingDetails):")
+        self.chk_enable_geo.setChecked(True)
+        self.chk_enable_geo.toggled.connect(self._on_geo_toggled)
+        row_geo_loc.addWidget(self.chk_enable_geo)
+
+        self.geo_location_edit = QLineEdit("Manila, Philippines")
+        self.geo_location_edit.setPlaceholderText("Ví dụ: Manila, Philippines hoặc New York, USA")
+        self.geo_location_edit.textChanged.connect(self._save_ui_settings)
+        row_geo_loc.addWidget(self.geo_location_edit, 1)
+        lay_geo.addLayout(row_geo_loc)
+
+        # Giãn cách chống Spam
+        row_spam = QHBoxLayout()
+        self.chk_anti_spam = QCheckBox("Giãn cách an toàn chống Spam (Cooldown):")
+        self.chk_anti_spam.setChecked(True)
+        self.chk_anti_spam.toggled.connect(self._on_anti_spam_toggled)
+        row_spam.addWidget(self.chk_anti_spam)
+
+        self.spin_spam_min = QSpinBox()
+        self.spin_spam_min.setRange(5, 3600)
+        self.spin_spam_min.setValue(60)
+        self.spin_spam_min.setSuffix("s")
+        self.spin_spam_min.setToolTip("Thời gian nghỉ tối thiểu")
+        self.spin_spam_min.valueChanged.connect(self._save_ui_settings)
+        row_spam.addWidget(self.spin_spam_min)
+
+        row_spam.addWidget(QLabel("➔"))
+
+        self.spin_spam_max = QSpinBox()
+        self.spin_spam_max.setRange(5, 3600)
+        self.spin_spam_max.setValue(180)
+        self.spin_spam_max.setSuffix("s")
+        self.spin_spam_max.setToolTip("Thời gian nghỉ tối đa (ngẫu nhiên)")
+        self.spin_spam_max.valueChanged.connect(self._save_ui_settings)
+        row_spam.addWidget(self.spin_spam_max)
+        lay_geo.addLayout(row_spam)
+
+        lay_meta.addWidget(grp_geo)
 
         # Cài đặt xuất bản & Lập lịch
         lay_pub = QVBoxLayout()
@@ -1663,6 +1909,16 @@ class YouTubeTab(QWidget):
         tbl_it = self.video_table.item(row, col)
         if not tbl_it:
             return
+
+        if col == 0:  # Cột Checkbox Chọn
+            chk = tbl_it.checkState()
+            st = item.get("upload_status", "unloaded")
+            if chk == Qt.Checked and st in ("unloaded", "- Chưa tải"):
+                self._update_row_status(row, "pending")
+            elif chk == Qt.Unchecked and st in ("pending", "🟡 Chờ tải lên"):
+                self._update_row_status(row, "unloaded")
+            return
+
         val = tbl_it.text().strip()
 
         if col == 1:  # Cột Tập
@@ -1686,6 +1942,260 @@ class YouTubeTab(QWidget):
                     self.title_len_label.setStyleSheet("color: red; font-weight: bold; font-size: 11px;")
                 else:
                     self.title_len_label.setStyleSheet("color: #888; font-size: 11px;")
+
+    def _update_row_status(self, row: int, status_key: str, message: str = "", extra_data: str = "") -> None:
+        """Cập nhật trạng thái hàng đợi và giao diện của từng video theo chuẩn."""
+        if row < 0 or row >= len(self.video_items):
+            return
+        item = self.video_items[row]
+        self.video_table.blockSignals(True)
+
+        chk_item = self.video_table.item(row, 0)
+        it_st = self.video_table.item(row, 6)
+        if not it_st:
+            it_st = QTableWidgetItem()
+            it_st.setTextAlignment(Qt.AlignCenter)
+            it_st.setFlags(it_st.flags() & ~Qt.ItemIsEditable)
+            self.video_table.setItem(row, 6, it_st)
+
+        if status_key == "unloaded":
+            item["upload_status"] = "unloaded"
+            it_st.setText("- Chưa tải")
+            it_st.setForeground(Qt.gray)
+            it_st.setToolTip("Video chưa được đưa vào hàng đợi tải lên (Tạm bỏ qua)")
+            if chk_item:
+                chk_item.setFlags(chk_item.flags() | Qt.ItemIsEnabled)
+                chk_item.setCheckState(Qt.Unchecked)
+
+        elif status_key == "pending":
+            item["upload_status"] = "pending"
+            it_st.setText("🟡 Chờ tải lên")
+            it_st.setForeground(Qt.yellow)
+            it_st.setToolTip("Video đang trong hàng đợi sẵn sàng tải lên YouTube")
+            if chk_item:
+                chk_item.setFlags(chk_item.flags() | Qt.ItemIsEnabled)
+                chk_item.setCheckState(Qt.Checked)
+
+        elif status_key == "uploading":
+            item["upload_status"] = "uploading"
+            it_st.setText(f"⏳ {message or 'Đang tải...'}")
+            it_st.setForeground(Qt.cyan)
+            it_st.setToolTip(f"Tiến trình tải lên: {message}")
+
+        elif status_key == "uploaded":
+            item["upload_status"] = "uploaded"
+            item["video_url"] = extra_data or item.get("video_url", "")
+            it_st.setText("✅ Đã tải (Mở ↗)")
+            it_st.setForeground(Qt.green)
+            it_st.setToolTip(f"Đã tải lên thành công!\nBấm đúp để mở trên YouTube:\n{item['video_url']}")
+            if chk_item:
+                chk_item.setCheckState(Qt.Unchecked)
+                # Khóa hoàn toàn không cho thao tác chọn đối với video đã tải hoàn thành
+                chk_item.setFlags(chk_item.flags() & ~Qt.ItemIsEnabled)
+
+        elif status_key == "error":
+            item["upload_status"] = "error"
+            item["error_msg"] = message
+            it_st.setText("❌ Lỗi tải")
+            it_st.setForeground(Qt.red)
+            it_st.setToolTip(f"Lỗi tải lên:\n{message}\n\n(Chuột phải hoặc bấm '🔄 Thử lại video lỗi' để tải lại)")
+            if chk_item:
+                chk_item.setFlags(chk_item.flags() | Qt.ItemIsEnabled)
+
+        self.video_table.blockSignals(False)
+
+    def _set_selected_pending(self) -> None:
+        """Đưa các video được chọn vào hàng đợi Chờ Tải Lên."""
+        selected_rows = set([idx.row() for idx in self.video_table.selectedIndexes()])
+        if not selected_rows:
+            selected_rows = set(range(len(self.video_items)))
+        count = 0
+        for r in selected_rows:
+            if 0 <= r < len(self.video_items):
+                st = self.video_items[r].get("upload_status", "unloaded")
+                if st != "uploaded":
+                    self._update_row_status(r, "pending")
+                    count += 1
+        self._log(f"🟡 Đã đưa {count} video vào hàng đợi [🟡 Chờ tải lên].")
+
+    def _set_selected_unloaded(self) -> None:
+        """Chuyển các video được chọn về trạng thái Chưa Tải (Tạm bỏ qua)."""
+        selected_rows = set([idx.row() for idx in self.video_table.selectedIndexes()])
+        if not selected_rows:
+            selected_rows = set(range(len(self.video_items)))
+        count = 0
+        for r in selected_rows:
+            if 0 <= r < len(self.video_items):
+                st = self.video_items[r].get("upload_status", "unloaded")
+                if st != "uploaded":
+                    self._update_row_status(r, "unloaded")
+                    count += 1
+        self._log(f"⚪ Đã chuyển {count} video về trạng thái [⚪ Chưa tải].")
+
+    def _retry_all_failed(self) -> None:
+        """Tự động chuyển toàn bộ các video bị Lỗi tải lên về Chờ Tải Lên."""
+        count = 0
+        for r, item in enumerate(self.video_items):
+            if item.get("upload_status") == "error":
+                self._update_row_status(r, "pending")
+                count += 1
+        if count > 0:
+            self._log(f"🔄 Đã đưa {count} video lỗi trở lại hàng đợi [🟡 Chờ tải lên].")
+        else:
+            QMessageBox.information(self, "Thông báo", "Không có video nào đang ở trạng thái lỗi tải lên.")
+
+    def _on_table_context_menu(self, pos) -> None:
+        row = self.video_table.rowAt(pos.y())
+        if row < 0 or row >= len(self.video_items):
+            return
+        item = self.video_items[row]
+        menu = QMenu(self)
+
+        act_pending = menu.addAction("🟡 Đặt thành: Chờ tải lên (Đưa vào hàng đợi)")
+        act_unloaded = menu.addAction("⚪ Đặt thành: Chưa tải (Tạm bỏ qua)")
+        act_retry = menu.addAction("🔄 Thử lại tải lên (Dành cho video lỗi)")
+
+        st = item.get("upload_status", "unloaded")
+        if st == "uploaded":
+            act_pending.setEnabled(False)
+            act_unloaded.setEnabled(False)
+            act_retry.setEnabled(False)
+
+        menu.addSeparator()
+        act_open_yt = menu.addAction("🌐 Mở xem video trên YouTube")
+        act_copy_url = menu.addAction("📋 Sao chép link YouTube")
+
+        video_url = item.get("video_url", "")
+        if not (video_url and video_url.startswith("http")):
+            act_open_yt.setEnabled(False)
+            act_copy_url.setEnabled(False)
+
+        action = menu.exec(self.video_table.viewport().mapToGlobal(pos))
+        if action == act_pending:
+            self._update_row_status(row, "pending")
+        elif action == act_unloaded:
+            self._update_row_status(row, "unloaded")
+        elif action == act_retry:
+            self._update_row_status(row, "pending")
+        elif action == act_open_yt and video_url:
+            webbrowser.open(video_url)
+        elif action == act_copy_url and video_url:
+            QApplication.clipboard().setText(video_url)
+            self._log(f"📋 Đã sao chép link YouTube: {video_url}")
+
+    def _on_country_changed(self) -> None:
+        c_key = self.country_combo.currentData()
+        if c_key in PRESET_COUNTRIES:
+            c = PRESET_COUNTRIES[c_key]
+            l_code = c.get("language_code", "")
+            tz = c.get("tz_offset", 7.0)
+            culture = c.get("culture", "")
+            loc = c.get("location_name", "")
+            self.lbl_geo_detail.setText(f"Mã ngôn ngữ: {l_code.upper() or 'Tùy chọn'} | Múi giờ: GMT{tz:+g} | Bản địa: {culture[:50]}...")
+            if loc:
+                self.geo_location_edit.setText(loc)
+            # Tự động đồng bộ dropdown AI Target Language nếu có
+            if l_code:
+                idx_tl = self.ai_target_lang_combo.findData(l_code)
+                if idx_tl >= 0:
+                    self.ai_target_lang_combo.blockSignals(True)
+                    self.ai_target_lang_combo.setCurrentIndex(idx_tl)
+                    self.ai_target_lang_combo.blockSignals(False)
+        self._save_ui_settings()
+
+    def _on_geo_toggled(self, checked: bool) -> None:
+        self.geo_location_edit.setEnabled(checked)
+        self._save_ui_settings()
+
+    def _on_anti_spam_toggled(self, checked: bool) -> None:
+        self.spin_spam_min.setEnabled(checked)
+        self.spin_spam_max.setEnabled(checked)
+        self._save_ui_settings()
+
+    def _translate_current_episode(self) -> None:
+        """Dịch 1-click Tiêu đề, Mô tả và Tags của tập đang chọn sang ngôn ngữ của quốc gia mục tiêu."""
+        if self.current_video_idx < 0 or self.current_video_idx >= len(self.video_items):
+            QMessageBox.warning(self, "Chưa chọn tập", "Vui lòng chọn 1 video/tập trong bảng để dịch.")
+            return
+
+        c_key = self.country_combo.currentData()
+        c_info = PRESET_COUNTRIES.get(c_key, PRESET_COUNTRIES["ph"])
+        target_lang = c_info.get("language_code") or self.ai_target_lang_combo.currentData() or "tl"
+        lang_label = c_info.get("label", "Quốc gia đã chọn")
+
+        title = self.title_edit.text().strip()
+        desc = self.desc_edit.toPlainText().strip()
+        tags = self.tags_edit.text().strip()
+        ch_name = self.channel_combo.currentText().split("(")[0].strip()
+
+        if not title:
+            QMessageBox.warning(self, "Thiếu tiêu đề", "Video hiện tại chưa có tiêu đề để dịch.")
+            return
+
+        provider = self.ai_provider_combo.currentData() or "9router"
+        api_key = ""
+        model = ""
+        custom_url = ""
+        if provider == "gemini":
+            api_key = self.gemini_key_edit.text().strip()
+            model = self.gemini_model_combo.currentText().strip()
+        elif provider == "9router":
+            api_key = self.nine_key_edit.text().strip()
+            model = self.nine_model_combo.currentText().strip()
+            custom_url = self.nine_url_edit.text().strip()
+        elif provider == "custom":
+            api_key = self.custom_key_edit.text().strip()
+            model = self.custom_model_edit.text().strip()
+            custom_url = self.custom_url_edit.text().strip()
+
+        self._log(f"🌐 Đang dịch tự động Tiêu đề, Mô tả sang {lang_label} ({provider})...")
+        self.btn_translate_single.setEnabled(False)
+        self.btn_translate_single.setText("⏳ Đang dịch...")
+        QApplication.processEvents()
+
+        try:
+            res = translate_video_metadata(
+                title=title,
+                description=desc,
+                tags=tags,
+                target_language=target_lang,
+                provider=provider,
+                api_key=api_key,
+                model=model,
+                custom_base_url=custom_url,
+                channel_name=ch_name,
+            )
+            new_title = res.get("title", title)
+            new_desc = res.get("description", desc)
+            new_tags = res.get("tags", tags)
+            new_hl = res.get("thumbnail_highlight", "")
+
+            self.title_edit.setText(new_title)
+            self.desc_edit.setText(new_desc)
+            self.tags_edit.setText(new_tags)
+            if hasattr(self, "thumb_hl_edit") and new_hl:
+                self.thumb_hl_edit.setText(new_hl)
+
+            # Cập nhật trong video_items và bảng
+            item = self.video_items[self.current_video_idx]
+            item["title"] = new_title
+            item["description"] = new_desc
+            item["tags"] = new_tags
+            if new_hl:
+                item["thumbnail_hl"] = new_hl
+
+            it_t = self.video_table.item(self.current_video_idx, 3)
+            if it_t:
+                it_t.setText(new_title)
+                it_t.setToolTip(new_title)
+
+            self._log(f"✔ Đã dịch thành công sang {lang_label}: {new_title}")
+        except Exception as e:
+            self._log(f"⚠ Lỗi khi dịch metadata: {e}")
+            QMessageBox.warning(self, "Lỗi dịch thuật", f"Không thể hoàn thành dịch thuật:\n{e}")
+        finally:
+            self.btn_translate_single.setEnabled(True)
+            self.btn_translate_single.setText("🌐 Dịch Sang Quốc Gia Này")
 
     def refresh_projects(self) -> None:
         cur_text = self.proj_combo.currentText()
@@ -1772,36 +2282,24 @@ class YouTubeTab(QWidget):
                 thumb_candidate = f.parent / f"{f.stem}.jpg"
             thumb_path = str(thumb_candidate) if thumb_candidate.exists() else None
 
-            # Làm sạch tên video: bỏ ID dài, bỏ _vi_xuly...
+            # Làm sạch tên video: bóc tách chính xác tên gốc của bộ truyện từ chính tên file
             clean_name = extract_clean_video_title(f.stem)
-            if not clean_name:
-                clean_name = f.stem
-
-            if is_external:
-                # Video mở ngoài: ưu tiên lấy tên video sạch của chính nó
-                if badge:
-                    item_title = f"{badge}: {clean_name}"
-                else:
-                    item_title = clean_name
+            if not clean_name or clean_name.lower() in ["video", "audio"]:
+                clean_name = clean_story_title(story_title) or f.stem
             else:
-                # Dự án nội bộ
-                if clean_name and clean_name.lower() != story_title.lower() and clean_name.lower() != "video":
-                    if badge:
-                        item_title = f"{badge}: {clean_name}"
-                    else:
-                        item_title = clean_name
-                else:
-                    if badge:
-                        item_title = f"{badge}: {story_title}"
-                    else:
-                        item_title = story_title or clean_name
+                clean_name = clean_story_title(clean_name)
+
+            if badge:
+                item_title = f"{clean_name} - {badge}"
+            else:
+                item_title = clean_name
 
             if len(item_title) > 95:
                 item_title = item_title[:95]
 
-            tag_base = f"{clean_name.lower()}, {story_title.lower() if story_title else ''}, truyen audio"
+            tag_base = f"{clean_name.lower()}, truyen audio"
             if badge:
-                tag_base += f", {badge.lower()}"
+                tag_base += f", {badge.lower()}, {clean_name.lower()} {badge.lower()}"
 
             item_data = {
                 "video_path": str(f),
@@ -1814,12 +2312,14 @@ class YouTubeTab(QWidget):
                 "tags": tag_base.strip(", "),
                 "thumbnail_path": thumb_path,
                 "thumbnail_hl": extract_highlight_from_title(item_title),
+                "upload_status": "- Chưa tải",
+                "video_url": "",
             }
             self.video_items.append(item_data)
 
             # Col 0: Checkbox
             chk_item = QTableWidgetItem()
-            chk_item.setCheckState(Qt.Checked)
+            chk_item.setCheckState(Qt.Unchecked)
             chk_item.setData(Qt.UserRole, row)
             chk_item.setFlags(chk_item.flags() & ~Qt.ItemIsEditable)
             self.video_table.setItem(row, 0, chk_item)
@@ -1856,6 +2356,13 @@ class YouTubeTab(QWidget):
             it_sz.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             it_sz.setFlags(it_sz.flags() & ~Qt.ItemIsEditable)
             self.video_table.setItem(row, 5, it_sz)
+
+            # Col 6: Trạng thái Tải lên
+            it_st = QTableWidgetItem("- Chưa tải")
+            it_st.setTextAlignment(Qt.AlignCenter)
+            it_st.setFlags(it_st.flags() & ~Qt.ItemIsEditable)
+            it_st.setForeground(Qt.gray)
+            self.video_table.setItem(row, 6, it_st)
 
         self.video_table.blockSignals(False)
 
@@ -1935,10 +2442,18 @@ class YouTubeTab(QWidget):
         self.video_table.blockSignals(True)
         self.video_table.setRowCount(len(self.video_items))
         for row, item_data in enumerate(self.video_items):
+            up_st = item_data.get("upload_status", "unloaded")
+            is_uploaded = "đã tải" in up_st.lower() or up_st == "uploaded"
+            is_pending = "chờ tải" in up_st.lower() or up_st == "pending"
+
             chk_item = QTableWidgetItem()
-            chk_item.setCheckState(Qt.Checked)
+            chk_item.setCheckState(Qt.Checked if is_pending else Qt.Unchecked)
             chk_item.setData(Qt.UserRole, row)
-            chk_item.setFlags(chk_item.flags() & ~Qt.ItemIsEditable)
+            if is_uploaded:
+                # Video đã hoàn thành: Khóa hoàn toàn checkbox
+                chk_item.setFlags(chk_item.flags() & ~Qt.ItemIsEditable & ~Qt.ItemIsEnabled)
+            else:
+                chk_item.setFlags(chk_item.flags() & ~Qt.ItemIsEditable | Qt.ItemIsEnabled)
             self.video_table.setItem(row, 0, chk_item)
 
             badge = item_data.get("episode_badge", "")
@@ -1973,6 +2488,34 @@ class YouTubeTab(QWidget):
             it_sz.setFlags(it_sz.flags() & ~Qt.ItemIsEditable)
             self.video_table.setItem(row, 5, it_sz)
 
+            # Col 6: Trạng thái Tải lên
+            v_url = item_data.get("video_url", "")
+            it_st = QTableWidgetItem(up_st)
+            it_st.setTextAlignment(Qt.AlignCenter)
+            it_st.setFlags(it_st.flags() & ~Qt.ItemIsEditable)
+            if is_uploaded:
+                it_st.setText("✅ Đã tải (Mở ↗)")
+                it_st.setForeground(Qt.green)
+                if v_url:
+                    it_st.setToolTip(f"Bấm đúp để xem trên YouTube:\n{v_url}")
+            elif is_pending:
+                it_st.setText("🟡 Chờ tải lên")
+                it_st.setForeground(Qt.yellow)
+                it_st.setToolTip("Video trong hàng đợi sẵn sàng tải lên")
+            elif "lỗi" in up_st.lower() or up_st == "error":
+                it_st.setText("❌ Lỗi tải")
+                it_st.setForeground(Qt.red)
+                err = item_data.get("error_msg") or v_url
+                if err:
+                    it_st.setToolTip(f"Lỗi: {err}\n(Bấm 'Thử lại' hoặc chuột phải để tải lại)")
+            elif "đang tải" in up_st.lower() or up_st.startswith("⏳"):
+                it_st.setText(up_st)
+                it_st.setForeground(Qt.cyan)
+            else:
+                it_st.setText("- Chưa tải")
+                it_st.setForeground(Qt.gray)
+            self.video_table.setItem(row, 6, it_st)
+
         self.video_table.blockSignals(False)
 
         if len(self.video_items) > 0:
@@ -1980,16 +2523,10 @@ class YouTubeTab(QWidget):
             self._select_video_row(target_r)
 
     def _select_all_videos(self) -> None:
-        for r in range(self.video_table.rowCount()):
-            it = self.video_table.item(r, 0)
-            if it:
-                it.setCheckState(Qt.Checked)
+        self._set_selected_pending()
 
     def _unselect_all_videos(self) -> None:
-        for r in range(self.video_table.rowCount()):
-            it = self.video_table.item(r, 0)
-            if it:
-                it.setCheckState(Qt.Unchecked)
+        self._set_selected_unloaded()
 
     def _on_video_clicked(self, row: int, col: int) -> None:
         self._select_video_row(row)
@@ -2150,6 +2687,18 @@ class YouTubeTab(QWidget):
             self.lbl_pl_img_name.setStyleSheet("color: #7ee787; font-weight: bold;")
             self._log(f"✔ Đã chọn ảnh nền chung cho toàn bộ Playlist: {self._playlist_common_thumb.name}")
 
+    def _on_ai_gen_options_changed(self) -> None:
+        self._update_ai_btn_text()
+        self._save_ui_settings()
+
+    def _update_ai_btn_text(self) -> None:
+        if not hasattr(self, "btn_batch_ai_gen") or not hasattr(self, "chk_ai_gen_title"):
+            return
+        if self.chk_ai_gen_title.isChecked():
+            self.btn_batch_ai_gen.setText("✨ Tự Động Sinh Tiêu Đề, Mô Tả & Tags Cho Các Tập Đã Chọn")
+        else:
+            self.btn_batch_ai_gen.setText("✨ Tự Động Sinh Mô Tả & Tags (Giữ Nguyên Tiêu Đề Gốc Video)")
+
     # ==========================
     # LOGIC: SINH NỘI DUNG AI
     # ==========================
@@ -2166,9 +2715,15 @@ class YouTubeTab(QWidget):
                 selected_indices.append(r)
                 bdg = item.get("episode_badge", "")
                 tasks.append({
-                    "story_title": item.get("title") or clean_title or item["file_name"],
+                    "file_name": item.get("file_name", ""),
+                    "story_title": clean_title or item.get("title") or item["file_name"],
+                    "original_title": item.get("title", ""),
                     "episode_badge": bdg,
                     "episode_index": item.get("episode_index"),
+                    "description": item.get("description", ""),
+                    "tags": item.get("tags", ""),
+                    "thumbnail_hl": item.get("thumbnail_hl", ""),
+                    "ai_image_prompt": item.get("ai_image_prompt", ""),
                 })
 
         if not tasks:
@@ -2209,6 +2764,11 @@ class YouTubeTab(QWidget):
         self.btn_batch_ai_gen.setText(f"⏳ Đang tạo nội dung cho {len(tasks)} tập...")
 
         target_lang = self.ai_target_lang_combo.currentData() or "vi"
+        gen_title = self.chk_ai_gen_title.isChecked()
+        gen_desc = self.chk_ai_gen_desc.isChecked()
+        gen_tags = self.chk_ai_gen_tags.isChecked()
+        gen_thumb = self.chk_ai_gen_thumb.isChecked()
+
         self._content_worker = ContentWorker(
             provider=provider,
             api_key=api_key,
@@ -2217,6 +2777,10 @@ class YouTubeTab(QWidget):
             tasks=tasks,
             channel_name=ch_name,
             target_language=target_lang,
+            gen_title=gen_title,
+            gen_desc=gen_desc,
+            gen_tags=gen_tags,
+            gen_thumb=gen_thumb,
         )
 
         def on_item_finished(task_idx: int, ok: bool, msg: str, data: dict) -> None:
@@ -2225,14 +2789,14 @@ class YouTubeTab(QWidget):
                 if ok and data:
                     item = self.video_items[row_idx]
                     self.video_table.blockSignals(True)
-                    if "title" in data:
+                    if gen_title and "title" in data and data["title"]:
                         item["title"] = data["title"]
                         self.video_table.setItem(row_idx, 3, QTableWidgetItem(data["title"]))
-                    if "description" in data:
+                    if gen_desc and "description" in data:
                         item["description"] = data["description"]
-                    if "tags" in data:
+                    if gen_tags and "tags" in data:
                         item["tags"] = data["tags"]
-                    if "thumbnail_badge" in data:
+                    if gen_thumb and "thumbnail_badge" in data:
                         raw_bdg = data["thumbnail_badge"]
                         if item.get("episode_badge"):
                             badge = clean_episode_badge(raw_bdg, fallback_idx=None) or item["episode_badge"]
@@ -2242,15 +2806,16 @@ class YouTubeTab(QWidget):
                         self.video_table.setItem(row_idx, 1, QTableWidgetItem(badge))
                     self.video_table.blockSignals(False)
 
-                    hl_val = data.get("thumbnail_highlight")
-                    if not hl_val or " - " not in hl_val:
-                        hl_val = extract_highlight_from_title(item.get("title", ""))
-                    item["thumbnail_hl"] = hl_val
-                    item["thumbnail_highlight"] = hl_val
-                    item["user_edited_hl"] = False
+                    if gen_thumb:
+                        hl_val = data.get("thumbnail_highlight")
+                        if not hl_val or " - " not in hl_val:
+                            hl_val = extract_highlight_from_title(item.get("title", ""))
+                        item["thumbnail_hl"] = hl_val
+                        item["thumbnail_highlight"] = hl_val
+                        item["user_edited_hl"] = False
 
-                    if "thumbnail_ai_prompt" in data and data["thumbnail_ai_prompt"]:
-                        item["ai_image_prompt"] = data["thumbnail_ai_prompt"].strip()
+                        if "thumbnail_ai_prompt" in data and data["thumbnail_ai_prompt"]:
+                            item["ai_image_prompt"] = data["thumbnail_ai_prompt"].strip()
 
                     if row_idx == self.current_video_idx:
                         self._select_video_row(row_idx)
@@ -2265,7 +2830,7 @@ class YouTubeTab(QWidget):
 
         def on_all_finished() -> None:
             self.btn_batch_ai_gen.setEnabled(True)
-            self.btn_batch_ai_gen.setText("✨ Tự Động Sinh Tiêu Đề, Mô Tả & Tags Cho Các Tập Đã Chọn")
+            self._update_ai_btn_text()
             QMessageBox.information(self, "Hoàn thành", f"Đã sinh xong nội dung SEO chuẩn cho {len(tasks)} tập video!")
 
         self._content_worker.item_finished_sig.connect(on_item_finished)
@@ -2868,13 +3433,49 @@ class YouTubeTab(QWidget):
 
         selected_tasks_info = []
         for r in range(self.video_table.rowCount()):
+            if r >= len(self.video_items):
+                continue
+            item = self.video_items[r]
+            st = str(item.get("upload_status", "unloaded")).lower()
             it = self.video_table.item(r, 0)
-            if it and it.checkState() == Qt.Checked and r < len(self.video_items):
-                selected_tasks_info.append((r, self.video_items[r]))
+            is_checked = (it is not None and it.checkState() == Qt.Checked)
+
+            # Bỏ qua tuyệt đối các video đã tải hoàn thành để tránh spam/trùng lặp
+            if "uploaded" in st or "đã tải" in st:
+                continue
+
+            # Điều kiện đưa vào hàng đợi: có trạng thái Pending HOẶC được Checkbox tích chọn
+            if "pending" in st or "chờ tải" in st or is_checked:
+                selected_tasks_info.append((r, item))
 
         if not selected_tasks_info:
-            QMessageBox.warning(self, "Chưa chọn video", "Hãy tích chọn ít nhất 1 video trong bảng để tải lên.")
+            QMessageBox.warning(
+                self, "Không có video chờ tải",
+                "Không tìm thấy video nào ở trạng thái '🟡 Chờ tải lên'.\n\n"
+                "👉 Hãy tích chọn video hoặc bấm '🟡 Đặt Chờ Tải Lên' để đưa video vào hàng đợi tải lên."
+            )
             return
+
+        # Chuẩn bị cấu hình Định danh Quốc gia (Geo-Targeting & Localization)
+        c_key = self.country_combo.currentData() or "ph"
+        c_info = PRESET_COUNTRIES.get(c_key, PRESET_COUNTRIES.get("ph", {}))
+        geo_config = {
+            "country_key": c_key,
+            "language_code": c_info.get("language_code", "tl"),
+            "audio_language": c_info.get("audio_language", "tl"),
+            "tz_offset": c_info.get("tz_offset", 8.0),
+            "enable_geo": self.chk_enable_geo.isChecked(),
+            "location_name": self.geo_location_edit.text().strip() or c_info.get("location_name", ""),
+            "latitude": c_info.get("latitude"),
+            "longitude": c_info.get("longitude"),
+        }
+
+        # Chuẩn bị cấu hình Giãn cách chống Spam (Cooldown)
+        cooldown_config = {
+            "enabled": self.chk_anti_spam.isChecked(),
+            "min_sec": self.spin_spam_min.value(),
+            "max_sec": self.spin_spam_max.value(),
+        }
 
         privacy_idx = self.privacy_combo.currentIndex()
         privacy_status = "schedule" if privacy_idx == 0 else (
@@ -2885,7 +3486,10 @@ class YouTubeTab(QWidget):
         if privacy_status == "schedule":
             start_date = self.sch_date_edit.date().toPython()
             time_slots = [s.strip() for s in self.sch_slots_edit.text().split(",") if s.strip()]
-            schedule_dts = YouTubeUploader.calculate_schedule_slots(start_date, time_slots, len(selected_tasks_info))
+            schedule_dts = YouTubeUploader.calculate_schedule_slots(
+                start_date, time_slots, len(selected_tasks_info),
+                tz_offset_hours=geo_config["tz_offset"]
+            )
 
         # Xác định tùy chọn Playlist
         pl_name = None
@@ -2926,6 +3530,10 @@ class YouTubeTab(QWidget):
             "custom_base_url": custom_url,
             "channel_name": ch_name,
             "target_language": target_lang,
+            "gen_title": self.chk_ai_gen_title.isChecked() if hasattr(self, "chk_ai_gen_title") else True,
+            "gen_desc": self.chk_ai_gen_desc.isChecked() if hasattr(self, "chk_ai_gen_desc") else True,
+            "gen_tags": self.chk_ai_gen_tags.isChecked() if hasattr(self, "chk_ai_gen_tags") else True,
+            "gen_thumb": self.chk_ai_gen_thumb.isChecked() if hasattr(self, "chk_ai_gen_thumb") else True,
         }
 
         # Chuẩn bị cấu hình Thumbnail tự động
@@ -2987,6 +3595,12 @@ class YouTubeTab(QWidget):
         self._log(f"🚀 Bắt đầu tiến trình tự động tải lên {len(tasks)} video lên kênh {self.channel_combo.currentText()}...")
         mode_desc = "Trích xuất frame từ video" if src_mode == "frame" else ("1 ảnh poster cho playlist" if src_mode == "playlist" else "Ảnh riêng")
         self._log(f"   ℹ Chế độ Thumbnail: {mode_desc}")
+        self._log(f"   🌏 Quốc gia mục tiêu: {c_info.get('label', c_key)} (Mã ngôn ngữ: {geo_config['language_code'].upper()})")
+        if geo_config["enable_geo"]:
+            self._log(f"   📍 Vị trí địa lý (recordingDetails): {geo_config['location_name']}")
+        if cooldown_config["enabled"]:
+            self._log(f"   🛡 Giãn cách chống Spam (Cooldown): {cooldown_config['min_sec']}s - {cooldown_config['max_sec']}s ngẫu nhiên giữa các video")
+
         if self.chk_use_playlist.isChecked():
             if pl_id:
                 self._log(f"   📂 Playlist: {self.playlist_combo.currentText()} (ID: {pl_id})")
@@ -2999,12 +3613,35 @@ class YouTubeTab(QWidget):
             channel_id=ch_id,
             ai_config=ai_config,
             thumb_config=thumb_config,
+            geo_config=geo_config,
+            cooldown_config=cooldown_config,
         )
         self._upload_worker.progress_sig.connect(self._on_upload_progress)
         self._upload_worker.log_sig.connect(self._log)
+        self._upload_worker.item_status_sig.connect(self._on_upload_item_status)
         self._upload_worker.item_updated_sig.connect(self._on_upload_item_updated)
         self._upload_worker.all_finished_sig.connect(self._on_upload_all_finished)
         self._upload_worker.start()
+
+    def _on_upload_item_status(self, row_idx: int, status_type: str, status_val: str) -> None:
+        if row_idx < 0 or row_idx >= len(self.video_items):
+            return
+        if status_type == "uploading":
+            self._update_row_status(row_idx, "uploading", message=status_val)
+        elif status_type == "success":
+            self._update_row_status(row_idx, "uploaded", extra_data=status_val)
+        elif status_type == "error":
+            self._update_row_status(row_idx, "error", message=status_val)
+
+    def _on_table_cell_double_clicked(self, row: int, col: int) -> None:
+        if col == 6 and 0 <= row < len(self.video_items):
+            url = self.video_items[row].get("video_url")
+            if url and url.startswith("http"):
+                try:
+                    webbrowser.open(url)
+                    self._log(f"🌐 Đang mở video YouTube trên trình duyệt: {url}")
+                except Exception as e:
+                    self._log(f"⚠ Không thể mở trình duyệt: {e}")
 
     def _on_upload_item_updated(self, row_idx: int, data: dict) -> None:
         if row_idx < 0 or row_idx >= len(self.video_items):
@@ -3069,6 +3706,10 @@ class YouTubeTab(QWidget):
         yt_cfg = self.settings.setdefault("youtube_uploader", {})
         yt_cfg["ai_provider"] = self.ai_provider_combo.currentData() or "offline"
         yt_cfg["ai_target_lang"] = self.ai_target_lang_combo.currentData() or "vi"
+        yt_cfg["ai_gen_title"] = self.chk_ai_gen_title.isChecked()
+        yt_cfg["ai_gen_desc"] = self.chk_ai_gen_desc.isChecked()
+        yt_cfg["ai_gen_tags"] = self.chk_ai_gen_tags.isChecked()
+        yt_cfg["ai_gen_thumb"] = self.chk_ai_gen_thumb.isChecked()
         yt_cfg["9router_base_url"] = self.nine_url_edit.text().strip()
         yt_cfg["9router_api_key"] = self.nine_key_edit.text().strip()
         yt_cfg["9router_model"] = self.nine_model_combo.currentText().strip()
@@ -3093,6 +3734,13 @@ class YouTubeTab(QWidget):
         yt_cfg["thumb_x"] = self.thumb_x_spin.value()
         yt_cfg["thumb_y"] = self.thumb_y_spin.value()
         yt_cfg["thumb_scale"] = self.thumb_scale_spin.value()
+        # Lưu cấu hình Quốc gia & Chống Spam
+        yt_cfg["target_country"] = self.country_combo.currentData() or "ph"
+        yt_cfg["enable_geo"] = self.chk_enable_geo.isChecked()
+        yt_cfg["geo_location"] = self.geo_location_edit.text().strip()
+        yt_cfg["enable_anti_spam"] = self.chk_anti_spam.isChecked()
+        yt_cfg["anti_spam_min"] = self.spin_spam_min.value()
+        yt_cfg["anti_spam_max"] = self.spin_spam_max.value()
         self.settings_changed.emit(self.settings)
 
     def load_settings(self, settings: Dict[str, Any]) -> None:
@@ -3110,6 +3758,16 @@ class YouTubeTab(QWidget):
             idx_tl = self.ai_target_lang_combo.findData(target_lang)
             if idx_tl >= 0:
                 self.ai_target_lang_combo.setCurrentIndex(idx_tl)
+
+            if "ai_gen_title" in yt_cfg:
+                self.chk_ai_gen_title.setChecked(bool(yt_cfg.get("ai_gen_title", True)))
+            if "ai_gen_desc" in yt_cfg:
+                self.chk_ai_gen_desc.setChecked(bool(yt_cfg.get("ai_gen_desc", True)))
+            if "ai_gen_tags" in yt_cfg:
+                self.chk_ai_gen_tags.setChecked(bool(yt_cfg.get("ai_gen_tags", True)))
+            if "ai_gen_thumb" in yt_cfg:
+                self.chk_ai_gen_thumb.setChecked(bool(yt_cfg.get("ai_gen_thumb", True)))
+            self._update_ai_btn_text()
 
             if yt_cfg.get("9router_base_url"):
                 self.nine_url_edit.setText(yt_cfg.get("9router_base_url"))
@@ -3198,6 +3856,24 @@ class YouTubeTab(QWidget):
             if yt_cfg.get("thumb_scale") is not None:
                 self.thumb_scale_spin.setValue(int(yt_cfg["thumb_scale"]))
             self.custom_pos_box.setVisible(pos == "custom")
+
+            # Cấu hình Quốc gia & Chống Spam
+            target_country = yt_cfg.get("target_country", "ph")
+            idx_c = self.country_combo.findData(target_country)
+            if idx_c >= 0:
+                self.country_combo.setCurrentIndex(idx_c)
+            if "enable_geo" in yt_cfg:
+                self.chk_enable_geo.setChecked(bool(yt_cfg["enable_geo"]))
+                self._on_geo_toggled(bool(yt_cfg["enable_geo"]))
+            if yt_cfg.get("geo_location"):
+                self.geo_location_edit.setText(str(yt_cfg["geo_location"]))
+            if "enable_anti_spam" in yt_cfg:
+                self.chk_anti_spam.setChecked(bool(yt_cfg["enable_anti_spam"]))
+                self._on_anti_spam_toggled(bool(yt_cfg["enable_anti_spam"]))
+            if yt_cfg.get("anti_spam_min") is not None:
+                self.spin_spam_min.setValue(int(yt_cfg["anti_spam_min"]))
+            if yt_cfg.get("anti_spam_max") is not None:
+                self.spin_spam_max.setValue(int(yt_cfg["anti_spam_max"]))
         finally:
             self._is_loading_settings = False
 

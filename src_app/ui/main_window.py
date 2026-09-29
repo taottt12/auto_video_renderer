@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 from core.settings import SettingsManager, PROJECTS_DIR
 from .crawler_tab import CrawlerTab
 from .setting_tab import SettingTab
+from .layout_tab import LayoutStudioTab
 from .render_tab import RenderTab
 from .youtube_tab import YouTubeTab
 
@@ -156,32 +157,62 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.crawler_tab = CrawlerTab(self.settings)
         self.setting_tab = SettingTab(self.settings)
+        self.layout_tab = LayoutStudioTab(self.settings)
         self.render_tab = RenderTab(self.settings)
         self.youtube_tab = YouTubeTab(self.settings)
 
         self.tabs.addTab(self.crawler_tab, "Cào MP3")
         self.tabs.addTab(self.setting_tab, "Setting")
+        self.tabs.addTab(self.layout_tab, "Studio Layout")
         self.tabs.addTab(self.render_tab, "Render")
         self.tabs.addTab(self.youtube_tab, "Đăng YouTube")
         self.setCentralWidget(self.tabs)
 
         # Kết nối sự kiện giữa các tab
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self.crawler_tab.settings_changed.connect(self.on_settings_changed)
         self.crawler_tab.audio_downloaded.connect(self.render_tab.add_audio_file)
         self.crawler_tab.audio_batch_downloaded.connect(self.render_tab.add_audio_files)
 
         self.setting_tab.settings_changed.connect(self.on_settings_changed)
+        self.layout_tab.settings_changed.connect(self.on_settings_changed)
         self.render_tab.settings_changed.connect(self.on_settings_changed)
         self.youtube_tab.settings_changed.connect(self.on_settings_changed)
 
         self.render_tab.project_requested.connect(self.open_project_dialog)
         self.render_tab.render_lock_changed.connect(self.setting_tab.set_locked)
+        self.render_tab.render_lock_changed.connect(lambda locked: self.layout_tab.setEnabled(not locked))
         self.render_tab.render_lock_changed.connect(lambda locked: self.crawler_tab.setEnabled(not locked))
+
+    def _on_tab_changed(self, index: int) -> None:
+        current_widget = self.tabs.widget(index)
+        if current_widget == self.render_tab:
+            self.render_tab.update_settings(self.settings)
+        elif current_widget == self.layout_tab:
+            self.layout_tab._reload_presets()
+            self.layout_tab.update_settings(self.settings)
 
     def on_settings_changed(self, settings: Dict[str, Any]) -> None:
         self.settings.update(settings)
         self.settings_manager.save(self.settings)
+        curr_p_path = self.settings.get("project", {}).get("current_path")
+        if curr_p_path and Path(curr_p_path).exists():
+            try:
+                SettingsManager.save_project(Path(curr_p_path), self.settings)
+            except Exception:
+                pass
+
+        self.setting_tab.settings = self.settings
+        self.crawler_tab.settings = self.settings
         self.render_tab.update_settings(self.settings)
+        if self.sender() != self.layout_tab:
+            self.layout_tab.update_settings(self.settings)
+        if self.sender() != self.setting_tab and hasattr(self.setting_tab, "output_edit"):
+            out_folder = self.settings.get("project", {}).get("output_folder") or self.settings.get("export", {}).get("output_folder")
+            if out_folder and self.setting_tab.output_edit.text() != out_folder:
+                self.setting_tab.output_edit.blockSignals(True)
+                self.setting_tab.output_edit.setText(out_folder)
+                self.setting_tab.output_edit.blockSignals(False)
         if self.sender() != self.youtube_tab:
             self.youtube_tab.load_settings(self.settings)
 
@@ -200,6 +231,8 @@ class MainWindow(QMainWindow):
                     self.settings["project"]["output_folder"] = out_folder
                 SettingsManager.save_project(dlg.selected_path, self.settings)
                 self.settings_manager.save(self.settings)
+                self.setting_tab.load_settings(self.settings)
+                self.layout_tab.update_settings(self.settings)
                 self.render_tab.update_settings(self.settings)
                 self.youtube_tab.load_settings(self.settings)
                 self.youtube_tab.refresh_projects()
@@ -212,6 +245,7 @@ class MainWindow(QMainWindow):
                 self.settings_manager.save(self.settings)
                 self.crawler_tab.load_settings(self.settings)
                 self.setting_tab.load_settings(self.settings)
+                self.layout_tab.update_settings(self.settings)
                 self.render_tab.load_settings(self.settings)
                 self.youtube_tab.load_settings(self.settings)
                 self.youtube_tab.refresh_projects()

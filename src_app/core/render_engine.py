@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import json
 import random
@@ -16,7 +17,7 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from .media_utils import choose_media_sequence, get_duration_seconds, is_image, is_video
 from .overlay_generator import get_overlay_file, ensure_default_overlays
-from .paths import TEMP_DIR, ensure_dirs, find_binary
+from .paths import TEMP_DIR, OUTPUT_DIR, DATA_DIR, APP_ROOT, ensure_dirs, find_binary
 from .process_utils import popen_hidden, run_hidden
 from .subtitle_utils import find_subtitle_file, srt_to_ass, transcribe_audio_to_srt
 
@@ -86,9 +87,10 @@ class RenderEngine:
             width = int(export.get("width", 1080))
             height = int(export.get("height", 1920))
             fps = int(export.get("fps", 30))
-            output_folder = Path(export.get("output_folder") or "output")
+            out_folder_str = self.settings.get("project", {}).get("output_folder") or export.get("output_folder") or "output"
+            output_folder = Path(out_folder_str)
             if not output_folder.is_absolute():
-                output_folder = Path(__file__).resolve().parents[1] / output_folder
+                output_folder = DATA_DIR / output_folder
             output_folder.mkdir(parents=True, exist_ok=True)
 
             # V4.3.6: đặt temp ngay bên trong output folder để tránh đầy ổ C/app folder
@@ -128,40 +130,75 @@ class RenderEngine:
             self.progress(15, "Tạo clip từ ảnh/video")
             clips, clip_durations = self._create_media_clips(media_sequence, job_temp, width, height, fps, image_duration, render_duration)
 
-            # Xử lý phụ đề Subtitle (nếu được bật)
-            sub_cfg = self.settings.get("subtitle", {}) or {}
+            # Xử lý phụ đề Subtitle (nếu được bật trong Cài đặt hoặc trong Studio Layout)
+            sub_cfg = copy.deepcopy(self.settings.get("subtitle", {}) or {})
             sub_ass_file: Path | None = None
-            if sub_cfg.get("enabled"):
+
+            ls_layers = (self.settings.get("layout_studio", {}) or {}).get("layers", [])
+            has_studio_sub = any(isinstance(l, dict) and l.get("type") == "subtitle" and l.get("enabled", True) for l in ls_layers)
+            sub_is_enabled = bool(sub_cfg.get("enabled") or has_studio_sub)
+
+            if sub_is_enabled:
                 sub_folder = sub_cfg.get("folder", "")
                 raw_sub = find_subtitle_file(original_audio_path, sub_folder)
 
                 # NẾU BẬT TỰ ĐỘNG QUÉT TẠO SUB (auto_transcribe) VÀ CHƯA CÓ FILE SUB:
-                if (not raw_sub or not raw_sub.exists()) and sub_cfg.get("auto_transcribe", False):
+                auto_transcribe_on = bool(sub_cfg.get("auto_transcribe", False) or has_studio_sub)
+                if (not raw_sub or not raw_sub.exists()) and auto_transcribe_on:
                     self.progress(12, "Whisper AI nhận diện giọng nói & tạo sub")
-                    self.log(f"⚡ Bật tự động tạo Sub: Đang dùng Whisper AI quét audio {original_audio_path.name}...")
                     model_size = str(sub_cfg.get("whisper_model", "base") or "base")
+                    whisper_lang = str(sub_cfg.get("whisper_language", "auto") or "auto").strip()
+                    lang_param = None if whisper_lang in ["auto", "", "None", "none"] else whisper_lang
+                    lang_display = whisper_lang.upper() if lang_param else "TỰ ĐỘNG (AUTO)"
+                    self.log(f"⚡ Bật tự động tạo Sub: Đang dùng Whisper AI [{model_size}], ngôn ngữ [{lang_display}] quét audio {original_audio_path.name}...")
                     auto_srt_path = original_audio_path.with_suffix(".srt")
                     try:
                         raw_sub, detected_lang = transcribe_audio_to_srt(
                             audio_path=original_audio_path,
                             out_srt_path=auto_srt_path,
                             model_size=model_size,
-                            log_callback=self.log
+                            language=lang_param,
+                            log_callback=self.log,
+                            speed=audio_speed,
                         )
                     except Exception as ex:
-                        self.log(f"Lỗi khi tự động tạo phụ đề Whisper: {ex}")
+                        self.log(f"⚠️ Lỗi khi tự động tạo phụ đề Whisper: {ex}")
                         raw_sub = None
 
                 if raw_sub and raw_sub.exists():
-                    self.log(f"Tìm thấy phụ đề: {raw_sub.name}")
+                    self.log(f"✔ Tìm thấy file phụ đề: {raw_sub.name}")
                     sub_ass_file = job_temp / "subtitles.ass"
                     if raw_sub.suffix.lower() == ".ass":
                         shutil.copy2(raw_sub, sub_ass_file)
                     else:
+                        # Đồng bộ cấu hình từ Layer Subtitle trong Layout Studio nếu có
+                        for l in ls_layers:
+                            if isinstance(l, dict) and l.get("type") == "subtitle" and l.get("enabled", True):
+                                sub_cfg["box_x"] = float(l.get("box_x", 0.15))
+                                sub_cfg["box_y"] = float(l.get("box_y", 0.70))
+                                sub_cfg["box_w"] = float(l.get("box_w", 0.70))
+                                sub_cfg["box_h"] = float(l.get("box_h", 0.20))
+                                sub_cfg["font_family"] = l.get("font_name", sub_cfg.get("font_family", "Arial"))
+                                sub_cfg["font_size"] = int(l.get("font_size", sub_cfg.get("font_size", 38)))
+                                sub_cfg["font_color"] = l.get("font_color", sub_cfg.get("font_color", "#FFFFFF"))
+                                sub_cfg["highlight_color"] = l.get("highlight_color", sub_cfg.get("highlight_color", "#FFE600"))
+                                sub_cfg["outline_color"] = l.get("outline_color", sub_cfg.get("outline_color", "#000000"))
+                                sub_cfg["outline_width"] = float(l.get("outline_width", sub_cfg.get("outline_width", 2.5)))
+                                sub_cfg["bold"] = bool(l.get("bold", True))
+                                sub_cfg["italic"] = bool(l.get("italic", False))
+                                sub_cfg["align"] = str(l.get("align", sub_cfg.get("align", "center"))).lower()
+                                sub_cfg["sub_mode"] = str(l.get("sub_mode", sub_cfg.get("sub_mode", "rolling_2line"))).lower()
+                                break
+                        sub_cfg["audio_speed"] = audio_speed
+                        sub_mode_display = {
+                            "rolling_2line": "Cuộn 2 dòng (Rolling 2-Line)",
+                            "cinema_hold": "Chuẩn điện ảnh (Cinema Hold)",
+                            "karaoke_highlight": "Karaoke Highlight từng từ"
+                        }.get(sub_cfg.get("sub_mode", "rolling_2line"), sub_cfg.get("sub_mode", "rolling_2line"))
                         srt_to_ass(raw_sub, sub_ass_file, width, height, sub_cfg)
-                    self.log(f"Đã biên dịch ASS subtitle sẵn sàng gắn vào video")
+                    self.log(f"✔ Đã biên dịch ASS subtitle (Kiểu: {sub_mode_display}, Căn lề: {sub_cfg.get('align', 'center')}) sẵn sàng gắn vào video")
                 else:
-                    self.log(f"Không có file phụ đề cho: {original_audio_path.name}")
+                    self.log(f"Bỏ qua phụ đề vì không có file sub cho: {original_audio_path.name}")
 
             transition_mode = str(self.settings.get("transition_mode", "fade") or "none")
             can_single_pass = (
@@ -315,50 +352,94 @@ class RenderEngine:
         self.log(f"GPU encoder OK: {encoder_name}")
 
     def _target_bitrate_bits(self) -> int:
-        """Bitrate mục tiêu nhẹ hơn cho render hàng loạt.
-
-        Bản 4.x dùng CQ + b:v 0 nên NVENC có thể nhảy lên ~18-20 Mbps.
-        Với video truyện/audio, mức này quá nặng. V5.0 đặt target bitrate rõ ràng để file nhỏ,
-        ít đầy temp và chạy được nhiều luồng hơn.
-        """
+        """Bitrate mục tiêu tối ưu cho video Audio/Truyện dài (file nhẹ ~1.2-1.5 GB/2h, render siêu tốc)."""
         export = self.settings.get("export", {}) or {}
         quality = str(export.get("quality", "standard") or "standard").lower()
-        base = {
-            "draft": 4_000_000,
-            "standard": 6_000_000,
-            "high": 9_000_000,
-            "ultra": 12_000_000,
-        }.get(quality, 6_000_000)
+
+        if quality == "custom":
+            custom_kbps = max(500, min(30000, int(export.get("custom_bitrate_kbps", 2200) or 2200)))
+            return custom_kbps * 1000
+
+        base_map = {
+            "economy": 1_500_000,
+            "low": 1_500_000,
+            "draft": 1_500_000,
+            "standard": 2_200_000,
+            "high": 3_500_000,
+            "ultra": 5_500_000,
+        }
+        base = base_map.get(quality, 2_200_000)
         width = max(1, int(export.get("width", 1080) or 1080))
         height = max(1, int(export.get("height", 1920) or 1920))
         fps = max(1, int(export.get("fps", 30) or 30))
-        scale = max(0.35, (width * height) / (1080 * 1920)) * max(0.5, fps / 30.0)
-        return int(base * scale)
+        # Tối ưu hệ số tỉ lệ theo độ phân giải & FPS (giới hạn trần để tránh phình dung lượng khi FPS cao)
+        res_scale = max(0.35, (width * height) / (1080 * 1920))
+        fps_scale = min(1.30, max(0.70, fps / 30.0))
+        return int(base * res_scale * fps_scale)
 
     @staticmethod
     def _ffmpeg_bitrate(value_bits: int) -> str:
-        return f"{max(1, int(round(value_bits / 1_000_000)))}M"
+        return f"{max(300, int(round(value_bits / 1000)))}k"
 
     def _video_encode_args(self) -> List[str]:
         encoder = self._encoder()
         quality = str(self.settings.get("export", {}).get("quality", "standard") or "standard").lower()
-        cq_map = {"draft": "30", "standard": "27", "high": "24", "ultra": "21"}
-        crf_map = {"draft": "30", "standard": "26", "high": "23", "ultra": "20"}
+        cq_map = {"economy": "30", "low": "30", "draft": "30", "standard": "28", "high": "25", "ultra": "22", "custom": "28"}
+        crf_map = {"economy": "30", "low": "30", "draft": "30", "standard": "27", "high": "24", "ultra": "21", "custom": "27"}
         target = self._target_bitrate_bits()
-        maxrate = int(target * 1.55)
-        bufsize = int(target * 2.2)
+        maxrate = int(target * 1.30)
+        bufsize = int(target * 1.60)
         b = self._ffmpeg_bitrate(target)
         mr = self._ffmpeg_bitrate(maxrate)
         bs = self._ffmpeg_bitrate(bufsize)
 
-        if encoder == "nvidia":
-            return ["-c:v", "h264_nvenc", "-preset", "p2", "-rc", "vbr", "-cq:v", cq_map.get(quality, "27"), "-b:v", b, "-maxrate", mr, "-bufsize", bs, "-pix_fmt", "yuv420p"]
-        if encoder == "intel":
-            return ["-c:v", "h264_qsv", "-global_quality", cq_map.get(quality, "27"), "-b:v", b, "-maxrate", mr, "-bufsize", bs, "-look_ahead", "0", "-pix_fmt", "yuv420p"]
-        if encoder == "amd":
-            return ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "vbr_peak", "-b:v", b, "-maxrate", mr, "-pix_fmt", "yuv420p"]
+        fps = max(1, int(self.settings.get("export", {}).get("fps", 30) or 30))
+        gop = str(fps * 2)  # GOP 2s tối ưu nén khung hình tĩnh / pan-zoom cho truyện audio
 
-        args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf_map.get(quality, "26"), "-maxrate", mr, "-bufsize", bs, "-pix_fmt", "yuv420p"]
+        if encoder == "nvidia":
+            return [
+                "-c:v", "h264_nvenc",
+                "-preset", "p1",
+                "-rc", "vbr",
+                "-cq:v", cq_map.get(quality, "28"),
+                "-b:v", b,
+                "-maxrate", mr,
+                "-bufsize", bs,
+                "-g", gop,
+                "-pix_fmt", "yuv420p",
+            ]
+        if encoder == "intel":
+            return [
+                "-c:v", "h264_qsv",
+                "-preset", "veryfast",
+                "-global_quality", cq_map.get(quality, "28"),
+                "-b:v", b,
+                "-maxrate", mr,
+                "-bufsize", bs,
+                "-g", gop,
+                "-look_ahead", "0",
+                "-pix_fmt", "yuv420p",
+            ]
+        if encoder == "amd":
+            return [
+                "-c:v", "h264_amf",
+                "-quality", "speed",
+                "-rc", "vbr_peak",
+                "-b:v", b,
+                "-maxrate", mr,
+                "-g", gop,
+                "-pix_fmt", "yuv420p",
+            ]
+
+        args = [
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", crf_map.get(quality, "27"),
+            "-maxrate", mr,
+            "-bufsize", bs,
+            "-g", gop,
+            "-pix_fmt", "yuv420p",
+        ]
         threads = self._cpu_threads()
         if threads > 0:
             args += ["-threads", str(threads)]
@@ -366,9 +447,22 @@ class RenderEngine:
 
     def _fallback_cpu_encode_args(self) -> List[str]:
         quality = str(self.settings.get("export", {}).get("quality", "standard") or "standard").lower()
-        crf_map = {"draft": "30", "standard": "26", "high": "23", "ultra": "20"}
+        crf_map = {"economy": "30", "low": "30", "draft": "30", "standard": "27", "high": "24", "ultra": "21", "custom": "27"}
         target = self._target_bitrate_bits()
-        args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf_map.get(quality, "26"), "-maxrate", self._ffmpeg_bitrate(int(target * 1.55)), "-bufsize", self._ffmpeg_bitrate(int(target * 2.2)), "-pix_fmt", "yuv420p"]
+        maxrate = int(target * 1.30)
+        bufsize = int(target * 1.60)
+        fps = max(1, int(self.settings.get("export", {}).get("fps", 30) or 30))
+        gop = str(fps * 2)
+
+        args = [
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", crf_map.get(quality, "27"),
+            "-maxrate", self._ffmpeg_bitrate(maxrate),
+            "-bufsize", self._ffmpeg_bitrate(bufsize),
+            "-g", gop,
+            "-pix_fmt", "yuv420p",
+        ]
         threads = self._cpu_threads()
         if threads > 0:
             args += ["-threads", str(threads)]
@@ -380,7 +474,7 @@ class RenderEngine:
         if custom_temp:
             root_base = Path(custom_temp)
             if not root_base.is_absolute():
-                root_base = Path(__file__).resolve().parents[1] / root_base
+                root_base = DATA_DIR / root_base
             root = root_base / "_avr_temp"
         else:
             root = output_folder / "_avr_temp"
@@ -752,7 +846,15 @@ class RenderEngine:
     def _create_image_clip(self, src: Path, out: Path, width: int, height: int, fps: int, duration: float, index: int) -> None:
         vf = self._image_effect_filter(width, height, fps, duration, index)
         def build(args: List[str]) -> List[str]:
-            return [self.ffmpeg, "-y", "-loop", "1", "-i", str(src), "-t", str(duration), "-vf", vf, "-an"] + args + [str(out)]
+            return [
+                self.ffmpeg, "-y",
+                "-framerate", str(fps),
+                "-loop", "1",
+                "-i", str(src),
+                "-t", f"{duration:.6f}",
+                "-vf", vf,
+                "-an"
+            ] + args + ["-movflags", "+faststart", str(out)]
         self._run(build(self._video_encode_args()), "Tạo image clip", True, lambda: build(self._fallback_cpu_encode_args()))
 
     def _image_effect_filter(self, width: int, height: int, fps: int, duration: float, index: int) -> str:
@@ -770,25 +872,37 @@ class RenderEngine:
         cycle = max(180, int(min(30.0, max(18.0, duration)) * fps))
 
         patterns = {
-            # Zoom in nhẹ nhàng, mượt mà suốt thời lượng clip (chỉ zoom 5%, nới rộng biên độ cực êm)
+            # Zoom in nhẹ nhàng, mượt mà suốt thời lượng clip
             "zoom_in": f"zoompan=z='1.0+0.05*(0.5-0.5*cos(PI*on/{frames}))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
-            # Zoom out nhẹ nhàng từ 1.05 về 1.0
+            "zoom_in_center": f"zoompan=z='1.0+0.06*(0.5-0.5*cos(PI*on/{frames}))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
+            # Zoom out nhẹ nhàng
             "zoom_out": f"zoompan=z='1.05-0.05*(0.5-0.5*cos(PI*on/{frames}))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
+            "zoom_out_center": f"zoompan=z='1.06-0.06*(0.5-0.5*cos(PI*on/{frames}))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
+            # Zoom vào các góc điện ảnh
+            "zoom_in_top_left": f"zoompan=z='1.0+0.05*(0.5-0.5*cos(PI*on/{frames}))':x='0':y='0':d={frames}:s={width}x{height}:fps={fps}",
+            "zoom_in_top_right": f"zoompan=z='1.0+0.05*(0.5-0.5*cos(PI*on/{frames}))':x='iw-iw/zoom':y='0':d={frames}:s={width}x{height}:fps={fps}",
+            "zoom_in_bottom_left": f"zoompan=z='1.0+0.05*(0.5-0.5*cos(PI*on/{frames}))':x='0':y='ih-ih/zoom':d={frames}:s={width}x{height}:fps={fps}",
+            "zoom_in_bottom_right": f"zoompan=z='1.0+0.05*(0.5-0.5*cos(PI*on/{frames}))':x='iw-iw/zoom':y='ih-ih/zoom':d={frames}:s={width}x{height}:fps={fps}",
             # Pan ngang / dọc trôi êm ái
             "pan_left": f"zoompan=z='1.04':x='(iw-iw/zoom)*(1-on/{frames})':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
             "pan_right": f"zoompan=z='1.04':x='(iw-iw/zoom)*(on/{frames})':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
             "pan_up": f"zoompan=z='1.04':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/{frames})':d={frames}:s={width}x{height}:fps={fps}",
             "pan_down": f"zoompan=z='1.04':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(on/{frames})':d={frames}:s={width}x{height}:fps={fps}",
-            # Chuyển động lặp hình sin tuần hoàn chậm rãi, thư thái (chu kỳ 25-30s)
+            # Chuyển động nhịp thở & lặp hình sin tuần hoàn chậm rãi (chu kỳ 25-30s)
+            "smooth_pulse": f"zoompan=z='1.02+0.03*sin(2*PI*on/{cycle})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
             "loop_zoom": f"zoompan=z='1.03+0.025*sin(2*PI*on/{cycle})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}",
             "loop_pan_zoom": f"zoompan=z='1.03+0.02*sin(2*PI*on/{cycle})':x='(iw-iw/zoom)*(0.5+0.45*cos(2*PI*on/{cycle}))':y='(ih-ih/zoom)*(0.5+0.45*sin(2*PI*on/{cycle}))':d={frames}:s={width}x{height}:fps={fps}",
         }
         # Auto mode: tự đổi hiệu ứng theo từng ảnh
-        if effect_mode in {"auto_light", "random_light"}:
-            keys = ["zoom_in", "zoom_out", "pan_left", "pan_right"]
+        if effect_mode in {"auto_smart", "auto_rich", "random_rich", "auto", "random"}:
+            keys = [
+                "zoom_in_center", "pan_right", "zoom_out_center", "pan_left",
+                "zoom_in_top_left", "loop_pan_zoom", "pan_up", "smooth_pulse",
+                "zoom_in_top_right", "pan_down"
+            ]
             selected = patterns[keys[(index - 1) % len(keys)]]
-        elif effect_mode in {"auto_rich", "random_rich"}:
-            keys = ["zoom_in", "zoom_out", "pan_left", "pan_right", "loop_zoom", "loop_pan_zoom"]
+        elif effect_mode in {"auto_light", "random_light"}:
+            keys = ["zoom_in", "zoom_out", "pan_left", "pan_right"]
             selected = patterns[keys[(index - 1) % len(keys)]]
         elif effect_mode in patterns:
             selected = patterns[effect_mode]
@@ -958,10 +1072,12 @@ class RenderEngine:
 
     @staticmethod
     def _transition_sequence(mode: str, count: int) -> List[str]:
-        light = ["fade", "fadeblack", "fadewhite", "slideleft", "slideright"]
-        rich = [
-            "fade", "fadeblack", "fadewhite", "slideleft", "slideright", "slideup", "slidedown",
-            "wipeleft", "wiperight", "circleopen", "circleclose", "zoomin", "pixelize",
+        soft = ["fade", "fadeblack", "fadewhite", "dissolve", "slideleft", "slideright"]
+        dynamic = [
+            "fade", "fadeblack", "fadewhite", "dissolve",
+            "slideleft", "slideright", "slideup", "slidedown",
+            "wipeleft", "wiperight", "wipeup", "wipedown",
+            "circleopen", "circleclose", "zoomin", "pixelize", "radial"
         ]
 
         def auto_no_repeat(pool: List[str]) -> List[str]:
@@ -976,15 +1092,13 @@ class RenderEngine:
                 last = picked
             return seq
 
-        # Auto mode: tự đổi transition, tránh cùng một transition lặp liên tiếp.
-        # random_basic cũ được coi như auto_light để config cũ không bị lỗi.
-        if mode in {"auto_light", "random_basic"}:
-            return auto_no_repeat(light)
-        if mode == "auto_rich":
-            return auto_no_repeat(rich)
-        if mode in rich:
+        if mode in {"auto_soft", "auto_light", "random_basic", "auto", "random"}:
+            return auto_no_repeat(soft)
+        if mode in {"auto_dynamic", "auto_rich", "random_rich"}:
+            return auto_no_repeat(dynamic)
+        if mode in dynamic or mode in soft:
             return [mode] * count
-        return auto_no_repeat(light)
+        return auto_no_repeat(soft)
 
     def _get_background_music_file(self) -> str:
         bgm_cfg = self.settings.get("background_music", {}) or {}
@@ -1575,6 +1689,12 @@ class RenderEngine:
 
 
     def _has_visual_overlays(self, sub_ass_file: Path | None = None) -> bool:
+        layout_studio = self.settings.get("layout_studio", {}) or {}
+        studio_enabled = bool(layout_studio.get("enabled", True))
+        studio_layers = [l for l in (layout_studio.get("layers", []) or []) if isinstance(l, dict) and l.get("enabled", True)]
+        if studio_enabled and len(studio_layers) > 0:
+            return True
+
         text = self.settings.get("text_overlay", {}) or {}
         sub = self.settings.get("subtitle", {}) or {}
         fx_mode = str(self.settings.get("video_effect_mode", "none") or "none")
@@ -1592,6 +1712,22 @@ class RenderEngine:
             or has_video_fx
         )
 
+    def _resolve_asset_path(self, path_str: str) -> Optional[Path]:
+        """Kiểm tra đường dẫn file tài nguyên. Nếu không tìm thấy, thử tìm trên các ổ đĩa khác (E: <-> F:)."""
+        if not path_str or not str(path_str).strip():
+            return None
+        p = Path(str(path_str).strip())
+        if p.exists():
+            return p
+        s = str(p)
+        for drive in ["F:", "E:", "D:", "C:"]:
+            if len(s) > 2 and s[1] == ":":
+                candidate = Path(drive + s[2:])
+                if candidate.exists():
+                    self.log(f"💡 Tự động nhận diện tài nguyên tại ổ {drive}: {candidate}")
+                    return candidate
+        return None
+
     def _video_effect_filter_for_overlay(self, mode: str, width: int, height: int) -> str:
         if not mode or mode == "none":
             return ""
@@ -1608,115 +1744,280 @@ class RenderEngine:
             return filters["auto_cinematic"]
         return ""
 
-    def _apply_visual_overlays(self, video: Path, out: Path, width: int, height: int, sub_ass_file: Path | None = None) -> None:
-        """Gộp watermark + logo + text + hiệu ứng video vào một lần encode video.
-
-        Đây là pass quan trọng của V5.0: thay vì encode lại nhiều lần riêng lẻ,
-        FFmpeg tạo một filter graph duy nhất rồi xuất video-only. Audio được mux sau bằng copy.
-        Hiệu ứng video (Hạt rơi layer mask, Film Grain, Vignette...) phủ đều full video chính và không đụng intro/outro.
-        """
-        cmd = [self.ffmpeg, "-y", "-i", str(video)]
-        filters: List[str] = []
-        last = "[0:v]"
-        input_index = 1
+    def _build_visual_layers_filtergraph(
+        self,
+        cmd: List[str],
+        filters: List[str],
+        base_label: str,
+        input_index_start: int,
+        width: int,
+        height: int,
+        sub_ass_file: Path | None = None,
+    ) -> Tuple[str, int]:
+        """Tạo chuỗi filtergraph cho toàn bộ các layer (Layout Studio multi-layer) hoặc fallback cũ."""
+        last = base_label
+        input_index = input_index_start
         stage = 0
 
-        # 1. Hiệu ứng Video (Layer mask hạt rơi / Film Grain / Vignette...) trên toàn bộ video chính
-        fx_mode = str(self.settings.get("video_effect_mode", "none") or "none")
-        fx_enabled = bool(self.settings.get("video_effect_enabled", True))
-        custom_fx_file = str(self.settings.get("video_effect_custom_file", "") or "").strip()
-        overlay_video = get_overlay_file(fx_mode, custom_file=custom_fx_file)
+        layout_studio = self.settings.get("layout_studio", {}) or {}
+        studio_enabled = bool(layout_studio.get("enabled", True))
+        layers = [l for l in (layout_studio.get("layers", []) or []) if isinstance(l, dict) and l.get("enabled", True)]
+        sub_rendered = False
 
-        if fx_enabled and overlay_video and overlay_video.exists():
-            cmd += ["-stream_loop", "-1", "-i", str(overlay_video)]
-            fx_opacity = min(1.0, max(0.05, float(self.settings.get("video_effect_opacity", 0.80) or 0.80)))
-            ov_label = f"[ov{stage}]"
-            out_label = f"[v{stage}]"
-            filters.append(
-                f"[{input_index}:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},format=rgba,colorkey=0x000000:0.15:0.1,colorchannelmixer=aa={fx_opacity:.2f}{ov_label}"
-            )
-            filters.append(f"{last}{ov_label}overlay=0:0:format=auto{out_label}")
-            last = out_label
-            input_index += 1
-            stage += 1
-        elif fx_enabled and fx_mode != "none":
-            fx_str = self._video_effect_filter_for_overlay(fx_mode, width, height)
-            if fx_str:
-                out_label = f"[v{stage}]"
-                filters.append(f"{last}{fx_str}{out_label}")
+        # Nếu có danh sách layers được cấu hình trong Studio Layout:
+        if studio_enabled and len(layers) > 0:
+            for layer in layers:
+                l_type = str(layer.get("type", "image")).lower()
+                l_name = str(layer.get("name", "Layer"))
+                opacity = float(layer.get("opacity", 1.0) if layer.get("opacity") is not None else 1.0)
+                opacity = max(0.0, min(1.0, opacity))
+                blend_mode = str(layer.get("blend_mode", "alpha"))
+
+                # Tọa độ chuẩn hóa 0.0 -> 1.0
+                bx = float(layer.get("box_x", 0.0))
+                by = float(layer.get("box_y", 0.0))
+                bw = float(layer.get("box_w", 0.3))
+                bh = float(layer.get("box_h", 0.2))
+
+                px = max(0, int(width * bx))
+                py = max(0, int(height * by))
+                pw = max(16, int(width * bw))
+                ph = max(16, int(height * bh))
+
+                if l_type in {"image", "gif", "video_mask", "banner", "logo", "watermark", "chat_bubble", "reaction"}:
+                    f_path_raw = str(layer.get("file_path", "")).strip()
+                    if not f_path_raw:
+                        continue
+                    resolved = self._resolve_asset_path(f_path_raw)
+                    if not resolved or not resolved.exists():
+                        raise FileNotFoundError(f"Không tìm thấy file của layer '{l_name}': {f_path_raw}")
+
+                    if l_type in {"gif", "reaction"}:
+                        cmd += ["-ignore_loop", "0", "-i", str(resolved)]
+                    elif l_type == "video_mask":
+                        cmd += ["-stream_loop", "-1", "-i", str(resolved)]
+                    else:
+                        cmd += ["-i", str(resolved)]
+
+                    in_lbl = f"[layer_in_{stage}]"
+                    out_lbl = f"[layer_v_{stage}]"
+
+                    scale_mode = str(layer.get("scale_mode", "stretch")).lower()
+                    if scale_mode == "fit":
+                        filter_chain = [f"scale={pw}:{ph}:force_original_aspect_ratio=decrease,pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black@0,format=rgba"]
+                    elif scale_mode == "crop":
+                        filter_chain = [f"scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph},format=rgba"]
+                    else:  # stretch (mặc định khớp khung kéo)
+                        filter_chain = [f"scale={pw}:{ph},format=rgba"]
+
+                    if blend_mode in {"colorkey_black", "screen"}:
+                        filter_chain.append("colorkey=0x000000:0.15:0.1")
+                    if opacity < 0.999:
+                        filter_chain.append(f"colorchannelmixer=aa={opacity:.2f}")
+
+                    filters.append(f"[{input_index}:v]{','.join(filter_chain)}{in_lbl}")
+                    filters.append(f"{last}{in_lbl}overlay={px}:{py}:format=auto{out_lbl}")
+                    last = out_lbl
+                    input_index += 1
+                    stage += 1
+
+                elif l_type == "text":
+                    content = str(layer.get("text_content", "") or layer.get("content", "")).strip()
+                    if not content:
+                        continue
+                    font_size = int(layer.get("font_size", 36) or 36)
+                    font_name = str(layer.get("font_name", "Arial") or "Arial")
+                    font_bold = bool(layer.get("bold", True))
+                    font_italic = bool(layer.get("italic", False))
+
+                    font_color_raw = str(layer.get("font_color", "#FFFFFF")).strip()
+                    font_color = self._normalize_ffmpeg_color(font_color_raw)
+
+                    outline_color_raw = str(layer.get("outline_color", "#000000")).strip()
+                    outline_width = float(layer.get("outline_width", 2.0) or 2.0)
+                    has_outline = (outline_color_raw.lower() not in {"none", "transparent", ""}) and outline_width > 0
+
+                    bg_color_raw = str(layer.get("bg_box_color", "black")).strip()
+                    bg_box_enabled = bool(layer.get("bg_box_enabled", False)) and (bg_color_raw.lower() not in {"none", "transparent", ""})
+                    bg_opacity = float(layer.get("bg_box_opacity", 0.5) if layer.get("bg_box_opacity") is not None else 0.5)
+
+                    font_align = str(layer.get("align", "center")).lower()
+                    if font_align == "center":
+                        pos_expr = f"x={px}+({pw}-text_w)/2:y={py}+({ph}-text_h)/2"
+                    elif font_align == "right":
+                        pos_expr = f"x={px}+{pw}-text_w:y={py}+({ph}-text_h)/2"
+                    else:  # left
+                        pos_expr = f"x={px}:y={py}+({ph}-text_h)/2"
+
+                    dt_parts = [
+                        f"text='{self._escape_drawtext(content)}'",
+                        f"fontsize={font_size}",
+                        f"fontcolor={font_color}",
+                        pos_expr,
+                        f"line_spacing=8",
+                    ]
+                    if has_outline:
+                        border_color = self._normalize_ffmpeg_color(outline_color_raw)
+                        dt_parts.append(f"borderw={int(round(outline_width))}")
+                        dt_parts.append(f"bordercolor={border_color}")
+                    else:
+                        dt_parts.append("borderw=0")
+
+                    font_file = self._find_font_file_by_name(font_name, font_bold, font_italic)
+                    if font_file:
+                        dt_parts.append(f"fontfile='{self._escape_drawtext(font_file.as_posix())}'")
+
+                    if bg_box_enabled:
+                        norm_bg = self._normalize_ffmpeg_color(bg_color_raw)
+                        dt_parts += ["box=1", f"boxcolor={norm_bg}@{bg_opacity:.2f}", "boxborderw=10"]
+
+                    out_lbl = f"[layer_v_{stage}]"
+                    filters.append(f"{last}drawtext={':'.join(dt_parts)}{out_lbl}")
+                    last = out_lbl
+                    stage += 1
+
+                elif l_type == "subtitle":
+                    if sub_ass_file and sub_ass_file.exists():
+                        out_lbl = f"[v_sub_{stage}]"
+                        ass_path_escaped = str(sub_ass_file.resolve()).replace("\\", "/").replace(":", "\\:")
+                        filters.append(f"{last}ass='{ass_path_escaped}'{out_lbl}")
+                        last = out_lbl
+                        stage += 1
+                        sub_rendered = True
+
+                elif l_type == "live_badge":
+                    # Huy hiệu LIVE đỏ góc trên
+                    dt_parts = [
+                        "text='LIVE'",
+                        f"fontsize={max(14, int(ph * 0.45))}",
+                        "fontcolor=white",
+                        f"x={px + 10}:y={py + 5}",
+                        "box=1", "boxcolor=red@0.85", "boxborderw=8"
+                    ]
+                    out_lbl = f"[layer_v_{stage}]"
+                    filters.append(f"{last}drawtext={':'.join(dt_parts)}{out_lbl}")
+                    last = out_lbl
+                    stage += 1
+
+        else:
+            # Fallback legacy cấu hình cũ nếu chưa dùng Studio layers:
+            # 1. Video Effect / Particles
+            fx_mode = str(self.settings.get("video_effect_mode", "none") or "none")
+            fx_enabled = bool(self.settings.get("video_effect_enabled", True))
+            custom_fx_file = str(self.settings.get("video_effect_custom_file", "") or "").strip()
+            overlay_video = get_overlay_file(fx_mode, custom_file=custom_fx_file)
+
+            if fx_enabled and overlay_video and overlay_video.exists():
+                cmd += ["-stream_loop", "-1", "-i", str(overlay_video)]
+                fx_opacity = min(1.0, max(0.05, float(self.settings.get("video_effect_opacity", 0.80) or 0.80)))
+                ov_label = f"[ov{stage}]"
+                out_label = f"[v_stage{stage}]"
+                filters.append(
+                    f"[{input_index}:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+                    f"crop={width}:{height},format=rgba,colorkey=0x000000:0.15:0.1,colorchannelmixer=aa={fx_opacity:.2f}{ov_label}"
+                )
+                filters.append(f"{last}{ov_label}overlay=0:0:format=auto{out_label}")
+                last = out_label
+                input_index += 1
+                stage += 1
+            elif fx_enabled and fx_mode != "none":
+                fx_str = self._video_effect_filter_for_overlay(fx_mode, width, height)
+                if fx_str:
+                    out_label = f"[v_stage{stage}]"
+                    filters.append(f"{last}{fx_str}{out_label}")
+                    last = out_label
+                    stage += 1
+
+            # Watermark
+            watermark_file = str(self.settings.get("watermark_file", "") or "").strip()
+            if self.settings.get("watermark_enabled") and watermark_file:
+                watermark = self._resolve_asset_path(watermark_file)
+                if watermark:
+                    cmd += ["-i", str(watermark)]
+                    opacity = min(1.0, max(0.0, float(self.settings.get("watermark_opacity", 0.2))))
+                    wm_scale = min(3.0, max(0.5, float(self.settings.get("watermark_scale", 1.0))))
+                    scaled_w = max(width, int(width * wm_scale))
+                    scaled_h = max(height, int(height * wm_scale))
+                    wm_label = f"[wm{stage}]"
+                    out_label = f"[v_stage{stage}]"
+                    filters.append(
+                        f"[{input_index}:v]scale={scaled_w}:{scaled_h}:force_original_aspect_ratio=increase,"
+                        f"crop={width}:{height},format=rgba,colorchannelmixer=aa={opacity}{wm_label}"
+                    )
+                    filters.append(f"{last}{wm_label}overlay=0:0:format=auto{out_label}")
+                    last = out_label
+                    input_index += 1
+                    stage += 1
+                else:
+                    raise FileNotFoundError(f"Không tìm thấy file Watermark kênh: {watermark_file}")
+
+            # Logo
+            logo_file = str(self.settings.get("logo_file", "") or "").strip()
+            if self.settings.get("logo_enabled") and logo_file:
+                logo = self._resolve_asset_path(logo_file)
+                if logo:
+                    cmd += ["-i", str(logo)]
+                    scale = float(self.settings.get("logo_scale", 0.12))
+                    logo_width = max(32, int(width * scale))
+                    pos = self.settings.get("logo_position", "top_right")
+                    margin_x = int(self.settings.get("logo_margin_x", 30))
+                    margin_y = int(self.settings.get("logo_margin_y", 30))
+                    positions = {
+                        "top_left": f"{margin_x}:{margin_y}",
+                        "top_center": f"(W-w)/2:{margin_y}",
+                        "top_right": f"W-w-{margin_x}:{margin_y}",
+                        "center_left": f"{margin_x}:(H-h)/2",
+                        "center": "(W-w)/2:(H-h)/2",
+                        "center_right": f"W-w-{margin_x}:(H-h)/2",
+                        "bottom_left": f"{margin_x}:H-h-{margin_y}",
+                        "bottom_center": f"(W-w)/2:H-h-{margin_y}",
+                        "bottom_right": f"W-w-{margin_x}:H-h-{margin_y}",
+                    }
+                    lg_label = f"[lg{stage}]"
+                    out_label = f"[v_stage{stage}]"
+                    filters.append(f"[{input_index}:v]scale={logo_width}:-1,format=rgba{lg_label}")
+                    filters.append(f"{last}{lg_label}overlay={positions.get(pos, positions['top_right'])}:format=auto{out_label}")
+                    last = out_label
+                    input_index += 1
+                    stage += 1
+                else:
+                    raise FileNotFoundError(f"Không tìm thấy file Logo kênh: {logo_file}")
+
+            # Text overlay
+            text_cfg = self.settings.get("text_overlay", {}) or {}
+            content = str(text_cfg.get("content", "")).strip()
+            if text_cfg.get("enabled") and content:
+                out_label = f"[v_stage{stage}]"
+                filters.append(f"{last}{self._drawtext_filter_body(text_cfg, content)}{out_label}")
                 last = out_label
                 stage += 1
 
-        watermark_file = str(self.settings.get("watermark_file", "") or "").strip()
-        if self.settings.get("watermark_enabled") and watermark_file:
-            watermark = Path(watermark_file)
-            if not watermark.exists():
-                raise FileNotFoundError(f"Không tìm thấy watermark: {watermark}")
-            cmd += ["-i", str(watermark)]
-            opacity = min(1.0, max(0.0, float(self.settings.get("watermark_opacity", 0.2))))
-            wm_scale = min(3.0, max(0.5, float(self.settings.get("watermark_scale", 1.0))))
-            scaled_w = max(width, int(width * wm_scale))
-            scaled_h = max(height, int(height * wm_scale))
-            wm_label = f"[wm{stage}]"
-            out_label = f"[v{stage}]"
-            filters.append(
-                f"[{input_index}:v]scale={scaled_w}:{scaled_h}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},format=rgba,colorchannelmixer=aa={opacity}{wm_label}"
-            )
-            filters.append(f"{last}{wm_label}overlay=0:0:format=auto{out_label}")
-            last = out_label
-            input_index += 1
-            stage += 1
-
-        logo_file = str(self.settings.get("logo_file", "") or "").strip()
-        if self.settings.get("logo_enabled") and logo_file:
-            logo = Path(logo_file)
-            if not logo.exists():
-                raise FileNotFoundError(f"Không tìm thấy logo: {logo}")
-            cmd += ["-i", str(logo)]
-            scale = float(self.settings.get("logo_scale", 0.12))
-            logo_width = max(32, int(width * scale))
-            pos = self.settings.get("logo_position", "top_right")
-            margin_x = int(self.settings.get("logo_margin_x", 30))
-            margin_y = int(self.settings.get("logo_margin_y", 30))
-            positions = {
-                "top_left": f"{margin_x}:{margin_y}",
-                "top_center": f"(W-w)/2:{margin_y}",
-                "top_right": f"W-w-{margin_x}:{margin_y}",
-                "center_left": f"{margin_x}:(H-h)/2",
-                "center": "(W-w)/2:(H-h)/2",
-                "center_right": f"W-w-{margin_x}:(H-h)/2",
-                "bottom_left": f"{margin_x}:H-h-{margin_y}",
-                "bottom_center": f"(W-w)/2:H-h-{margin_y}",
-                "bottom_right": f"W-w-{margin_x}:H-h-{margin_y}",
-            }
-            lg_label = f"[lg{stage}]"
-            out_label = f"[v{stage}]"
-            filters.append(f"[{input_index}:v]scale={logo_width}:-1,format=rgba{lg_label}")
-            filters.append(f"{last}{lg_label}overlay={positions.get(pos, positions['top_right'])}:format=auto{out_label}")
-            last = out_label
-            input_index += 1
-            stage += 1
-
-        text_cfg = self.settings.get("text_overlay", {}) or {}
-        content = str(text_cfg.get("content", "")).strip()
-        if text_cfg.get("enabled") and content:
-            out_label = f"[v{stage}]"
-            filters.append(f"{last}{self._drawtext_filter_body(text_cfg, content)}{out_label}")
-            last = out_label
-            stage += 1
-
-        # Subtitle overlay via ASS
-        if sub_ass_file and sub_ass_file.exists():
-            out_label = f"[v{stage}]"
+        # Subtitle overlay via ASS (nếu chưa được chèn theo layer z-index ở trên)
+        if not sub_rendered and sub_ass_file and sub_ass_file.exists():
+            out_label = f"[v_sub_{stage}]"
             ass_path_escaped = str(sub_ass_file.resolve()).replace("\\", "/").replace(":", "\\:")
             filters.append(f"{last}ass='{ass_path_escaped}'{out_label}")
             last = out_label
             stage += 1
 
-        filters.append(f"{last}format=yuv420p[v]")
+        return last, input_index
 
+    def _apply_visual_overlays(self, video: Path, out: Path, width: int, height: int, sub_ass_file: Path | None = None) -> None:
+        """Gộp visual overlays (Layout Studio đa tầng / Watermark / Logo / Text / Mask) vào một lần encode video."""
+        cmd = [self.ffmpeg, "-y", "-i", str(video)]
+        filters: List[str] = []
+
+        last, _ = self._build_visual_layers_filtergraph(
+            cmd=cmd,
+            filters=filters,
+            base_label="[0:v]",
+            input_index_start=1,
+            width=width,
+            height=height,
+            sub_ass_file=sub_ass_file,
+        )
+
+        filters.append(f"{last}format=yuv420p[v]")
         duration = get_duration_seconds(video)
 
         def build(args: List[str]) -> List[str]:
@@ -1733,10 +2034,7 @@ class RenderEngine:
         height: int,
         sub_ass_file: Path | None = None,
     ) -> None:
-        """Gộp XFade transitions và toàn bộ visual overlays (Logo, Watermark, Text, Layer mask) thành 1 pass duy nhất.
-
-        Tiết kiệm hoàn toàn 1 lần encode toàn bộ video 11 phút (giảm 2-3 phút render).
-        """
+        """Gộp XFade transitions và toàn bộ visual overlays (Layout Studio đa tầng) thành 1 pass duy nhất."""
         transition_mode = str(self.settings.get("transition_mode", "fade") or "none")
         transition_duration = self._transition_duration(min(clip_durations) if clip_durations else 0.0)
         selected_transitions = self._transition_sequence(transition_mode, max(1, len(clips) - 1))
@@ -1758,101 +2056,15 @@ class RenderEngine:
         for clip in clips:
             cmd += ["-i", str(clip)]
 
-        last = "[v_xfade]"
-        input_index = len(clips)
-        stage = 0
-
-        # Overlays: Video Effect / Particles
-        fx_mode = str(self.settings.get("video_effect_mode", "none") or "none")
-        fx_enabled = bool(self.settings.get("video_effect_enabled", True))
-        custom_fx_file = str(self.settings.get("video_effect_custom_file", "") or "").strip()
-        overlay_video = get_overlay_file(fx_mode, custom_file=custom_fx_file)
-
-        if fx_enabled and overlay_video and overlay_video.exists():
-            cmd += ["-stream_loop", "-1", "-i", str(overlay_video)]
-            fx_opacity = min(1.0, max(0.05, float(self.settings.get("video_effect_opacity", 0.80) or 0.80)))
-            ov_label = f"[ov{stage}]"
-            out_label = f"[v_stage{stage}]"
-            filters.append(
-                f"[{input_index}:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},format=rgba,colorkey=0x000000:0.15:0.1,colorchannelmixer=aa={fx_opacity:.2f}{ov_label}"
-            )
-            filters.append(f"{last}{ov_label}overlay=0:0:format=auto{out_label}")
-            last = out_label
-            input_index += 1
-            stage += 1
-        elif fx_enabled and fx_mode != "none":
-            fx_str = self._video_effect_filter_for_overlay(fx_mode, width, height)
-            if fx_str:
-                out_label = f"[v_stage{stage}]"
-                filters.append(f"{last}{fx_str}{out_label}")
-                last = out_label
-                stage += 1
-
-        watermark_file = str(self.settings.get("watermark_file", "") or "").strip()
-        if self.settings.get("watermark_enabled") and watermark_file:
-            watermark = Path(watermark_file)
-            if watermark.exists():
-                cmd += ["-i", str(watermark)]
-                opacity = min(1.0, max(0.0, float(self.settings.get("watermark_opacity", 0.2))))
-                wm_scale = min(3.0, max(0.5, float(self.settings.get("watermark_scale", 1.0))))
-                scaled_w = max(width, int(width * wm_scale))
-                scaled_h = max(height, int(height * wm_scale))
-                wm_label = f"[wm{stage}]"
-                out_label = f"[v_stage{stage}]"
-                filters.append(
-                    f"[{input_index}:v]scale={scaled_w}:{scaled_h}:force_original_aspect_ratio=increase,"
-                    f"crop={width}:{height},format=rgba,colorchannelmixer=aa={opacity}{wm_label}"
-                )
-                filters.append(f"{last}{wm_label}overlay=0:0:format=auto{out_label}")
-                last = out_label
-                input_index += 1
-                stage += 1
-
-        logo_file = str(self.settings.get("logo_file", "") or "").strip()
-        if self.settings.get("logo_enabled") and logo_file:
-            logo = Path(logo_file)
-            if logo.exists():
-                cmd += ["-i", str(logo)]
-                scale = float(self.settings.get("logo_scale", 0.12))
-                logo_width = max(32, int(width * scale))
-                pos = self.settings.get("logo_position", "top_right")
-                margin_x = int(self.settings.get("logo_margin_x", 30))
-                margin_y = int(self.settings.get("logo_margin_y", 30))
-                positions = {
-                    "top_left": f"{margin_x}:{margin_y}",
-                    "top_center": f"(W-w)/2:{margin_y}",
-                    "top_right": f"W-w-{margin_x}:{margin_y}",
-                    "center_left": f"{margin_x}:(H-h)/2",
-                    "center": "(W-w)/2:(H-h)/2",
-                    "center_right": f"W-w-{margin_x}:(H-h)/2",
-                    "bottom_left": f"{margin_x}:H-h-{margin_y}",
-                    "bottom_center": f"(W-w)/2:H-h-{margin_y}",
-                    "bottom_right": f"W-w-{margin_x}:H-h-{margin_y}",
-                }
-                lg_label = f"[lg{stage}]"
-                out_label = f"[v_stage{stage}]"
-                filters.append(f"[{input_index}:v]scale={logo_width}:-1,format=rgba{lg_label}")
-                filters.append(f"{last}{lg_label}overlay={positions.get(pos, positions['top_right'])}:format=auto{out_label}")
-                last = out_label
-                input_index += 1
-                stage += 1
-
-        text_cfg = self.settings.get("text_overlay", {}) or {}
-        content = str(text_cfg.get("content", "")).strip()
-        if text_cfg.get("enabled") and content:
-            out_label = f"[v_stage{stage}]"
-            filters.append(f"{last}{self._drawtext_filter_body(text_cfg, content)}{out_label}")
-            last = out_label
-            stage += 1
-
-        # Subtitle overlay via ASS
-        if sub_ass_file and sub_ass_file.exists():
-            out_label = f"[v_stage{stage}]"
-            ass_path_escaped = str(sub_ass_file.resolve()).replace("\\", "/").replace(":", "\\:")
-            filters.append(f"{last}ass='{ass_path_escaped}'{out_label}")
-            last = out_label
-            stage += 1
+        last, _ = self._build_visual_layers_filtergraph(
+            cmd=cmd,
+            filters=filters,
+            base_label="[v_xfade]",
+            input_index_start=len(clips),
+            width=width,
+            height=height,
+            sub_ass_file=sub_ass_file,
+        )
 
         filters.append(f"{last}format=yuv420p[v]")
 
@@ -1931,8 +2143,15 @@ class RenderEngine:
             raise RuntimeError(f"Không chuyển được file cuối sang output {out}: {exc}") from exc
 
     def _overlay_logo(self, video: Path, logo: Path, out: Path, width: int, height: int) -> None:
-        if not logo.exists():
-            raise FileNotFoundError(f"Không tìm thấy logo: {logo}")
+        resolved = self._resolve_asset_path(str(logo))
+        if not resolved:
+            self.log(f"⚠️ [Bỏ qua Logo] Không tìm thấy logo: {logo}. Tiếp tục render video.")
+            try:
+                shutil.copy2(str(video), str(out))
+            except Exception as e:
+                self.log(f"Lỗi sao chép video tạm: {e}")
+            return
+        logo = resolved
         scale = float(self.settings.get("logo_scale", 0.12))
         logo_width = max(32, int(width * scale))
         pos = self.settings.get("logo_position", "top_right")
@@ -1962,14 +2181,19 @@ class RenderEngine:
         self._run(build(self._video_encode_args()), "Overlay logo", True, lambda: build(self._fallback_cpu_encode_args()))
 
     def _overlay_watermark(self, video: Path, watermark: Path, out: Path, width: int, height: int) -> None:
-        if not watermark.exists():
-            raise FileNotFoundError(f"Không tìm thấy watermark: {watermark}")
+        resolved = self._resolve_asset_path(str(watermark))
+        if not resolved:
+            self.log(f"⚠️ [Bỏ qua Watermark] Không tìm thấy watermark: {watermark}. Tiếp tục render video.")
+            try:
+                shutil.copy2(str(video), str(out))
+            except Exception as e:
+                self.log(f"Lỗi sao chép video tạm: {e}")
+            return
+        watermark = resolved
         opacity = min(1.0, max(0.0, float(self.settings.get("watermark_opacity", 0.2))))
         wm_scale = min(3.0, max(0.5, float(self.settings.get("watermark_scale", 1.0))))
         scaled_w = max(width, int(width * wm_scale))
         scaled_h = max(height, int(height * wm_scale))
-        # Phủ kín toàn bộ khung hình với mọi tỉ lệ: 9:16, 16:9, 1:1, 4:5...
-        # Watermark nằm ở lớp dưới logo/text vì pipeline gọi watermark trước.
         filter_complex = (
             f"[1:v]scale={scaled_w}:{scaled_h}:force_original_aspect_ratio=increase,"
             f"crop={width}:{height},format=rgba,colorchannelmixer=aa={opacity}[wm];"
@@ -2024,7 +2248,51 @@ class RenderEngine:
 
     @staticmethod
     def _escape_drawtext(text: str) -> str:
-        return text.replace("\\", "\\\\").replace("\n", "\\n").replace(":", "\\:").replace("'", "\\'").replace("%", "\\%")
+        # Chuẩn hóa nháy đơn, nháy kép sang typography an toàn tránh vỡ cú pháp FFmpeg Filtergraph:
+        # ' -> ’ (right single quote / apostrophe: It's -> It’s)
+        # " -> ” (right double quote)
+        # ` -> ‘ (left single quote)
+        safe = (
+            str(text)
+            .replace("'", "’")
+            .replace('"', '”')
+            .replace("`", "‘")
+            .replace("\\", "\\\\")
+            .replace("\n", "\\n")
+            .replace(":", "\\:")
+            .replace("%", "\\%")
+        )
+        return safe
+
+    @staticmethod
+    def _find_font_file_by_name(font_name: str, bold: bool = False, italic: bool = False) -> Path | None:
+        font_clean = font_name.lower().strip()
+        win_fonts = Path("C:/Windows/Fonts")
+        if win_fonts.exists():
+            mapping = {
+                "arial": "arialbd.ttf" if bold else ("ariali.ttf" if italic else "arial.ttf"),
+                "times new roman": "timesbd.ttf" if bold else ("timesi.ttf" if italic else "times.ttf"),
+                "tahoma": "tahomabd.ttf" if bold else "tahoma.ttf",
+                "segoe ui": "segoeuib.ttf" if bold else ("segoeuii.ttf" if italic else "segoeui.ttf"),
+                "calibri": "calibrib.ttf" if bold else ("calibrii.ttf" if italic else "calibri.ttf"),
+                "consolas": "consolab.ttf" if bold else ("consolai.ttf" if italic else "consola.ttf"),
+                "comic sans ms": "comicbd.ttf" if bold else "comic.ttf",
+                "verdana": "verdanab.ttf" if bold else ("verdanai.ttf" if italic else "verdana.ttf"),
+                "georgia": "georgiab.ttf" if bold else ("georgiai.ttf" if italic else "georgia.ttf"),
+                "impact": "impact.ttf",
+                "trebuchet ms": "trebucbd.ttf" if bold else "trebuc.ttf",
+            }
+            if font_clean in mapping:
+                f_path = win_fonts / mapping[font_clean]
+                if f_path.exists():
+                    return f_path
+            for f in win_fonts.glob("*.ttf"):
+                if font_clean in f.stem.lower():
+                    return f
+            for f in win_fonts.glob("*.otf"):
+                if font_clean in f.stem.lower():
+                    return f
+        return RenderEngine._default_font_file()
 
     @staticmethod
     def _default_font_file() -> Path | None:

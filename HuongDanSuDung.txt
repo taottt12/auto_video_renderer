@@ -1,0 +1,117 @@
+========================================================================================
+             🎬 SỔ TAY HƯỚNG DẪN SỬ DỤNG CHI TIẾT AUTO VIDEO RENDERER
+                     (Phần Mềm Sản Xuất & Tự Động Hóa Video Đa Kênh)
+========================================================================================
+
+----------------------------------------------------------------------------------------
+📌 PHẦN 1: CÁC FILE KHỞI CHẠY TIỆN ÍCH (1-CLICK)
+----------------------------------------------------------------------------------------
+1. [ ChayTool.bat ] hoặc [ ChayTool.vbs ] (hoặc [ run.bat ]):
+   👉 Nhấp đúp để MỞ ỨNG DỤNG.
+   👉 Tự động kiểm tra Python & thư viện, sau đó TỰ ĐỘNG ĐÓNG CỬA SỔ CMD ĐEN ngay khi giao diện đồ họa mở lên (hoặc dùng ChayTool.vbs để ẩn 100% không nháy CMD). Không lo bấm nhầm tắt tool!
+
+2. [ KiemTraPhanCung.bat ]:
+   👉 Tự động quét Card màn hình (NVIDIA RTX/GTX, AMD, Intel) và số luồng CPU của máy bạn.
+   👉 Tự động cấu hình tối ưu:
+      + Nếu có NVIDIA: Kích hoạt render GPU NVENC + Whisper AI GPU (float16) siêu tốc.
+      + Nếu dùng CPU: Kích hoạt render CPU libx264 đa luồng + Whisper CPU (int8) mượt mà.
+
+3. [ DongGoiTool.bat ]:
+   👉 1-Click tự động xóa sạch 100% API key, Token kênh YouTube, đường dẫn riêng tư của bạn
+      và nén thành file ZIP sạch sẵn sàng gửi cho người khác sử dụng.
+
+
+----------------------------------------------------------------------------------------
+📌 PHẦN 2: HƯỚNG DẪN CHI TIẾT TỪNG TAB TRÊN GIAO DIỆN PHẦN MỀM
+----------------------------------------------------------------------------------------
+
+🔷 TAB 1: 🎧 CÀO MP3 (CRAWLER)
+   - Chức năng: Tải âm thanh chất lượng cao từ YouTube, TikTok hoặc liên kết trực tiếp.
+   - Các chế độ tải:
+     + Theo Video: Dán 1 hoặc nhiều link video (YouTube / TikTok).
+     + Theo Playlist: Dán link danh sách phát (có ô giới hạn số lượng bài tải).
+     + Theo Toàn Kênh: Quét video theo khoảng thời gian (Từ ngày... Đến ngày...).
+   - Tính năng nâng cao:
+     + Cắt đầu / Cắt đuôi Audio: Tự động cắt bỏ đoạn nhạc dạo đầu hoặc đoạn quảng cáo cũ.
+     + Tự động chuyển danh sách: Âm thanh tải về sẽ tự động nạp sang Tab Render.
+
+🔷 TAB 2: ⚙️ CÀI ĐẶT (SETTING)
+   - 1. Cấu hình Xuất Video (Export Settings):
+     + Tỉ lệ khung hình: 16:9 (Video dài YouTube), 9:16 (Shorts / TikTok / Reels), 1:1, 4:3.
+     + Độ phân giải: 1080p Full HD (1920x1080), 2K, 4K, 720p.
+     + Tốc độ khung hình (FPS): 24, 30, 60 FPS. Tùy chỉnh Bitrate và định dạng (MP4/MKV).
+   - 2. Hiệu ứng Chuyển động Ảnh (Image Motion & Transitions):
+     + Hiệu ứng Ken Burns: Auto Smart, Pan Trái/Phải, Zoom In, Zoom Out, Nhịp thở (Pulse)...
+     + Thời lượng mỗi ảnh: Đặt số giây cố định hoặc Auto chia đều theo bài nhạc.
+     + Hiệu ứng chuyển cảnh (Transitions): Hòa tan (Fade), Cắt mềm (Soft Transition)...
+   - 3. Lớp phủ Hiệu ứng Video (Video Effects & Overlays):
+     + Bụi sáng phát quang (Dust Particles), Mưa rơi (Rain), Ánh sáng rò rỉ (Light Leak),
+       Mờ góc điện ảnh (Vignette), Tăng cường màu sắc rực rỡ (Color Boost).
+   - 4. Nhạc Nền (Background Music - BGM):
+     + Bật/Tắt nhạc nền, nạp danh sách nhạc nền BGM, chỉnh âm lượng (15% - 25%), lặp lại (Loop).
+   - 5. Nhạc Quảng Cáo & Kêu Gọi Đăng Ký (Promo Audio & Ducking):
+     + Chèn file âm thanh kêu gọi đăng ký vào các mốc thời gian cố định.
+     + Tính năng Né Tiếng (Audio Ducking): Tự động giảm âm lượng nhạc khi giọng đọc vang lên.
+   - 6. Watermark & Logo Kênh:
+     + Chèn Logo ở góc (tùy chỉnh vị trí, kích thước và lề).
+     + Chèn Watermark mờ chống Reup phủ toàn khung hình.
+   - 7. Hiệu Năng & Tăng Tốc Phần Cứng:
+     + Chọn Render bằng Card đồ họa NVIDIA NVENC (siêu nhanh) hoặc CPU libx264.
+     + Số luồng render song song (Max Parallel Jobs), tự động dọn rác bộ nhớ tạm.
+
+🔷 TAB 3: 🎨 STUDIO LAYOUT (THIẾT KẾ BỐ CỤC TRỰC QUAN KÉO THẢ)
+   - Màn hình Canvas tương tác:
+     + Dùng chuột kéo thả di chuyển vị trí, kéo dãn kích thước các phần tử trực tiếp.
+     + Layer Text: Đặt tiêu đề truyện/bài hát, tên tác giả, tên kênh với font chữ, viền, bóng.
+     + Layer Subtitle: Tùy biến khung hiển thị phụ đề AI.
+     + Layer GIF / Sóng âm: Chèn GIF sóng âm nhảy theo nhạc (Soundwave), hiệu ứng động.
+     + Layer Khung ảnh / Logo: Đặt khung viền tùy biến cho video.
+   - Mẫu Bố Cục Có Sẵn (Preset Layouts):
+     + ⭐ Mẫu Truyện Audio Chuẩn 1080p: Phụ đề lớn nổi bật, tiêu đề phía dưới.
+     + ⭐ Mẫu Radio Drama / Livestream: Bố cục nghệ thuật kèm sóng âm và phụ đề.
+     + ⭐ Mẫu Podcast Đêm Khuya: Tone tối sang trọng, phụ đề đổi màu Karaoke cuốn hút.
+   - Quản lý Mẫu riêng: Tự do sáng tạo layout mới và bấm nút "Lưu Thành Mẫu Mới".
+
+🔷 TAB 4: 🚀 RENDER (QUẢN LÝ NGUỒN VÀO & XUẤT VIDEO)
+   - 1. Cột Danh Sách Audio Chính:
+     + Nạp file MP3 từ máy hoặc nhận tự động từ Tab Cào MP3.
+     + Nút sắp xếp thông minh theo số tập: Sắp xếp tự nhiên (P1, P2... P10, P32), A➔Z, Z➔A, Đẩy lên/xuống.
+   - 2. Cột Nghe Thử Audio (Player):
+     + Nghe thử âm thanh trực tiếp, có thanh trượt tua thời gian và chỉnh âm lượng.
+   - 3. Cột Media (Hình Ảnh / Video Nền) & Xem Trước:
+     + Nạp danh sách ảnh/video nền từ máy.
+     + Tùy chọn Xáo trộn (Shuffle), Tránh trùng lặp ảnh (Avoid Repeat).
+     + Xem trước ảnh/video ngay trên khung Preview.
+   - 4. Bảng Tiến Trình Render & Nút Điều Khiển:
+     + Nút "Quản lý dự án": Lưu hoặc mở lại các dự án video đã làm (.avr.json).
+     + Nút "Bắt đầu Render tất cả": Tự động render toàn bộ danh sách hàng loạt.
+     + Tạo Phụ Đề AI Whisper Tự Động: Tự động quét giọng nói và xuất phụ đề theo 2 kiểu:
+       * Cinema Hold: Gom cụm từ mượt mà như rạp chiếu phim.
+       * Karaoke Highlight: Chữ chạy đổi màu từng từ chuẩn xác 100% theo nhịp giọng đọc.
+     + Nút "Xem thư mục xuất": Mở ngay thư mục chứa video thành phẩm (`src_app\data\output\`).
+
+🔷 TAB 5: 📺 ĐĂNG YOUTUBE (QUẢN LÝ KÊNH & AI HẸN GIỜ TỰ ĐỘNG)
+   - Quản lý Kênh YouTube: Kết nối nhiều kênh YouTube bằng OAuth 2.0 an toàn và bảo mật.
+   - Trợ lý AI Thông Minh (Gemini / 9Router / Groq / Offline):
+     + Tùy chọn linh hoạt các thành phần muốn AI sinh tự động:
+       * [☑ Tạo Tiêu Đề]: Tự động viết lại tiêu đề chuẩn SEO cuốn hút (Bỏ chọn nếu muốn GIỮ NGUYÊN tên video gốc).
+       * [☑ Tạo Mô Tả]: Tự động phân tích nội dung để viết mô tả video chi tiết chuẩn SEO.
+       * [☑ Tạo Tags]: Tự động sinh bộ thẻ từ khóa và hashtag tối ưu đề xuất tìm kiếm.
+       * [☑ Tạo Chữ Thumbnail & Prompt]: Tự động trích xuất chữ nổi bật và Prompt tạo ảnh bìa.
+   - Tự Động Tạo Ảnh Thumbnail (Ảnh Bìa):
+     + Tự động bắt khung hình đẹp nhất của video, ghép chữ nghệ thuật và huy hiệu bắt mắt.
+   - Hẹn Giờ Tự Động (Auto Scheduler):
+     + Tự động chia đều các video cần đăng vào các khung giờ vàng trong ngày (ví dụ: 11:30, 19:30).
+     + Đặt chế độ: Công chiếu (Premiere), Riêng tư (Private), hoặc Lên lịch (Schedule).
+
+
+----------------------------------------------------------------------------------------
+📌 PHẦN 3: QUY TRÌNH 3 BƯỚC LÀM VIDEO TỰ ĐỘNG HOÀN CHỈNH
+----------------------------------------------------------------------------------------
+1. BƯỚC 1: Vào Tab "Cào MP3" tải audio hoặc vào Tab "Render" bấm "Thêm audio từ máy".
+2. BƯỚC 2: Tại Tab "Render", bấm "Thêm media" để chọn các ảnh/video nền; vào Tab "Studio Layout" chọn Mẫu giao diện bạn thích.
+3. BƯỚC 3: Tại Tab "Render", bấm [ BẮT ĐẦU RENDER TẤT CẢ ] -> Nhận video thành phẩm tại thư mục `src_app\data\output\`!
+
+========================================================================================
+                CHÚC BẠN TẠO RA HÀNG TRĂM VIDEO CHẤT LƯỢNG VÀ THÀNH CÔNG!
+========================================================================================

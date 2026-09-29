@@ -18,7 +18,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem,
     QTextEdit, QProgressBar, QMessageBox, QAbstractItemView, QGroupBox, QListWidget,
-    QFileDialog, QCheckBox, QLabel, QSlider, QFrame, QSplitter, QHeaderView
+    QFileDialog, QCheckBox, QLabel, QSlider, QFrame, QSplitter, QHeaderView, QComboBox
 )
 
 from core.media_utils import (
@@ -416,6 +416,29 @@ class RenderTab(QWidget):
         # ====================================================
         # 2. KHU VỰC DƯỚI: ĐIỀU KHIỂN & HÀNG ĐỢI RENDER (QUEUE)
         # ====================================================
+        # Thanh chọn Mẫu Bố Cục Video (Studio Layout)
+        layout_preset_bar = QHBoxLayout()
+        layout_preset_bar.addWidget(QLabel("<b>🎨 Mẫu Bố Cục Render:</b>"))
+        self.render_layout_combo = QComboBox()
+        self.render_layout_combo.setMinimumWidth(260)
+        self._reload_render_layout_presets()
+        self.render_layout_combo.currentIndexChanged.connect(self._on_render_layout_changed)
+        layout_preset_bar.addWidget(self.render_layout_combo)
+
+        self.refresh_presets_btn = QPushButton("🔄 Nạp lại mẫu")
+        self.refresh_presets_btn.setToolTip("Quét lại các mẫu bố cục mới tạo từ tab Studio Layout")
+        self.refresh_presets_btn.clicked.connect(self._reload_render_layout_presets)
+        layout_preset_bar.addWidget(self.refresh_presets_btn)
+        layout_preset_bar.addSpacing(15)
+
+        self.chk_delete_audio_after_render = QCheckBox("🗑 Xóa file MP3 nguồn khi render xong")
+        self.chk_delete_audio_after_render.setToolTip("Khi render video hoàn tất thành công, tự động xóa file MP3 audio nguồn để giải phóng dung lượng ổ đĩa.")
+        self.chk_delete_audio_after_render.setStyleSheet("color: #ff9800; font-weight: bold; font-size: 11px;")
+        self.chk_delete_audio_after_render.stateChanged.connect(self._on_render_options_changed)
+        layout_preset_bar.addWidget(self.chk_delete_audio_after_render)
+        layout_preset_bar.addStretch(1)
+        root.addLayout(layout_preset_bar)
+
         buttons = QHBoxLayout()
         self.run_btn = QPushButton("▶ Chạy render")
         self.run_btn.setStyleSheet("font-weight: bold; font-size: 13px; padding: 6px 16px; background-color: #2e7d32; color: white; border-radius: 4px;")
@@ -424,11 +447,6 @@ class RenderTab(QWidget):
         self.project_btn = QPushButton("📁 Dự án")
         self.change_out_btn = QPushButton("📂 Đổi thư mục xuất")
         self.change_out_btn.clicked.connect(self._change_output_folder)
-
-        self.chk_delete_audio_after_render = QCheckBox("🗑 Xóa file MP3 nguồn khi render xong")
-        self.chk_delete_audio_after_render.setToolTip("Khi render video hoàn tất thành công, tự động xóa file MP3 audio nguồn để giải phóng dung lượng ổ đĩa.")
-        self.chk_delete_audio_after_render.setStyleSheet("color: #ff9800; font-weight: bold; font-size: 11px;")
-        self.chk_delete_audio_after_render.stateChanged.connect(self._on_render_options_changed)
 
         self.project_info_label = QLabel("Dự án: Chưa lưu")
         self.project_info_label.setStyleSheet("color: #2e7d32; font-weight: bold; font-size: 11px;")
@@ -449,8 +467,6 @@ class RenderTab(QWidget):
         buttons.addWidget(self.change_out_btn)
         buttons.addWidget(self.project_info_label)
         buttons.addWidget(self.out_info_label)
-        buttons.addSpacing(10)
-        buttons.addWidget(self.chk_delete_audio_after_render)
         buttons.addSpacing(15)
         buttons.addWidget(self.remove_btn)
         buttons.addWidget(self.clear_btn)
@@ -780,18 +796,25 @@ class RenderTab(QWidget):
         self._update_project_labels()
 
     def _change_output_folder(self) -> None:
-        current = self.settings.get("export", {}).get("output_folder", "") or self.settings.get("project", {}).get("output_folder", "")
-        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục xuất video", current)
+        current = self.settings.get("project", {}).get("output_folder", "") or self.settings.get("export", {}).get("output_folder", "")
+        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục xuất video của dự án", current)
         if folder:
             self.settings.setdefault("export", {})["output_folder"] = folder
             self.settings.setdefault("project", {})["output_folder"] = folder
+            curr_p_path = self.settings.get("project", {}).get("current_path")
+            if curr_p_path and Path(curr_p_path).exists():
+                try:
+                    from core.settings import SettingsManager
+                    SettingsManager.save_project(curr_p_path, self.settings)
+                except Exception:
+                    pass
             self._update_project_labels()
             self.settings_changed.emit(self.settings)
 
     def _update_project_labels(self) -> None:
         p_name = self.settings.get("project", {}).get("current_name") or "Chưa lưu"
         self.project_info_label.setText(f"Dự án: {p_name}")
-        out = self.settings.get("export", {}).get("output_folder") or "output"
+        out = self.settings.get("project", {}).get("output_folder") or self.settings.get("export", {}).get("output_folder") or "output"
         disp = out if len(out) <= 35 else f"...{out[-30:]}"
         self.out_info_label.setText(f"Xuất: {disp}")
         self.out_info_label.setToolTip(f"Thư mục xuất video: {out}")
@@ -832,6 +855,168 @@ class RenderTab(QWidget):
     def selected_rows(self) -> List[int]:
         return sorted({index.row() for index in self.table.selectedIndexes()})
 
+    def _validate_before_render(self) -> bool:
+        """Kiểm tra toàn bộ tài nguyên (Watermark, Logo, Layer Mask, Media, Audio, Nhạc nền) TRƯỚC KHI chạy render."""
+        # 1. Kiểm tra Watermark
+        if self.settings.get("watermark_enabled"):
+            wm_file = str(self.settings.get("watermark_file", "")).strip()
+            if wm_file:
+                if not os.path.exists(wm_file):
+                    # Thử tìm trên các ổ đĩa khác
+                    alt_found = None
+                    for drive in ["F:", "E:", "D:", "C:"]:
+                        if len(wm_file) > 2 and wm_file[1] == ":":
+                            cand = drive + wm_file[2:]
+                            if os.path.exists(cand):
+                                alt_found = cand
+                                break
+                    if alt_found:
+                        self.settings["watermark_file"] = alt_found
+                        self.append_log(f"💡 Đã tự động chuyển đường dẫn Watermark sang: {alt_found}")
+                    else:
+                        reply = QMessageBox.question(
+                            self,
+                            "Thiếu ảnh Watermark",
+                            f"Không tìm thấy file Watermark tại:\n{wm_file}\n\nBạn có muốn TẮT Watermark để tiếp tục render không?",
+                            QMessageBox.Yes | QMessageBox.No,
+                            QMessageBox.Yes,
+                        )
+                        if reply == QMessageBox.Yes:
+                            self.settings["watermark_enabled"] = False
+                            self.append_log("⚠️ Đã tự động tắt Watermark cho phiên render này do không tìm thấy file.")
+                        else:
+                            return False
+
+        # 2. Kiểm tra Logo
+        if self.settings.get("logo_enabled"):
+            logo_file = str(self.settings.get("logo_file", "")).strip()
+            if logo_file:
+                if not os.path.exists(logo_file):
+                    alt_found = None
+                    for drive in ["F:", "E:", "D:", "C:"]:
+                        if len(logo_file) > 2 and logo_file[1] == ":":
+                            cand = drive + logo_file[2:]
+                            if os.path.exists(cand):
+                                alt_found = cand
+                                break
+                    if alt_found:
+                        self.settings["logo_file"] = alt_found
+                        self.append_log(f"💡 Đã tự động chuyển đường dẫn Logo sang: {alt_found}")
+                    else:
+                        reply = QMessageBox.question(
+                            self,
+                            "Thiếu ảnh Logo",
+                            f"Không tìm thấy file Logo tại:\n{logo_file}\n\nBạn có muốn TẮT Logo để tiếp tục render không?",
+                            QMessageBox.Yes | QMessageBox.No,
+                            QMessageBox.Yes,
+                        )
+                        if reply == QMessageBox.Yes:
+                            self.settings["logo_enabled"] = False
+                            self.append_log("⚠️ Đã tự động tắt Logo cho phiên render này do không tìm thấy file.")
+                        else:
+                            return False
+
+        # 3. Kiểm tra Layer Mask / Video Effect
+        fx_mode = str(self.settings.get("video_effect_mode", "none") or "none")
+        if fx_mode == "custom":
+            fx_file = str(self.settings.get("video_effect_custom_file", "")).strip()
+            if fx_file and not os.path.exists(fx_file):
+                self.settings["video_effect_enabled"] = False
+                self.append_log(f"⚠️ Không tìm thấy file hiệu ứng tùy chỉnh: {fx_file}. Tự động tắt hiệu ứng.")
+
+        # 4. Kiểm tra Outro / Intro
+        for intro_key, label in [("intro_file", "Intro"), ("outro_file", "Outro")]:
+            f_path = str(self.settings.get(intro_key, "")).strip()
+            if f_path and not os.path.exists(f_path):
+                alt_found = None
+                for drive in ["F:", "E:", "D:", "C:"]:
+                    if len(f_path) > 2 and f_path[1] == ":":
+                        cand = drive + f_path[2:]
+                        if os.path.exists(cand):
+                            alt_found = cand
+                            break
+                if alt_found:
+                    self.settings[intro_key] = alt_found
+                    self.append_log(f"💡 Đã tự động chuyển đường dẫn {label} sang: {alt_found}")
+                else:
+                    self.append_log(f"⚠️ Không tìm thấy video {label}: {f_path}. Sẽ bỏ qua {label}.")
+                    self.settings[intro_key] = ""
+
+        # 5. Kiểm tra Media Files (ảnh/video nền)
+        media_files = [self.media_list.item(i).text() for i in range(self.media_list.count())]
+        valid_media = []
+        for m in media_files:
+            m_str = str(m).strip()
+            if not m_str:
+                continue
+            if os.path.exists(m_str):
+                valid_media.append(m_str)
+            else:
+                alt_found = None
+                for drive in ["F:", "E:", "D:", "C:"]:
+                    if len(m_str) > 2 and m_str[1] == ":":
+                        cand = drive + m_str[2:]
+                        if os.path.exists(cand):
+                            alt_found = cand
+                            break
+                if alt_found:
+                    valid_media.append(alt_found)
+                else:
+                    self.append_log(f"⚠️ Bỏ qua media không tồn tại: {m_str}")
+
+        if not valid_media:
+            QMessageBox.warning(self, "Thiếu media", "Không tìm thấy file ảnh/video nền nào hợp lệ trên máy.")
+            return False
+        self.settings["media_files"] = valid_media
+
+        return True
+
+    def _reload_render_layout_presets(self) -> None:
+        try:
+            from .layout_tab import get_all_layout_presets
+            presets = get_all_layout_presets()
+        except Exception:
+            presets = {}
+
+        if not hasattr(self, "render_layout_combo"):
+            return
+
+        curr_key = self.settings.get("layout_studio", {}).get("selected_preset", "default")
+        self.render_layout_combo.blockSignals(True)
+        self.render_layout_combo.clear()
+        self.render_layout_combo.addItem("⚙️ Đang mở trên Studio (Không ghi đè)", "__current__")
+        for k, v in presets.items():
+            self.render_layout_combo.addItem(v["name"], k)
+
+        idx = self.render_layout_combo.findData(curr_key)
+        if idx >= 0:
+            self.render_layout_combo.setCurrentIndex(idx)
+        else:
+            self.render_layout_combo.setCurrentIndex(0)
+        self.render_layout_combo.blockSignals(False)
+
+    def _on_render_layout_changed(self, idx: int) -> None:
+        key = self.render_layout_combo.currentData()
+        if not key or key == "__current__":
+            return
+        try:
+            from .layout_tab import get_all_layout_presets
+            presets = get_all_layout_presets()
+            if key in presets:
+                preset = presets[key]
+                if "layout_studio" not in self.settings:
+                    self.settings["layout_studio"] = {}
+                self.settings["layout_studio"]["layers"] = copy.deepcopy(preset.get("layers", []))
+                self.settings["layout_studio"]["selected_preset"] = key
+                self.settings_changed.emit(self.settings)
+        except Exception:
+            pass
+
+    def update_settings(self, settings: Dict[str, Any]) -> None:
+        self.settings = settings
+        if hasattr(self, "render_layout_combo"):
+            self._reload_render_layout_presets()
+
     def start_render(self) -> None:
         if self.worker and self.worker.isRunning():
             QMessageBox.information(self, "Đang render", "Tool đang render, hãy dừng hoặc đợi hoàn thành.")
@@ -839,11 +1024,25 @@ class RenderTab(QWidget):
 
         self._stop_playback()
 
-        media_files = [self.media_list.item(i).text() for i in range(self.media_list.count())]
-        if not media_files:
-            QMessageBox.warning(self, "Thiếu media", "Bạn chưa chọn ảnh/video nền trong danh sách Media.")
+        # Áp dụng mẫu layout được chọn nếu có
+        if hasattr(self, "render_layout_combo"):
+            chosen_preset_key = self.render_layout_combo.currentData()
+            if chosen_preset_key and chosen_preset_key != "__current__":
+                try:
+                    from .layout_tab import get_all_layout_presets
+                    presets = get_all_layout_presets()
+                    if chosen_preset_key in presets:
+                        preset = presets[chosen_preset_key]
+                        if "layout_studio" not in self.settings:
+                            self.settings["layout_studio"] = {}
+                        self.settings["layout_studio"]["layers"] = copy.deepcopy(preset.get("layers", []))
+                        self.settings["layout_studio"]["selected_preset"] = chosen_preset_key
+                except Exception:
+                    pass
+
+        if not self._validate_before_render():
             return
-        self.settings["media_files"] = media_files
+
         self.settings["delete_audio_after_render"] = self.chk_delete_audio_after_render.isChecked()
 
         rows = self.selected_rows() or list(range(self.table.rowCount()))

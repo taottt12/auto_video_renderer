@@ -34,12 +34,15 @@ def clean_episode_badge(ep: str, fallback_idx: Optional[int] = None) -> str:
     if not ep:
         return f"P{fallback_idx}" if fallback_idx is not None else ""
 
+    # Bỏ extension nếu truyền cả tên file (ví dụ .mp4, .mkv)
+    ep_clean = Path(ep).stem if "." in ep else ep
+
     # Chuẩn hóa khoảng trắng và gạch ngang/gạch dưới để dễ nhận diện
-    normalized = re.sub(r"[_\-]+", " ", ep).strip()
+    normalized = re.sub(r"[_\-]+", " ", ep_clean).strip()
 
     # Tìm các mẫu số tập hợp lệ rõ ràng: P1, P10, Tập 1, Tap 1, Phần 2, Phan 2, Ep 3, Chương 5... (1 đến 4 chữ số)
     m = re.search(
-        r"(?:^|[\s\[\(_\-])(?:p\s*(\d{1,4}[a-zA-Z]?)|(?:tập|tap)\s*(\d{1,4}[a-zA-Z]?)|(?:phần|phan)\s*(\d{1,4}[a-zA-Z]?)|(?:chương|chuong)\s*(\d{1,4}[a-zA-Z]?)|(?:ep|episode)\s*(\d{1,4}[a-zA-Z]?))(?:$|[\s\]\)_:\-])",
+        r"(?:^|[\s\[\(_\-])(?:p\s*(\d{1,4}[a-zA-Z]?)|(?:tập|tap)\s*(\d{1,4}[a-zA-Z]?)|(?:phần|phan)\s*(\d{1,4}[a-zA-Z]?)|(?:chương|chuong)\s*(\d{1,4}[a-zA-Z]?)|(?:ep|episode)\s*(\d{1,4}[a-zA-Z]?))(?:$|[\s\]\)_:\.\-])",
         normalized,
         re.IGNORECASE
     )
@@ -49,7 +52,7 @@ def clean_episode_badge(ep: str, fallback_idx: Optional[int] = None) -> str:
                 return f"P{num.upper().strip()}"
 
     # Kiểm tra dạng ngoặc hoặc ký hiệu bao bọc: [P1], (P1), _P1_, - P1 -
-    m_bracket = re.search(r"[\[\(_\-\s](?:p|ep|tập|tap|phần|phan)\s*(\d{1,4}[a-zA-Z]?)[\]\)_\-\s]", ep, re.IGNORECASE)
+    m_bracket = re.search(r"[\[\(_\-\s](?:p|ep|tập|tap|phần|phan)\s*(\d{1,4}[a-zA-Z]?)[\]\)_\-\s]", ep_clean, re.IGNORECASE)
     if m_bracket:
         return f"P{m_bracket.group(1).upper().strip()}"
 
@@ -64,20 +67,24 @@ def extract_clean_video_title(filename_or_stem: str) -> str:
     - Bỏ phần mở rộng (.mp4, .mkv...)
     - Bỏ mã số ID video dài (>=7 chữ số) ở đầu (ví dụ 19 số TikTok/Douyin: 7672309670169562394_)
     - Bỏ các hậu tố kỹ thuật (_vi_xuly, _xuly, _output, _hd, _merged, _converted...)
-    - Bỏ tiền tố/hậu tố số tập nếu có (đã có badge riêng) để tránh trùng lặp
-    - Chuyển dấu gạch dưới thành khoảng trắng
+    - Bỏ tiền tố/hậu tố/giữa số tập (P1, Tập 1, Phần 1, Ep 1, Chương 1...) để lấy đúng tên gốc của bộ truyện
+    - Chuyển dấu gạch dưới thành khoảng trắng và chuẩn hóa khoảng trắng thừa
     """
     stem = Path(filename_or_stem).stem
-    # Bỏ mã ID dạng số dài (>=7 số) ở đầu: ví dụ 7672309670169562394_
+    # Bỏ mã ID dạng số dài (>=7 số) ở đầu
     t = re.sub(r"^\d{7,}[_\-\s]+", "", stem)
     # Bỏ hậu tố kỹ thuật ở đuôi
     t = re.sub(r"([_\-\s]+(vi_xuly|xuly|output|final|converted|render|1080p|720p|hd|sub))+$", "", t, flags=re.IGNORECASE)
-    # Bỏ tiền tố số tập ở đầu nếu có (đã có badge riêng)
-    t = re.sub(r"^(?:p\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?)[\s:\-_]+", "", t, flags=re.IGNORECASE).strip()
-    # Bỏ số tập ở đuôi nếu có (ví dụ _Tap_3, - Tập 3, _P3)
-    t = re.sub(r"[\s:\-_]+(?:p\s*\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?)$", "", t, flags=re.IGNORECASE).strip()
+    # Bỏ các định danh tập ở đầu
+    t = re.sub(r"^(?:\[?(?:p\s*\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?|(?:chương|chuong)\s*\d{1,4}[a-zA-Z]?|(?:ep|episode)\s*\d{1,4}[a-zA-Z]?)\]?)[\s:\-_]+", "", t, flags=re.IGNORECASE).strip()
+    # Bỏ các định danh tập ở đuôi
+    t = re.sub(r"[\s:\-_]+(?:\[?(?:p\s*\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?|(?:chương|chuong)\s*\d{1,4}[a-zA-Z]?|(?:ep|episode)\s*\d{1,4}[a-zA-Z]?)\]?)$", "", t, flags=re.IGNORECASE).strip()
+    # Bỏ định danh tập ở giữa (ví dụ: [P1], (P1), hoặc - P1 -)
+    t = re.sub(r"[\s\-_]+\[(?:p\s*\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?|(?:ep|episode)\s*\d{1,4}[a-zA-Z]?)\][\s\-_]*", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"[\s\-_]+\((?:p\s*\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?|(?:ep|episode)\s*\d{1,4}[a-zA-Z]?)\)[\s\-_]*", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"[\s:\-_]+(?:p\s*\d{1,4}[a-zA-Z]?|(?:tập|tap)\s*\d{1,4}[a-zA-Z]?|(?:phần|phan)\s*\d{1,4}[a-zA-Z]?|(?:chương|chuong)\s*\d{1,4}[a-zA-Z]?|(?:ep|episode)\s*\d{1,4}[a-zA-Z]?)[\s:\-_]+", " ", t, flags=re.IGNORECASE)
     t = t.replace("_", " ")
-    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s+", " ", t).strip(" -_:")
     return t
 
 
@@ -246,6 +253,98 @@ SUPPORTED_LANGUAGES: Dict[str, Dict[str, str]] = {
 }
 
 
+PRESET_COUNTRIES: Dict[str, Dict[str, Any]] = {
+    "ph": {
+        "label": "🇵🇭 Philippines (Drama/Radio Stories)",
+        "language_code": "tl",
+        "audio_language": "tl",
+        "country_name": "Philippines",
+        "location_name": "Manila, Philippines",
+        "latitude": 14.5995,
+        "longitude": 120.9842,
+        "tz_offset": 8.0,
+        "culture": "Philippines TV drama, radio stories, heart-wrenching emotional family romance (e.g. May Pangako Ang Bukas, TMT Radio Stories)",
+    },
+    "us": {
+        "label": "🇺🇸 Hoa Kỳ / Toàn Cầu (English)",
+        "language_code": "en",
+        "audio_language": "en",
+        "country_name": "United States",
+        "location_name": "New York, United States",
+        "latitude": 40.7128,
+        "longitude": -74.0060,
+        "tz_offset": -5.0,
+        "culture": "Global YouTube viral drama / audio storytelling format",
+    },
+    "vn": {
+        "label": "🇻🇳 Việt Nam (Truyện Audio/Drama)",
+        "language_code": "vi",
+        "audio_language": "vi",
+        "country_name": "Vietnam",
+        "location_name": "Vietnam",
+        "latitude": 14.0583,
+        "longitude": 108.2772,
+        "tz_offset": 7.0,
+        "culture": "Vietnam YouTube drama / truyện audio tình cảm tâm lý xã hội",
+    },
+    "jp": {
+        "label": "🇯🇵 Nhật Bản (Voice Drama/Anime)",
+        "language_code": "ja",
+        "audio_language": "ja",
+        "country_name": "Japan",
+        "location_name": "Tokyo, Japan",
+        "latitude": 35.6762,
+        "longitude": 139.6503,
+        "tz_offset": 9.0,
+        "culture": "Japanese voice drama / audio novel",
+    },
+    "th": {
+        "label": "🇹🇭 Thái Lan (Lakorn Drama)",
+        "language_code": "th",
+        "audio_language": "th",
+        "country_name": "Thailand",
+        "location_name": "Bangkok, Thailand",
+        "latitude": 13.7563,
+        "longitude": 100.5018,
+        "tz_offset": 7.0,
+        "culture": "Thailand Lakorn emotional drama / romance audio series",
+    },
+    "id": {
+        "label": "🇮🇩 Indonesia (Sinetron/Kisah)",
+        "language_code": "id",
+        "audio_language": "id",
+        "country_name": "Indonesia",
+        "location_name": "Jakarta, Indonesia",
+        "latitude": -6.2088,
+        "longitude": 106.8456,
+        "tz_offset": 7.0,
+        "culture": "Indonesian sinetron / kisah drama audio",
+    },
+    "es": {
+        "label": "🇪🇸 Tây Ban Nha / Mỹ Latinh (Telenovela)",
+        "language_code": "es",
+        "audio_language": "es",
+        "country_name": "Spain / Latin America",
+        "location_name": "Madrid, Spain",
+        "latitude": 40.4168,
+        "longitude": -3.7038,
+        "tz_offset": 1.0,
+        "culture": "Spanish telenovela / radionovela drama series",
+    },
+    "custom": {
+        "label": "⚙️ Tùy Chỉnh Khác...",
+        "language_code": "",
+        "audio_language": "",
+        "country_name": "",
+        "location_name": "",
+        "latitude": None,
+        "longitude": None,
+        "tz_offset": 7.0,
+        "culture": "Global YouTube",
+    }
+}
+
+
 class OfflineSEOAssistant:
     """Bộ tạo nội dung & tiêu đề truyện audio chuẩn SEO YouTube hoàn toàn MIỄN PHÍ & OFFLINE."""
 
@@ -337,16 +436,18 @@ class OfflineSEOAssistant:
 
         hook = hooks_pool[hook_idx]
 
-        # Tiêu đề chuẩn SEO YouTube (< 100 ký tự)
+        # Tiêu đề chuẩn SEO YouTube đồng bộ 100% tên bộ truyện
         if badge:
-            candidate_title = f"{badge}: {clean_title} - {hook} | {ch_name}"
+            candidate_title = f"{clean_title} - {badge} | {ch_name}"
+            if len(candidate_title) > 98:
+                candidate_title = f"{clean_title} - {badge}"
         else:
-            candidate_title = f"{clean_title} - {hook} | {ch_name}"
+            candidate_title = f"{clean_title} | {ch_name}"
+            if len(candidate_title) > 98:
+                candidate_title = clean_title
 
         if len(candidate_title) > 98:
-            candidate_title = f"{badge}: {clean_title} | {ch_name}" if badge else f"{clean_title} | {ch_name}"
-            if len(candidate_title) > 98:
-                candidate_title = candidate_title[:95] + "..."
+            candidate_title = candidate_title[:95] + "..."
 
         # Trích xuất chữ to nổi bật trực tiếp từ tiêu đề vừa tạo
         hl_text = extract_highlight_from_title(candidate_title)
@@ -869,5 +970,122 @@ class ThumbnailPromptGenerator:
             f'- Bottom right corner: A rectangular broadcast badge labeled "{channel_badge_name}" alongside a vibrant red diagonal "NEW ARRIVAL" ribbon banner.\n\n'
             f"High-contrast TV drama aesthetic, ultra-sharp focus, rich color saturation, 16:9 aspect ratio."
         )
+
+
+def translate_video_metadata(
+    title: str,
+    description: str = "",
+    tags: str = "",
+    target_language: str = "tl",
+    provider: str = "9router",
+    api_key: str = "",
+    model: str = "",
+    custom_base_url: str = "",
+    channel_name: str = "",
+) -> Dict[str, str]:
+    """Dịch và bản địa hóa Tiêu đề, Mô tả và Tags sang ngôn ngữ quốc gia đích chuẩn SEO YouTube."""
+    lang_info = SUPPORTED_LANGUAGES.get(target_language, SUPPORTED_LANGUAGES.get("vi", {}))
+    lang_name = lang_info.get("english_name", "Tagalog / Filipino")
+    lang_culture = lang_info.get("culture", "YouTube Drama")
+    clean_ch = re.sub(r"\(.*?\)", "", channel_name or "").strip() or "Radio Drama"
+
+    clean_title = (title or "").strip()
+    clean_desc = (description or "").strip()
+    clean_tags = (tags or "").strip()
+
+    prompt = f"""Bạn là chuyên gia dịch thuật & bản địa hóa YouTube SEO cho thị trường: {lang_culture}.
+NGÔN NGỮ ĐÍCH BẮT BUỘC: {lang_name} ({target_language}).
+
+Nhiệm vụ:
+1. Dịch và biến đổi Tiêu đề gốc dưới đây sang {lang_name} cực kỳ cuốn hút, giật gân chuẩn văn phong YouTube của thị trường đó, độ dài TUYỆT ĐỐI KHÔNG vượt quá 95 ký tự.
+2. Dịch phần Mô tả sang {lang_name}, giữ nguyên cấu trúc hashtag và lời kêu gọi theo văn phong {lang_name}.
+3. Dịch/bổ sung Tags sang {lang_name} (khoảng 10-15 từ khóa ngăn cách bằng dấu phẩy).
+4. Phân tích tạo 2 cụm chữ nổi bật Thumbnail ("thumbnail_highlight") từ chính tiêu đề đã dịch (in hoa, ngăn cách bằng " - ").
+
+NỘI DUNG GỐC:
+- Tiêu đề gốc: {clean_title}
+- Mô tả gốc: {clean_desc[:1200]}
+- Tags gốc: {clean_tags}
+- Kênh: {clean_ch}
+
+TRẢ VỀ JSON DUY NHẤT:
+{{
+  "title": "<tiêu đề đã dịch và tối ưu sang {lang_name}>",
+  "description": "<mô tả đã dịch sang {lang_name}>",
+  "tags": "<tags chuẩn SEO bằng {lang_name}>",
+  "thumbnail_highlight": "<CỤM 1 - CỤM 2>"
+}}"""
+
+    # 1. Thử qua 9Router hoặc Custom OpenAI
+    if provider in ["9router", "custom"]:
+        if provider == "9router" and not api_key:
+            api_key = detect_9router_api_key()
+        if api_key or provider == "9router":
+            base = (custom_base_url or ("http://localhost:20128/v1" if provider == "9router" else "https://api.groq.com/openai/v1")).rstrip("/")
+            if not base.endswith("/v1"):
+                base += "/v1"
+            url = f"{base}/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            payload = {
+                "model": model or ("ag/gemini-3.8-flash-high" if provider == "9router" else "llama-3.3-70b-versatile"),
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.5,
+                "stream": False,
+            }
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=25)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    content = data["choices"][0]["message"]["content"].strip()
+                    m = re.search(r"\{.*\}", content, re.DOTALL)
+                    if m:
+                        content = m.group(0)
+                    res = json.loads(content)
+                    hl = res.get("thumbnail_highlight", "").strip().upper()
+                    if not hl or " - " not in hl:
+                        hl = extract_highlight_from_title(res.get("title", ""))
+                    res["thumbnail_highlight"] = hl
+                    return res
+            except Exception:
+                pass
+
+    # 2. Thử qua Gemini API
+    elif provider == "gemini" and api_key:
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model or 'gemini-2.5-flash'}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.5}
+        }
+        try:
+            resp = requests.post(endpoint, json=payload, timeout=25)
+            if resp.status_code == 200:
+                data = resp.json()
+                raw_txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                m = re.search(r"\{.*\}", raw_txt, re.DOTALL)
+                if m:
+                    raw_txt = m.group(0)
+                res = json.loads(raw_txt)
+                hl = res.get("thumbnail_highlight", "").strip().upper()
+                if not hl or " - " not in hl:
+                    hl = extract_highlight_from_title(res.get("title", ""))
+                res["thumbnail_highlight"] = hl
+                return res
+        except Exception:
+            pass
+
+    # 3. Fallback: Sinh lại bộ metadata chuẩn cho ngôn ngữ đó
+    clean_story = clean_story_title(clean_title) or clean_title
+    fallback = OfflineSEOAssistant.generate_video_metadata(
+        story_title=clean_story,
+        channel_name=channel_name,
+        target_language=target_language,
+    )
+    return {
+        "title": fallback.get("title", clean_title),
+        "description": fallback.get("description", clean_desc),
+        "tags": fallback.get("tags", clean_tags),
+        "thumbnail_highlight": fallback.get("thumbnail_highlight", extract_highlight_from_title(clean_title)),
+    }
+
 
 

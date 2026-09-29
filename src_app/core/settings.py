@@ -6,9 +6,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 
-APP_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = APP_ROOT / "config.json"
-PROJECTS_DIR = APP_ROOT / "projects"
+from .paths import APP_ROOT, CONFIG_PATH, PROJECTS_DIR
 
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
@@ -16,6 +14,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "audio_source_mode": "local",
     "audio_crawler": {
         "platform": "youtube",
+        "browser_cookie": "chrome",
+        "cookie_file_path": "",
         "save_folder": "",
         "auto_add_to_audio_list": True,
         "mode": "video",
@@ -29,6 +29,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "channel_date_from": "",
         "channel_date_to": "",
         "direct_crawl": True,
+        "audio_quality": "192",
     },
     "media_files": [],
     "shuffle_media": True,
@@ -68,10 +69,17 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "duck_pad_end_ms": 300,
     },
     "image_duration_mode": "auto",
-    "effect_mode": "auto_light",
-    "video_effect_mode": "auto_cinematic",
-    "transition_mode": "auto_light",
+    "effect_mode": "auto_smart",
+    "image_motion_enabled": True,
+    "video_effect_mode": "none",
+    "transition_mode": "auto_soft",
     "transition_duration": 0.5,
+    "layout_studio": {
+        "enabled": True,
+        "selected_preset": "custom",
+        "layers": [],
+        "custom_presets": {},
+    },
     "audio_speed": 1.0,
     "video_speed": 1.0,
     "performance": {
@@ -100,6 +108,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     },
     "subtitle": {
         "enabled": False,
+        "auto_transcribe": False,
+        "whisper_language": "auto",
+        "whisper_model": "base",
         "auto_detect_srt": True,
         "custom_sub_file": "",
         "font_name": "Arial",
@@ -125,6 +136,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "height": 1920,
         "fps": 30,
         "quality": "standard",
+        "custom_bitrate_kbps": 2200,
         "format": "mp4",
         "output_folder": "output",
     },

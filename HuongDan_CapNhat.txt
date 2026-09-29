@@ -1,0 +1,23 @@
+============================================================
+           HƯỚNG DẪN CẬP NHẬT TOOL SIÊU NHANH
+============================================================
+
+Để cập nhật phiên bản mới nhất cho Tool mà không cần tải lại toàn bộ:
+
+BƯỚC 1: Giải nén file 'CapNhat_SuaLoi_Nhe.zip'.
+BƯỚC 2: Copy toàn bộ các file & thư mục bên trong (thư mục 'src_app', file 'ChayTool.bat', 'ChayTool.vbs', 'run.bat'...)
+BƯỚC 3: Dán (Paste) đè trực tiếp vào thư mục gốc của Tool hiện tại trên máy bạn.
+BƯỚC 4: Chọn 'Replace the files in the destination' (Ghi đè tất cả các file trùng tên).
+BƯỚC 5: Nhấp đúp vào 'ChayTool.bat' (hoặc 'ChayTool.vbs') để mở và sử dụng ngay!
+
+Các tính năng & sửa lỗi mới nhất trong bản này:
+1. Tab Cào MP3:
+   - Thêm nút 'Kiểm tra Cookie' kiểm tra hạn dùng, độ bảo mật và tính hợp lệ của Cookie.
+   - Tự động nhận diện và sửa lỗi cú pháp JSON dán từ Cookie-Editor.
+   - Tích hợp Smart Fallback: tự động chuyển sang Mobile/SmartTV client khi cookie hết hạn hoặc bị chặn bot.
+2. Tab Render:
+   - Tự động sửa lỗi Render FFmpeg khi tiêu đề/text chứa dấu nháy đơn/kép (It's, Don't...).
+3. Tab Đăng YouTube:
+   - Tùy chọn 4 ô Checkbox linh hoạt cho AI Metadata (Tiêu đề, Mô tả, Tags, Thumbnail).
+4. Khởi chạy không còn bị nháy màn hình đen console CMD.
+============================================================

@@ -15,10 +15,163 @@ from PySide6.QtWidgets import (
     QLineEdit, QFormLayout, QTextEdit, QLabel,
     QStackedWidget, QDateEdit, QProgressBar, QMessageBox, QApplication,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QScrollArea,
-    QSizePolicy
+    QSizePolicy, QDialog, QGridLayout
 )
 
-from core.audio_crawler import run_crawler, extract_entry_list, normalize_channel_url
+from core.audio_crawler import (
+    run_crawler,
+    extract_entry_list,
+    normalize_channel_url,
+    ensure_netscape_cookie_file,
+    validate_and_inspect_cookie,
+)
+
+
+class CookieInspectDialog(QDialog):
+    """Cửa sổ hiển thị chi tiết kết quả kiểm tra thời hạn, tính hợp lệ và các trường bảo mật của Cookie."""
+
+    def __init__(self, parent: QWidget | None = None, inspect_result: Dict[str, Any] | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("🔍 Kết Quả Kiểm Tra Cookie YouTube")
+        self.resize(600, 460)
+        res = inspect_result or {}
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        # 1. Header Banner
+        lvl = res.get("status_level", "error")
+        if lvl == "success":
+            bg_color = "#1b5e20"
+            border_color = "#4caf50"
+            title_text = "🟢 COOKIE HỢP LỆ & SẴN SÀNG VƯỢT BOT"
+        elif lvl == "warning":
+            bg_color = "#e65100"
+            border_color = "#ff9800"
+            title_text = "🟡 CẢNH BÁO: THIẾU MÃ ĐĂNG NHẬP / CÓ THỂ BỊ HẠN CHẾ"
+        else:
+            bg_color = "#b71c1c"
+            border_color = "#f44336"
+            title_text = "🔴 COOKIE KHÔNG HỢP LỆ HOẶC ĐÃ HẾT HẠN"
+
+        banner = QLabel(f"<div style='font-size: 13px; font-weight: bold; color: white;'>{title_text}</div>")
+        banner.setStyleSheet(f"background-color: {bg_color}; border: 1px solid {border_color}; border-radius: 6px; padding: 8px 12px;")
+        banner.setAlignment(Qt.AlignCenter)
+        layout.addWidget(banner)
+
+        # 2. Tóm tắt nhanh
+        summary_lbl = QLabel(res.get("summary", ""))
+        summary_lbl.setWordWrap(True)
+        summary_lbl.setStyleSheet("font-size: 12px; font-weight: bold; color: #eceff1; margin: 2px 0;")
+        layout.addWidget(summary_lbl)
+
+        # 3. Bảng thông số chi tiết
+        info_group = QGroupBox("Chi tiết thông số Cookie")
+        info_layout = QFormLayout(info_group)
+        info_layout.setVerticalSpacing(5)
+
+        info_layout.addRow("Định dạng phát hiện:", QLabel(f"<b>{res.get('format', 'N/A')}</b>"))
+        info_layout.addRow("Tổng số Cookie tìm thấy:", QLabel(f"<b>{res.get('total_cookies', 0)} mục</b>"))
+
+        days = res.get("days_remaining", 0)
+        exp_date = res.get("expiry_date_str", "N/A")
+        if res.get("is_expired"):
+            exp_text = f"<span style='color: #ff5252; font-weight: bold;'>Đã hết hạn ({exp_date})</span>"
+        else:
+            exp_text = f"<span style='color: #69f0ae; font-weight: bold;'>Còn lại {days} ngày</span> (Hết hạn: {exp_date})"
+        info_layout.addRow("Thời hạn sử dụng:", QLabel(exp_text))
+
+        auth_text = "<span style='color: #69f0ae; font-weight: bold;'>✔ Có phiên đăng nhập YouTube</span>" if res.get("has_auth") else "<span style='color: #ffb74d; font-weight: bold;'>⚠ Chưa có phiên đăng nhập</span>"
+        info_layout.addRow("Quyền tài khoản:", QLabel(auth_text))
+        layout.addWidget(info_group)
+
+        # 4. Danh sách trường cốt lõi của YouTube
+        keys_group = QGroupBox("Kiểm tra các trường bảo mật cốt lõi (Core Auth Keys)")
+        keys_layout = QGridLayout(keys_group)
+        keys_layout.setSpacing(6)
+
+        core_keys = res.get("core_keys", {})
+        row = 0
+        col = 0
+        for k, found in core_keys.items():
+            if found:
+                status_span = "<span style='color: #69f0ae; font-weight: bold;'>✔ Có</span>"
+            else:
+                status_span = "<span style='color: #78909c;'>❌ Thiếu</span>"
+            lbl = QLabel(f"<b>{k}:</b> {status_span}")
+            keys_layout.addWidget(lbl, row, col)
+            col += 1
+            if col > 1:
+                col = 0
+                row += 1
+        layout.addWidget(keys_group)
+
+        # 5. Khuyến nghị
+        rec_group = QGroupBox("💡 Lời khuyên & Khuyến nghị")
+        rec_layout = QVBoxLayout(rec_group)
+        rec_lbl = QLabel(res.get("recommendation", ""))
+        rec_lbl.setWordWrap(True)
+        rec_lbl.setStyleSheet("color: #bbdefb; font-size: 11px;")
+        rec_layout.addWidget(rec_lbl)
+        layout.addWidget(rec_group)
+
+        # 6. Nút đóng
+        btn_box = QHBoxLayout()
+        btn_box.addStretch(1)
+        close_btn = QPushButton("Đóng")
+        close_btn.setStyleSheet("padding: 5px 20px; font-weight: bold;")
+        close_btn.clicked.connect(self.accept)
+        btn_box.addWidget(close_btn)
+        layout.addLayout(btn_box)
+
+
+class CookieInputDialog(QDialog):
+    """Cửa sổ tiện ích cho phép dán hoặc chỉnh sửa Cookie JSON / Netscape / Header."""
+
+    def __init__(self, parent: QWidget | None = None, initial_text: str = "") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Dán / Nhập Cookie YouTube (JSON hoặc Netscape txt)")
+        self.resize(620, 420)
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "Dán nội dung Cookie JSON (từ Cookie-Editor), Netscape (cookies.txt) hoặc Cookie Header vào ô bên dưới:\n"
+            "Tool sẽ tự động nhận diện và chuyển đổi sang định dạng chuẩn để vượt chặn Bot."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #4CAF50; font-weight: bold; margin-bottom: 4px;")
+        layout.addWidget(info)
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setPlaceholderText(
+            '[{"domain": ".youtube.com", "name": "SID", "value": "..."}, ...]\n\n'
+            'Hoặc định dạng Netscape .txt\n'
+            'Hoặc chuỗi Cookie Header (SID=...; HSID=...)'
+        )
+        self.text_edit.setPlainText(initial_text)
+        layout.addWidget(self.text_edit)
+
+        btn_row = QHBoxLayout()
+        paste_btn = QPushButton("📋 Dán từ Clipboard")
+        paste_btn.clicked.connect(lambda: self.text_edit.setPlainText(QApplication.clipboard().text()))
+        btn_row.addWidget(paste_btn)
+
+        clear_btn = QPushButton("Xóa trắng")
+        clear_btn.clicked.connect(self.text_edit.clear)
+        btn_row.addWidget(clear_btn)
+
+        btn_row.addStretch(1)
+        save_btn = QPushButton("Áp dụng Cookie")
+        save_btn.setStyleSheet("font-weight: bold; background-color: #2e7d32; color: white; padding: 5px 14px;")
+        save_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Đóng")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+    def get_cookie_text(self) -> str:
+        return self.text_edit.toPlainText().strip()
 
 
 class AdaptiveStackedWidget(QStackedWidget):
@@ -53,12 +206,16 @@ class ScanVideoListThread(QThread):
     def run(self) -> None:
         try:
             mode = str(self.crawler_cfg.get("mode") or "playlist")
+            browser_cookie = str(self.crawler_cfg.get("browser_cookie") or "chrome").strip()
+            cookie_file = str(self.crawler_cfg.get("cookie_file_path") or "").strip()
             if mode == "playlist":
                 url = str(self.crawler_cfg.get("playlist_url") or "").strip()
                 # Quét danh sách không giới hạn (limit=0) để nạp đầy đủ các tập cho người dùng chọn
                 items = extract_entry_list(
                     url=url,
                     limit=0,
+                    browser_cookie=browser_cookie,
+                    cookie_file=cookie_file,
                     log=self.log_signal.emit,
                     cancel_event=self.cancel_event,
                 )
@@ -76,6 +233,8 @@ class ScanVideoListThread(QThread):
                     date_filter=date_filter,
                     date_from=date_from,
                     date_to=date_to,
+                    browser_cookie=browser_cookie,
+                    cookie_file=cookie_file,
                     log=self.log_signal.emit,
                     cancel_event=self.cancel_event,
                 )
@@ -162,6 +321,42 @@ class CrawlerTab(QWidget):
         self.platform_combo.addItem("Facebook (Sắp hỗ trợ)", "facebook")
         self.platform_combo.addItem("TikTok (Sắp hỗ trợ)", "tiktok")
         form_layout.addRow("Nền tảng:", self.platform_combo)
+
+        # Cookie vượt chặn Bot (Nhập/Dán trực tiếp hoặc chọn file)
+        self.cookie_file_widget = QWidget()
+        cookie_file_row = QHBoxLayout(self.cookie_file_widget)
+        cookie_file_row.setContentsMargins(0, 0, 0, 0)
+        cookie_file_row.setSpacing(6)
+        self.cookie_file_edit = QLineEdit()
+        self.cookie_file_edit.setPlaceholderText("Dán JSON Cookie (từ Cookie-Editor), Netscape cookies.txt hoặc đường dẫn file...")
+        self.paste_cookie_btn = QPushButton("📋 Dán Clipboard")
+        self.paste_cookie_btn.setStyleSheet("font-weight: bold; background-color: #0288d1; color: white; padding: 4px 10px;")
+        self.paste_cookie_btn.clicked.connect(self._paste_cookie_from_clipboard)
+        self.browse_cookie_btn = QPushButton("📁 Chọn file...")
+        self.browse_cookie_btn.clicked.connect(self._choose_cookie_file)
+        self.check_cookie_btn = QPushButton("🔍 Kiểm tra Cookie")
+        self.check_cookie_btn.setStyleSheet("font-weight: bold; background-color: #00897b; color: white; padding: 4px 10px;")
+        self.check_cookie_btn.clicked.connect(self._inspect_current_cookie)
+        self.edit_cookie_btn = QPushButton("✏ Soạn/Xem")
+        self.edit_cookie_btn.clicked.connect(self._open_cookie_input_dialog)
+        self.clear_cookie_btn = QPushButton("🗑️ Xóa")
+        self.clear_cookie_btn.clicked.connect(self._clear_cookie)
+        cookie_file_row.addWidget(self.cookie_file_edit, 1)
+        cookie_file_row.addWidget(self.paste_cookie_btn)
+        cookie_file_row.addWidget(self.browse_cookie_btn)
+        cookie_file_row.addWidget(self.check_cookie_btn)
+        cookie_file_row.addWidget(self.edit_cookie_btn)
+        cookie_file_row.addWidget(self.clear_cookie_btn)
+        form_layout.addRow("Cookie YouTube (vượt Bot):", self.cookie_file_widget)
+
+        # Chất lượng Audio MP3
+        self.audio_quality_combo = QComboBox()
+        self.audio_quality_combo.addItem("128 kbps (Nhẹ - Tải siêu tốc, tối ưu truyện/podcast)", "128")
+        self.audio_quality_combo.addItem("192 kbps (Chuẩn phổ biến)", "192")
+        self.audio_quality_combo.addItem("256 kbps (Chất lượng cao)", "256")
+        self.audio_quality_combo.addItem("320 kbps (Tối đa chất lượng MP3)", "320")
+        self.audio_quality_combo.addItem("Gốc tốt nhất (Best Audio)", "0")
+        form_layout.addRow("Chất lượng MP3:", self.audio_quality_combo)
 
         # Thư mục lưu
         folder_row = QHBoxLayout()
@@ -381,16 +576,16 @@ class CrawlerTab(QWidget):
         self.preview_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.preview_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.preview_table.setMinimumHeight(100)
-        self.preview_table.setMaximumHeight(140)
+        self.preview_table.setMinimumHeight(260)
+        self.preview_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview_table.itemChanged.connect(self._on_table_item_changed)
-        preview_layout.addWidget(self.preview_table)
+        preview_layout.addWidget(self.preview_table, 1)
 
         filter_note = QLabel("🛡 Đã tự động lọc bỏ video khóa hội viên (Members-only), video riêng tư và chưa công chiếu.")
         filter_note.setStyleSheet("color: #888; font-size: 10px; font-style: italic;")
         preview_layout.addWidget(filter_note)
 
-        left_layout.addWidget(self.preview_group)
+        left_layout.addWidget(self.preview_group, 1)
 
         # 3. GroupBox Điều khiển tác vụ & Tiến trình
         action_group = QGroupBox("Điều khiển tác vụ")
@@ -427,27 +622,24 @@ class CrawlerTab(QWidget):
         action_layout.addWidget(self.status_label)
 
         left_layout.addWidget(action_group)
-        left_layout.addStretch(1)
 
         # ==========================================
         # CỘT PHẢI: KHUNG LOG CHUYÊN BIỆT & RỘNG RÃI
         # ==========================================
         right_group = QGroupBox("Nhật ký cào MP3 (Real-time Log)")
         right_layout = QVBoxLayout(right_group)
-        right_layout.setContentsMargins(10, 10, 10, 10)
-        right_layout.setSpacing(8)
+        right_layout.setContentsMargins(8, 6, 8, 6)
+        right_layout.setSpacing(4)
 
-        log_tools = QHBoxLayout()
-        self.log_info_label = QLabel("Theo dõi tiến trình tải, trích xuất FFmpeg và lỗi chi tiết:")
-        self.clear_log_btn = QPushButton("Xóa log")
-        self.clear_log_btn.clicked.connect(self._clear_log)
+        top_log_row = QHBoxLayout()
+        top_log_row.addWidget(QLabel("Theo dõi tiến trình tải, trích xuất FFmpeg và lỗi chi tiết:"))
         self.copy_log_btn = QPushButton("Sao chép log")
         self.copy_log_btn.clicked.connect(self._copy_log)
-
-        log_tools.addWidget(self.log_info_label, 1)
-        log_tools.addWidget(self.copy_log_btn)
-        log_tools.addWidget(self.clear_log_btn)
-        right_layout.addLayout(log_tools)
+        self.clear_log_btn = QPushButton("Xóa log")
+        self.clear_log_btn.clicked.connect(self._clear_log)
+        top_log_row.addWidget(self.copy_log_btn)
+        top_log_row.addWidget(self.clear_log_btn)
+        right_layout.addLayout(top_log_row)
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -474,7 +666,7 @@ class CrawlerTab(QWidget):
         )
 
         self._connect_change_events(
-            self.platform_combo, self.folder_edit, self.auto_add_checkbox,
+            self.platform_combo, self.cookie_file_edit, self.audio_quality_combo, self.folder_edit, self.auto_add_checkbox,
             self.direct_crawl_checkbox,
             self.mode_combo, self.video_urls_edit, self.playlist_url_edit,
             self.playlist_limit_spin, self.channel_url_edit, self.channel_limit_spin,
@@ -482,6 +674,102 @@ class CrawlerTab(QWidget):
             self.date_from_edit, self.date_to_edit,
             self.trim_enabled_cb, self.trim_mode_combo, self.trim_start_edit, self.trim_end_edit
         )
+
+    def _clear_cookie(self) -> None:
+        self.cookie_file_edit.clear()
+        self._emit()
+
+    def _inspect_current_cookie(self) -> None:
+        source = self.cookie_file_edit.text().strip()
+        if not source:
+            QMessageBox.warning(
+                self, "Chưa có Cookie",
+                "Ô Cookie hiện đang trống!\n\nVui lòng dán Cookie (bấm '📋 Dán Clipboard') hoặc chọn file Cookie trước khi kiểm tra."
+            )
+            return
+
+        res = validate_and_inspect_cookie(source)
+        dlg = CookieInspectDialog(self, res)
+        dlg.exec()
+
+    def _choose_cookie_file(self) -> None:
+        fname, _ = QFileDialog.getOpenFileName(
+            self, "Chọn file Cookie (cookies.txt hoặc cookies.json)",
+            "", "Cookie Files (*.txt *.json);;JSON Files (*.json);;Text Files (*.txt);;All Files (*)"
+        )
+        if fname:
+            self.cookie_file_edit.setText(fname)
+            self._emit()
+            res = validate_and_inspect_cookie(fname)
+            if res.get("valid") and not res.get("is_expired"):
+                days = res.get("days_remaining", 0)
+                exp_str = res.get("expiry_date_str", "")
+                QMessageBox.information(
+                    self, "Đã nhận File Cookie",
+                    f"Đã nhận diện file cookie hợp lệ: {Path(fname).name}\n\n"
+                    f"• Định dạng: {res.get('format')}\n"
+                    f"• Số lượng: {res.get('total_cookies')} cookie\n"
+                    f"• Thời hạn: Còn {days} ngày (Hết hạn: {exp_str})"
+                )
+            elif res.get("is_expired"):
+                QMessageBox.warning(
+                    self, "Cảnh báo File Cookie hết hạn",
+                    f"File cookie này ĐÃ HẾT HẠN từ ngày {res.get('expiry_date_str')}!\n\n"
+                    f"Khuyến nghị: Mở Chrome và xuất lại file cookies.txt mới nhất."
+                )
+
+    def _paste_cookie_from_clipboard(self) -> None:
+        clip_text = QApplication.clipboard().text().strip()
+        if not clip_text:
+            QMessageBox.warning(self, "Clipboard trống", "Không tìm thấy nội dung văn bản trong Clipboard để dán.\nHãy copy JSON từ Cookie-Editor hoặc cookies.txt trước.")
+            return
+        self.cookie_file_edit.setText(clip_text)
+        self._emit()
+        res = validate_and_inspect_cookie(clip_text)
+        if res.get("valid") and not res.get("is_expired"):
+            days = res.get("days_remaining", 0)
+            exp_str = res.get("expiry_date_str", "")
+            QMessageBox.information(
+                self, "Đã dán Cookie thành công",
+                f"Đã nhận diện và chuyển đổi Cookie thành công từ Clipboard!\n\n"
+                f"• Định dạng: {res.get('format')}\n"
+                f"• Số lượng: {res.get('total_cookies')} cookie\n"
+                f"• Thời hạn: Còn {days} ngày (Hết hạn: {exp_str})\n\n"
+                f"Sẵn sàng vượt 100% chặn Bot của YouTube."
+            )
+        elif res.get("is_expired"):
+            QMessageBox.warning(
+                self, "Cảnh báo Cookie hết hạn",
+                f"Đã nhận diện Cookie nhưng Cookie này ĐÃ HẾT HẠN từ ngày {res.get('expiry_date_str')}!\n\n"
+                f"Khuyến nghị: Mở lại Chrome và xuất Cookie mới để tránh bị chặn."
+            )
+        else:
+            QMessageBox.information(self, "Đã dán nội dung", "Đã nạp chuỗi Cookie vào ô cấu hình.")
+
+    def _open_cookie_input_dialog(self) -> None:
+        dlg = CookieInputDialog(self, self.cookie_file_edit.text().strip())
+        if dlg.exec() == QDialog.Accepted:
+            txt = dlg.get_cookie_text()
+            if txt:
+                self.cookie_file_edit.setText(txt)
+                self._emit()
+                res = validate_and_inspect_cookie(txt)
+                if res.get("valid") and not res.get("is_expired"):
+                    days = res.get("days_remaining", 0)
+                    exp_str = res.get("expiry_date_str", "")
+                    QMessageBox.information(
+                        self, "Đã lưu Cookie",
+                        f"Đã nhận diện và chuyển đổi Cookie thành công!\n\n"
+                        f"• Định dạng: {res.get('format')}\n"
+                        f"• Số lượng: {res.get('total_cookies')} cookie\n"
+                        f"• Thời hạn: Còn {days} ngày (Hết hạn: {exp_str})"
+                    )
+                elif res.get("is_expired"):
+                    QMessageBox.warning(
+                        self, "Cảnh báo Cookie hết hạn",
+                        f"Đã nhận diện Cookie nhưng Cookie này ĐÃ HẾT HẠN từ ngày {res.get('expiry_date_str')}!\n\n"
+                        f"Khuyến nghị: Mở lại Chrome và xuất Cookie mới."
+                    )
 
     def _connect_change_events(self, *widgets: Any) -> None:
         for w in widgets:
@@ -877,6 +1165,9 @@ class CrawlerTab(QWidget):
         settings = dict(self.settings)
         crawler_settings = {
             "platform": self.platform_combo.currentData() or "youtube",
+            "browser_cookie": "file" if self.cookie_file_edit.text().strip() else "none",
+            "cookie_file_path": self.cookie_file_edit.text().strip(),
+            "audio_quality": self.audio_quality_combo.currentData() or "192",
             "save_folder": self.folder_edit.text().strip(),
             "auto_add_to_audio_list": self.auto_add_checkbox.isChecked(),
             "direct_crawl": self.direct_crawl_checkbox.isChecked(),
@@ -906,6 +1197,8 @@ class CrawlerTab(QWidget):
         crawler_cfg = settings.get("audio_crawler", {}) or {}
 
         self._set_combo_by_data(self.platform_combo, crawler_cfg.get("platform", "youtube"))
+        self.cookie_file_edit.setText(str(crawler_cfg.get("cookie_file_path", "")))
+        self._set_combo_by_data(self.audio_quality_combo, crawler_cfg.get("audio_quality", "192"))
         self.folder_edit.setText(str(crawler_cfg.get("save_folder", "")))
         self.auto_add_checkbox.setChecked(bool(crawler_cfg.get("auto_add_to_audio_list", True)))
         self.direct_crawl_checkbox.setChecked(bool(crawler_cfg.get("direct_crawl", True)))

@@ -18,9 +18,8 @@ from google_auth_oauthlib.flow import (
 )
 from googleapiclient.discovery import build
 
-from .paths import APP_ROOT
+from .paths import APP_ROOT, TOKENS_DIR
 
-TOKENS_DIR = APP_ROOT / "tokens"
 REGISTRY_FILE = TOKENS_DIR / "channels_registry.json"
 
 SCOPES = [
@@ -296,9 +295,17 @@ class YouTubeAuthManager:
         if not ch:
             raise ValueError(f"Kênh {channel_id} chưa được đăng nhập!")
 
-        token_path = Path(ch["token_path"])
+        token_path = Path(ch.get("token_path", ""))
         if not token_path.exists():
-            raise FileNotFoundError(f"Không tìm thấy token của kênh: {token_path}")
+            # Thử tìm trong TOKENS_DIR mới
+            fallback = TOKENS_DIR / (token_path.name or f"channel_{channel_id}.json")
+            if fallback.exists():
+                token_path = fallback
+                # Tự động cập nhật lại registry với đường dẫn mới
+                ch["token_path"] = str(token_path.resolve())
+                self._save_registry(reg)
+            else:
+                raise FileNotFoundError(f"Không tìm thấy token của kênh: {token_path}")
 
         creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
         if creds.expired and creds.refresh_token:

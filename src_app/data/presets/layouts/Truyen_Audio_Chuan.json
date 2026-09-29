@@ -1,0 +1,53 @@
+{
+  "name": "Truyện Audio Chuẩn 1080p",
+  "layers": [
+    {
+      "id": "title_header",
+      "name": "🏷️ Tiêu Đề Truyện (Phía Dưới)",
+      "type": "text",
+      "text_content": "TIỂU THUYẾT AUDIO HAY NHẤT",
+      "font_name": "Arial",
+      "font_size": 72,
+      "bold": true,
+      "italic": false,
+      "font_color": "#FFBE4E",
+      "outline_color": "#000000",
+      "outline_width": 3.0,
+      "box_x": 0.0,
+      "box_y": 0.82,
+      "box_w": 1.0,
+      "box_h": 0.15,
+      "align": "center",
+      "bg_box_enabled": false,
+      "opacity": 1.0,
+      "blend_mode": "alpha",
+      "locked": false,
+      "enabled": true
+    },
+    {
+      "id": "sub_main",
+      "name": "💬 Phụ Đề Giọng Đọc (Subtitle)",
+      "type": "subtitle",
+      "text_content": "💬 Đây là phụ đề mẫu xem trước (Subtitle Live Preview)",
+      "font_name": "Tahoma",
+      "font_size": 68,
+      "bold": true,
+      "italic": false,
+      "font_color": "#FFFF7F",
+      "highlight_color": "#FFE600",
+      "outline_color": "#000080",
+      "outline_width": 5.0,
+      "sub_mode": "cinema_hold",
+      "box_x": 0.08,
+      "box_y": 0.55,
+      "box_w": 0.84,
+      "box_h": 0.24,
+      "align": "center",
+      "bg_box_enabled": false,
+      "opacity": 1.0,
+      "blend_mode": "alpha",
+      "locked": false,
+      "enabled": true
+    }
+  ]
+}

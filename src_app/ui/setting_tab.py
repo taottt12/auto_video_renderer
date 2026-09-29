@@ -273,7 +273,7 @@ class ImageMotionDemoWidget(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFixedHeight(115)
-        self.motion_mode = "auto_light"
+        self.motion_mode = "auto_smart"
         self._anim_t = 0.0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._on_tick)
@@ -284,7 +284,7 @@ class ImageMotionDemoWidget(QWidget):
         self.update()
 
     def set_motion(self, mode: str) -> None:
-        self.motion_mode = mode or "auto_light"
+        self.motion_mode = mode or "auto_smart"
         self.update()
 
     def paintEvent(self, event) -> None:
@@ -304,22 +304,83 @@ class ImageMotionDemoWidget(QWidget):
         painter.setClipRect(rect)
 
         # Tính toán ma trận Ken Burns (Pan & Zoom)
+        t = self._anim_t
+        zoom = 1.0
+        pan_x = 0.0
+        pan_y = 0.0
+
+        mode = self.motion_mode
+        p3 = (t % 3.0) / 3.0
+
+        if mode == "auto_smart":
+            # Xoay tua 4 kiểu mượt mà (chu kỳ 8s)
+            cycle = int(t / 2.0) % 4
+            sub_p = (t % 2.0) / 2.0
+            if cycle == 0:
+                zoom = 1.0 + 0.30 * sub_p
+            elif cycle == 1:
+                zoom = 1.15
+                pan_x = -16 * (sub_p - 0.5)
+            elif cycle == 2:
+                zoom = 1.30 - 0.30 * sub_p
+            else:
+                zoom = 1.15
+                pan_x = 16 * (sub_p - 0.5)
+        elif mode == "auto_light":
+            zoom = 1.0 + 0.08 * math.sin(t * 1.2)
+            pan_x = 8 * math.cos(t * 0.9)
+        elif mode == "auto_rich":
+            zoom = 1.0 + 0.16 * math.sin(t * 1.5)
+            pan_x = 14 * math.sin(t * 1.1)
+            pan_y = 6 * math.cos(t * 1.3)
+        elif mode == "zoom_in_center":
+            zoom = 1.0 + 0.35 * p3
+        elif mode == "zoom_out_center":
+            zoom = 1.35 - 0.35 * p3
+        elif mode == "zoom_in_top_left":
+            zoom = 1.0 + 0.35 * p3
+            pan_x = -14 * p3
+            pan_y = -8 * p3
+        elif mode == "zoom_in_top_right":
+            zoom = 1.0 + 0.35 * p3
+            pan_x = 14 * p3
+            pan_y = -8 * p3
+        elif mode == "zoom_in_bottom_left":
+            zoom = 1.0 + 0.35 * p3
+            pan_x = -14 * p3
+            pan_y = 8 * p3
+        elif mode == "zoom_in_bottom_right":
+            zoom = 1.0 + 0.35 * p3
+            pan_x = 14 * p3
+            pan_y = 8 * p3
+        elif mode == "pan_left":
+            zoom = 1.15
+            pan_x = -20 * (p3 - 0.5)
+        elif mode == "pan_right":
+            zoom = 1.15
+            pan_x = 20 * (p3 - 0.5)
+        elif mode == "pan_up":
+            zoom = 1.15
+            pan_y = -12 * (p3 - 0.5)
+        elif mode == "pan_down":
+            zoom = 1.15
+            pan_y = 12 * (p3 - 0.5)
+        elif mode == "smooth_pulse":
+            pulse = (math.sin(t * 2.5) + 1.0) * 0.5
+            zoom = 1.0 + 0.18 * pulse
+        elif mode == "loop_pan_zoom":
+            zoom = 1.08 + 0.12 * math.sin(t * 1.8)
+            pan_x = 16 * math.sin(t * 1.2)
+            pan_y = 8 * math.cos(t * 1.4)
+        elif mode == "none":
+            zoom = 1.0
+            pan_x = 0.0
+            pan_y = 0.0
+
         painter.save()
-        if self.motion_mode == "auto_light":
-            # Pan ngang nhẹ & Zoom chậm
-            zoom = 1.0 + 0.08 * math.sin(self._anim_t * 1.2)
-            pan_x = 8 * math.cos(self._anim_t * 0.9)
-            painter.translate(x0 + box_w // 2 + pan_x, y0 + box_h // 2)
-            painter.scale(zoom, zoom)
-            painter.translate(-(x0 + box_w // 2), -(y0 + box_h // 2))
-        elif self.motion_mode == "auto_rich":
-            # Chuyển động đa hướng chéo & Zoom sâu
-            zoom = 1.0 + 0.16 * math.sin(self._anim_t * 1.5)
-            pan_x = 14 * math.sin(self._anim_t * 1.1)
-            pan_y = 6 * math.cos(self._anim_t * 1.3)
-            painter.translate(x0 + box_w // 2 + pan_x, y0 + box_h // 2 + pan_y)
-            painter.scale(zoom, zoom)
-            painter.translate(-(x0 + box_w // 2), -(y0 + box_h // 2))
+        painter.translate(x0 + box_w // 2 + pan_x, y0 + box_h // 2 + pan_y)
+        painter.scale(zoom, zoom)
+        painter.translate(-(x0 + box_w // 2), -(y0 + box_h // 2))
 
         # Vẽ ảnh phong cảnh núi non
         grad = QLinearGradient(x0, y0, x0, y0 + box_h)
@@ -355,8 +416,21 @@ class ImageMotionDemoWidget(QWidget):
         painter.drawRect(rect)
 
         mode_text = {
+            "auto_smart": "Xoay tua thông minh (Auto Smart)",
             "auto_light": "Auto Light (Pan & Zoom nhẹ)",
             "auto_rich": "Auto Rich (Ken Burns đa hướng)",
+            "zoom_in_center": "Zoom In (Tâm)",
+            "zoom_out_center": "Zoom Out (Tâm)",
+            "zoom_in_top_left": "Zoom In (Góc Trên Trái)",
+            "zoom_in_top_right": "Zoom In (Góc Trên Phải)",
+            "zoom_in_bottom_left": "Zoom In (Góc Dưới Trái)",
+            "zoom_in_bottom_right": "Zoom In (Góc Dưới Phải)",
+            "pan_left": "Pan Sang Trái",
+            "pan_right": "Pan Sang Phải",
+            "pan_up": "Pan Lên Trên",
+            "pan_down": "Pan Xuống Dưới",
+            "smooth_pulse": "Smooth Pulse (Nhịp thở)",
+            "loop_pan_zoom": "Loop Pan & Zoom",
             "none": "Tắt hiệu ứng (Ảnh tĩnh)",
         }.get(self.motion_mode, self.motion_mode)
 
@@ -571,12 +645,12 @@ class VideoEffectDemoWidget(QWidget):
 
 
 class TransitionDemoWidget(QWidget):
-    """Widget demo trực quan hiệu ứng chuyển cảnh (Transitions: Crossfade, Wipe, Cut)."""
+    """Widget demo trực quan hiệu ứng chuyển cảnh (Transitions: Crossfade, Wipe, Slide, Circle, Zoom...)."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFixedHeight(115)
-        self.transition_mode = "auto_light"
+        self.transition_mode = "auto_soft"
         self._anim_t = 0.0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._on_tick)
@@ -587,7 +661,7 @@ class TransitionDemoWidget(QWidget):
         self.update()
 
     def set_transition(self, mode: str) -> None:
-        self.transition_mode = mode or "auto_light"
+        self.transition_mode = mode or "auto_soft"
         self.update()
 
     def _draw_scene_a(self, painter: QPainter, rect: QRect) -> None:
@@ -672,9 +746,28 @@ class TransitionDemoWidget(QWidget):
         painter.drawRect(rect)
 
         trans_text = {
-            "auto_light": "Auto Light (Dissolve / Fade mượt)",
-            "auto_rich": "Auto Rich (Wipe, Slide, Fade)",
-            "none": "Cut trực tiếp (Tắt chuyển cảnh)",
+            "auto_soft": "Auto Soft (Chuyển cảnh êm)",
+            "auto_dynamic": "Auto Dynamic (Đa dạng sôi động)",
+            "auto_light": "Auto Light (Crossfade cơ bản)",
+            "auto_rich": "Auto Rich (Phong phú)",
+            "fade": "Crossfade (Mờ dần chồng)",
+            "fadeblack": "Fade to Black (Đen dần)",
+            "fadewhite": "Fade to White (Trắng chớp)",
+            "dissolve": "Dissolve (Hòa tan)",
+            "slideleft": "Slide Left (Trượt sang trái)",
+            "slideright": "Slide Right (Trượt sang phải)",
+            "slideup": "Slide Up (Trượt lên trên)",
+            "slidedown": "Slide Down (Trượt xuống dưới)",
+            "wipeleft": "Wipe Left (Quét sang trái)",
+            "wiperight": "Wipe Right (Quét sang phải)",
+            "wipeup": "Wipe Up (Quét lên trên)",
+            "wipedown": "Wipe Down (Quét xuống dưới)",
+            "circleopen": "Circle Open (Vòng tròn mở)",
+            "circleclose": "Circle Close (Vòng tròn đóng)",
+            "zoomin": "Zoom In (Phóng to cảnh mới)",
+            "pixelize": "Pixelize (Vỡ hạt Pixel)",
+            "radial": "Radial (Quạt xoay 360°)",
+            "none": "Cut (Cắt thẳng / Tắt chuyển cảnh)",
         }.get(self.transition_mode, self.transition_mode)
 
         painter.setFont(QFont("Arial", 8, QFont.Bold))
@@ -682,50 +775,199 @@ class TransitionDemoWidget(QWidget):
         painter.drawText(QRect(0, y0 + box_h + 2, w, 18), Qt.AlignCenter, f"🔄 {trans_text}")
 
     def _render_transition(self, painter: QPainter, rect: QRect, from_a_to_b: bool, progress: float) -> None:
-        if self.transition_mode == "none":
-            if progress < 0.5:
-                if from_a_to_b:
-                    self._draw_scene_a(painter, rect)
-                else:
-                    self._draw_scene_b(painter, rect)
+        p = min(1.0, max(0.0, progress))
+        mode = self.transition_mode
+
+        def draw_from():
+            if from_a_to_b:
+                self._draw_scene_a(painter, rect)
             else:
-                if from_a_to_b:
-                    self._draw_scene_b(painter, rect)
-                else:
-                    self._draw_scene_a(painter, rect)
+                self._draw_scene_b(painter, rect)
+
+        def draw_to():
+            if from_a_to_b:
+                self._draw_scene_b(painter, rect)
+            else:
+                self._draw_scene_a(painter, rect)
+
+        if mode == "none":
+            if p < 0.5:
+                draw_from()
+            else:
+                draw_to()
             return
 
-        if self.transition_mode == "auto_rich":
-            if from_a_to_b:
-                self._draw_scene_a(painter, rect)
+        if mode == "fadeblack":
+            if p < 0.5:
+                draw_from()
+                painter.fillRect(rect, QColor(0, 0, 0, int(255 * (p * 2))))
             else:
-                self._draw_scene_b(painter, rect)
+                draw_to()
+                painter.fillRect(rect, QColor(0, 0, 0, int(255 * (1.0 - (p - 0.5) * 2))))
+            return
 
-            wipe_w = int(rect.width() * progress)
-            if wipe_w > 0:
-                clip = QRect(rect.left(), rect.top(), wipe_w, rect.height())
-                painter.save()
-                painter.setClipRect(clip)
-                if from_a_to_b:
-                    self._draw_scene_b(painter, rect)
-                else:
-                    self._draw_scene_a(painter, rect)
-                painter.setPen(QPen(QColor(255, 255, 255, 180), 2))
-                painter.drawLine(rect.left() + wipe_w, rect.top(), rect.left() + wipe_w, rect.bottom())
-                painter.restore()
-        else:
-            if from_a_to_b:
-                self._draw_scene_a(painter, rect)
+        if mode == "fadewhite":
+            if p < 0.5:
+                draw_from()
+                painter.fillRect(rect, QColor(255, 255, 255, int(255 * (p * 2))))
             else:
-                self._draw_scene_b(painter, rect)
+                draw_to()
+                painter.fillRect(rect, QColor(255, 255, 255, int(255 * (1.0 - (p - 0.5) * 2))))
+            return
+
+        if mode in {"slideleft", "slideright", "slideup", "slidedown"}:
+            offset_x = 0
+            offset_y = 0
+            if mode == "slideleft":
+                offset_x = int(rect.width() * p)
+            elif mode == "slideright":
+                offset_x = -int(rect.width() * p)
+            elif mode == "slideup":
+                offset_y = int(rect.height() * p)
+            elif mode == "slidedown":
+                offset_y = -int(rect.height() * p)
 
             painter.save()
-            painter.setOpacity(min(1.0, max(0.0, progress)))
-            if from_a_to_b:
-                self._draw_scene_b(painter, rect)
-            else:
-                self._draw_scene_a(painter, rect)
+            painter.translate(-offset_x, -offset_y)
+            draw_from()
+            if mode == "slideleft":
+                painter.translate(rect.width(), 0)
+            elif mode == "slideright":
+                painter.translate(-rect.width(), 0)
+            elif mode == "slideup":
+                painter.translate(0, rect.height())
+            elif mode == "slidedown":
+                painter.translate(0, -rect.height())
+            draw_to()
             painter.restore()
+            return
+
+        if mode in {"wipeleft", "wiperight", "wipeup", "wipedown", "auto_rich"}:
+            draw_from()
+            clip = QRect()
+            if mode == "wipeleft":
+                wipe_w = int(rect.width() * p)
+                clip = QRect(rect.right() - wipe_w, rect.top(), wipe_w + 1, rect.height())
+            elif mode in {"wiperight", "auto_rich"}:
+                wipe_w = int(rect.width() * p)
+                clip = QRect(rect.left(), rect.top(), wipe_w, rect.height())
+            elif mode == "wipeup":
+                wipe_h = int(rect.height() * p)
+                clip = QRect(rect.left(), rect.bottom() - wipe_h, rect.width(), wipe_h + 1)
+            elif mode == "wipedown":
+                wipe_h = int(rect.height() * p)
+                clip = QRect(rect.left(), rect.top(), rect.width(), wipe_h)
+
+            if not clip.isEmpty():
+                painter.save()
+                painter.setClipRect(clip)
+                draw_to()
+                painter.setPen(QPen(QColor(255, 255, 255, 180), 2))
+                if mode in {"wiperight", "auto_rich"}:
+                    painter.drawLine(clip.right(), rect.top(), clip.right(), rect.bottom())
+                elif mode == "wipeleft":
+                    painter.drawLine(clip.left(), rect.top(), clip.left(), rect.bottom())
+                elif mode == "wipedown":
+                    painter.drawLine(rect.left(), clip.bottom(), rect.right(), clip.bottom())
+                elif mode == "wipeup":
+                    painter.drawLine(rect.left(), clip.top(), rect.right(), clip.top())
+                painter.restore()
+            return
+
+        if mode == "circleopen":
+            draw_from()
+            max_r = math.hypot(rect.width() / 2, rect.height() / 2)
+            c_path = QPainterPath()
+            c_path.addEllipse(QPointF(rect.center().x(), rect.center().y()), max_r * p, max_r * p)
+            painter.save()
+            painter.setClipPath(c_path)
+            draw_to()
+            painter.restore()
+            return
+
+        if mode == "circleclose":
+            draw_to()
+            max_r = math.hypot(rect.width() / 2, rect.height() / 2)
+            c_path = QPainterPath()
+            c_path.addEllipse(QPointF(rect.center().x(), rect.center().y()), max_r * (1.0 - p), max_r * (1.0 - p))
+            painter.save()
+            painter.setClipPath(c_path)
+            draw_from()
+            painter.restore()
+            return
+
+        if mode == "zoomin":
+            draw_from()
+            painter.save()
+            scale = max(0.01, p)
+            painter.translate(rect.center().x(), rect.center().y())
+            painter.scale(scale, scale)
+            painter.translate(-rect.center().x(), -rect.center().y())
+            painter.setOpacity(min(1.0, p * 1.2))
+            draw_to()
+            painter.restore()
+            return
+
+        if mode == "pixelize":
+            draw_from()
+            painter.save()
+            painter.setOpacity(p)
+            draw_to()
+            painter.restore()
+            if 0.05 < p < 0.95:
+                pixel_size = max(4, int(20 * math.sin(p * math.pi)))
+                painter.setPen(QColor(0, 0, 0, 45))
+                for px in range(rect.left(), rect.right(), pixel_size):
+                    painter.drawLine(px, rect.top(), px, rect.bottom())
+                for py in range(rect.top(), rect.bottom(), pixel_size):
+                    painter.drawLine(rect.left(), py, rect.right(), py)
+            return
+
+        if mode == "radial":
+            draw_from()
+            c_path = QPainterPath()
+            c_path.moveTo(rect.center().x(), rect.center().y())
+            c_path.arcTo(QRectF(rect.adjusted(-rect.width(), -rect.height(), rect.width(), rect.height())), 90, -int(360 * p))
+            c_path.closeSubpath()
+            painter.save()
+            painter.setClipPath(c_path)
+            draw_to()
+            painter.restore()
+            return
+
+        if mode == "auto_dynamic":
+            cycle = int(self._anim_t / 3.2) % 4
+            if cycle == 0:
+                offset = int(rect.width() * p)
+                painter.save(); painter.translate(-offset, 0); draw_from(); painter.translate(rect.width(), 0); draw_to(); painter.restore()
+            elif cycle == 1:
+                draw_from()
+                max_r = math.hypot(rect.width() / 2, rect.height() / 2)
+                c_path = QPainterPath()
+                c_path.addEllipse(QPointF(rect.center().x(), rect.center().y()), max_r * p, max_r * p)
+                painter.save(); painter.setClipPath(c_path); draw_to(); painter.restore()
+            elif cycle == 2:
+                draw_from()
+                painter.save()
+                scale = max(0.01, p)
+                painter.translate(rect.center().x(), rect.center().y()); painter.scale(scale, scale); painter.translate(-rect.center().x(), -rect.center().y())
+                painter.setOpacity(min(1.0, p * 1.2))
+                draw_to()
+                painter.restore()
+            else:
+                draw_from()
+                wipe_w = int(rect.width() * p)
+                if wipe_w > 0:
+                    clip = QRect(rect.left(), rect.top(), wipe_w, rect.height())
+                    painter.save(); painter.setClipRect(clip); draw_to(); painter.restore()
+            return
+
+        # Default / auto_soft / fade / dissolve
+        draw_from()
+        painter.save()
+        painter.setOpacity(p)
+        draw_to()
+        painter.restore()
 
 
 EffectDemoWidget = VideoEffectDemoWidget
@@ -757,7 +999,7 @@ class SettingTab(QWidget):
     def __init__(self, settings: Dict[str, Any]) -> None:
         super().__init__()
         self.settings = settings
-        self._lock_emit = False
+        self._lock_emit = True
         self._preview_player = QMediaPlayer(self)
         self._preview_audio_output = QAudioOutput(self)
         self._preview_player.setAudioOutput(self._preview_audio_output)
@@ -766,17 +1008,9 @@ class SettingTab(QWidget):
         self.load_settings(settings)
 
     def _build_ui(self) -> None:
-        outer = QHBoxLayout(self)
+        outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
-        outer.setSpacing(12)
-
-        # ==========================================
-        # CỘT TRÁI: CÁC NHÓM THIẾT LẬP RENDER
-        # ==========================================
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(8)
+        outer.setSpacing(8)
 
         # Thanh nút lưu đầu trang
         save_bar = QHBoxLayout()
@@ -791,7 +1025,7 @@ class SettingTab(QWidget):
         save_bar.addWidget(self.save_btn)
         save_bar.addWidget(self.save_status_label)
         save_bar.addStretch(1)
-        left_layout.addLayout(save_bar)
+        outer.addLayout(save_bar)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -800,51 +1034,26 @@ class SettingTab(QWidget):
         root.setContentsMargins(0, 0, 8, 0)
         root.setSpacing(6)
 
-        root.addWidget(CollapsibleBox("Intro / Outro / Logo / Watermark", self._build_extra_group(), collapsed=False))
+        root.addWidget(CollapsibleBox("Intro / Outro", self._build_extra_group(), collapsed=False))
         root.addWidget(CollapsibleBox("Text Overlay", self._build_text_group(), collapsed=True))
         root.addWidget(CollapsibleBox("Phụ đề Video (Subtitle)", self._build_subtitle_group(), collapsed=False))
         root.addWidget(CollapsibleBox("Nhạc nền (Background Music)", self._build_background_music_group(), collapsed=True))
         root.addWidget(CollapsibleBox("Audio quảng bá / chèn giữa video", self._build_promo_audio_group(), collapsed=True))
-        root.addWidget(CollapsibleBox("Hiệu ứng thị giác & Chuyển cảnh", self._build_effect_audio_group(), collapsed=False))
+        root.addWidget(CollapsibleBox("Chuyển động & Chuyển cảnh", self._build_effect_audio_group(), collapsed=False))
         root.addWidget(CollapsibleBox("Export Setting", self._build_export_group(), collapsed=False))
         root.addWidget(CollapsibleBox("Hiệu năng / CPU / GPU", self._build_performance_group(), collapsed=True))
 
         root.addStretch(1)
         scroll.setWidget(container)
-        left_layout.addWidget(scroll, 1)
-
-        # ==========================================
-        # CỘT PHẢI: KHUNG XEM TRƯỚC BỐ CỤC (LIVE PREVIEW)
-        # ==========================================
-        right_group = QGroupBox("Xem trước Bố cục Video (Live Layout Preview)")
-        right_layout = QVBoxLayout(right_group)
-        right_layout.setContentsMargins(10, 10, 10, 10)
-        right_layout.setSpacing(8)
-
-        preview_bar = QHBoxLayout()
-        preview_desc = QLabel("Mô phỏng vị trí thực tế của Logo, Watermark, Text:")
-        preview_desc.setStyleSheet("color: #888; font-size: 11px;")
-        self.refresh_preview_btn = QPushButton("🔄 Cập nhật Preview")
-        self.refresh_preview_btn.clicked.connect(self._refresh_preview)
-        preview_bar.addWidget(preview_desc, 1)
-        preview_bar.addWidget(self.refresh_preview_btn)
-        right_layout.addLayout(preview_bar)
-
-        self.layout_preview = LayoutPreviewWidget()
-        right_layout.addWidget(self.layout_preview, 1)
-
-        outer.addWidget(left_widget, 6)
-        outer.addWidget(right_group, 4)
+        outer.addWidget(scroll, 1)
 
     def _refresh_preview(self) -> None:
-        settings = self.collect_settings()
-        self.layout_preview.update_settings(settings)
+        pass
 
     def save_settings_action(self) -> None:
         settings = self.collect_settings()
         self.settings = settings
         self.settings_changed.emit(settings)
-        self.layout_preview.update_settings(settings)
         self.save_status_label.setText("✔ Đã lưu cấu hình!")
         QTimer.singleShot(2500, lambda: self.save_status_label.setText("Sẵn sàng"))
 
@@ -854,43 +1063,11 @@ class SettingTab(QWidget):
         self.intro_edit = self._file_row(form, "Intro", "Chọn intro", "Video (*.mp4 *.mov *.mkv)")
         self.outro_edit = self._file_row(form, "Outro", "Chọn outro", "Video (*.mp4 *.mov *.mkv)")
 
-        self.logo_enabled = QCheckBox("Bật logo")
-        self.logo_edit = self._file_row(form, "Logo", "Chọn logo", "Image (*.png *.jpg *.jpeg *.webp)")
-        self.logo_position = self._position_combo()
-        self.logo_scale = QDoubleSpinBox()
-        self.logo_scale.setRange(0.03, 0.8)
-        self.logo_scale.setSingleStep(0.01)
-        self.logo_scale.setDecimals(2)
-        self.logo_margin_x = QSpinBox()
-        self.logo_margin_x.setRange(0, 1000)
-        self.logo_margin_y = QSpinBox()
-        self.logo_margin_y.setRange(0, 1000)
-        form.addRow("Logo enabled", self.logo_enabled)
-        form.addRow("Vị trí logo", self.logo_position)
-        form.addRow("Scale logo", self.logo_scale)
-        form.addRow("Logo margin X", self.logo_margin_x)
-        form.addRow("Logo margin Y", self.logo_margin_y)
+        note_label = QLabel("💡 <i>Logo, Watermark, Huy hiệu & Lớp phủ đồ họa hiện được quản lý trực quan tại tab <b>Studio Layout</b>.</i>")
+        note_label.setStyleSheet("color: #88c0d0; font-size: 11px;")
+        form.addRow(note_label)
 
-        self.watermark_enabled = QCheckBox("Bật watermark full màn hình")
-        self.watermark_edit = self._file_row(form, "Watermark", "Chọn watermark", "Image (*.png *.jpg *.jpeg *.webp)")
-        self.watermark_opacity = QDoubleSpinBox()
-        self.watermark_opacity.setRange(0.01, 1.0)
-        self.watermark_opacity.setSingleStep(0.05)
-        self.watermark_opacity.setDecimals(2)
-        self.watermark_scale = QDoubleSpinBox()
-        self.watermark_scale.setRange(0.5, 3.0)
-        self.watermark_scale.setSingleStep(0.05)
-        self.watermark_scale.setDecimals(2)
-        self.watermark_scale.setToolTip("1.0 = phủ kín khung hình. Tăng nếu muốn crop mạnh hơn.")
-        form.addRow("Watermark enabled", self.watermark_enabled)
-        form.addRow("Độ mờ watermark", self.watermark_opacity)
-        form.addRow("Scale watermark", self.watermark_scale)
-
-        self._connect_change_widgets(
-            self.intro_edit, self.outro_edit, self.logo_enabled, self.logo_position,
-            self.logo_scale, self.logo_margin_x, self.logo_margin_y,
-            self.watermark_enabled, self.watermark_opacity, self.watermark_scale
-        )
+        self._connect_change_widgets(self.intro_edit, self.outro_edit)
         return group
 
     def _build_text_group(self) -> QGroupBox:
@@ -964,107 +1141,113 @@ class SettingTab(QWidget):
         folder_row.addWidget(self.sub_folder_edit, 1)
         folder_row.addWidget(self.sub_folder_btn)
 
-        font_row = QHBoxLayout()
-        self.sub_font_family = QComboBox()
-        fonts = ["Arial", "Roboto", "Montserrat", "Segoe UI", "Tahoma", "Times New Roman", "Verdana", "UTM Alexander", "UTM Bebas"]
-        self.sub_font_family.addItems(fonts)
-        self.sub_font_family.setEditable(True)
-
-        self.sub_font_size = QSpinBox()
-        self.sub_font_size.setRange(12, 120)
-        self.sub_font_size.setValue(38)
-        self.sub_font_size.setToolTip("Cỡ chữ chuẩn ở độ phân giải 1080p")
-
-        self.sub_bold = QCheckBox("In đậm (Bold)")
-        self.sub_bold.setChecked(True)
-        self.sub_italic = QCheckBox("In nghiêng (Italic)")
-        self.sub_italic.setChecked(False)
-
-        font_row.addWidget(self.sub_font_family, 2)
-        font_row.addWidget(QLabel("Cỡ:"))
-        font_row.addWidget(self.sub_font_size, 1)
-        font_row.addWidget(self.sub_bold)
-        font_row.addWidget(self.sub_italic)
-
-        color_row = QHBoxLayout()
-        self.sub_font_color = QLineEdit("#FFFFFF")
-        self.sub_font_color.setFixedWidth(80)
-        self.sub_color_btn = QPushButton("Màu chữ")
-        self.sub_color_btn.clicked.connect(self._choose_sub_font_color)
-        self.sub_color_preview = QLabel()
-        self.sub_color_preview.setFixedSize(24, 24)
-
-        self.sub_outline_color = QLineEdit("#000000")
-        self.sub_outline_color.setFixedWidth(80)
-        self.sub_outline_color_btn = QPushButton("Màu viền")
-        self.sub_outline_color_btn.clicked.connect(self._choose_sub_outline_color)
-        self.sub_outline_color_preview = QLabel()
-        self.sub_outline_color_preview.setFixedSize(24, 24)
-
-        self.sub_outline_width = QDoubleSpinBox()
-        self.sub_outline_width.setRange(0.0, 15.0)
-        self.sub_outline_width.setSingleStep(0.5)
-        self.sub_outline_width.setValue(2.5)
-
-        color_row.addWidget(QLabel("Màu:"))
-        color_row.addWidget(self.sub_font_color)
-        color_row.addWidget(self.sub_color_btn)
-        color_row.addWidget(self.sub_color_preview)
-        color_row.addSpacing(10)
-        color_row.addWidget(QLabel("Viền:"))
-        color_row.addWidget(self.sub_outline_color)
-        color_row.addWidget(self.sub_outline_color_btn)
-        color_row.addWidget(self.sub_outline_color_preview)
-        color_row.addWidget(QLabel("Dày:"))
-        color_row.addWidget(self.sub_outline_width)
-
         auto_row = QHBoxLayout()
         self.sub_auto_transcribe = QCheckBox("⚡ Tự động quét giọng nói & tạo phụ đề khi Render (Whisper AI)")
         self.sub_auto_transcribe.setStyleSheet("color: #ffca28; font-weight: bold;")
-        self.sub_auto_transcribe.setToolTip("Khi bật, lúc nhấn 'Chạy render' hệ thống sẽ tự động nghe MP3 để nhận diện ngôn ngữ nước đó và tạo file .srt rồi gắn vào video. Nếu tắt thì trực tiếp render luôn.")
+        self.sub_auto_transcribe.setToolTip("Khi bật, lúc nhấn 'Chạy render' hệ thống sẽ tự động nghe MP3 theo đúng ngôn ngữ đã chọn để tạo file .srt rồi gắn vào video.")
+
+        self.sub_whisper_lang = QComboBox()
+        self.sub_whisper_lang.addItem("🌐 Tự động nhận diện (Auto Detect)", "auto")
+        self.sub_whisper_lang.addItem("🇵🇭 Philippines (Tagalog / Filipino)", "tl")
+        self.sub_whisper_lang.addItem("🇸🇬 Singapore / Mã Lai (Malay)", "ms")
+        self.sub_whisper_lang.addItem("🇹🇭 Thái Lan (Thai)", "th")
+        self.sub_whisper_lang.addItem("🇻🇳 Tiếng Việt (Vietnamese)", "vi")
+        self.sub_whisper_lang.addItem("🇺🇸 Tiếng Anh (English)", "en")
+        self.sub_whisper_lang.addItem("🇨🇳 Tiếng Trung (Chinese)", "zh")
+        self.sub_whisper_lang.addItem("🇯🇵 Tiếng Nhật (Japanese)", "ja")
+        self.sub_whisper_lang.addItem("🇰🇷 Tiếng Hàn (Korean)", "ko")
+        self.sub_whisper_lang.addItem("🇮🇩 Indonesia (Bahasa)", "id")
+        self.sub_whisper_lang.addItem("🇪🇸 Tây Ban Nha (Spanish)", "es")
+        self.sub_whisper_lang.addItem("🇧🇷 Bồ Đào Nha (Portuguese)", "pt")
+        self.sub_whisper_lang.addItem("🇫🇷 Tiếng Pháp (French)", "fr")
+        self.sub_whisper_lang.addItem("🇩🇪 Tiếng Đức (German)", "de")
+        self.sub_whisper_lang.addItem("🇷🇺 Tiếng Nga (Russian)", "ru")
+        self.sub_whisper_lang.addItem("🇮🇳 Tiếng Hindi (India)", "hi")
+        self.sub_whisper_lang.addItem("🇸🇦 Tiếng Ả Rập (Arabic)", "ar")
+        self.sub_whisper_lang.setCurrentIndex(0)
+        self.sub_whisper_lang.setToolTip("Chọn ngôn ngữ của giọng đọc audio để Whisper AI nhận diện chính xác 100%, không bị nhầm lẫn ngôn ngữ.")
+
         self.sub_whisper_model = QComboBox()
-        self.sub_whisper_model.addItem("tiny (Siêu tốc)", "tiny")
-        self.sub_whisper_model.addItem("base (Cân bằng - Khuyên dùng)", "base")
-        self.sub_whisper_model.addItem("small (Chính xác cao)", "small")
+        self.sub_whisper_model.addItem("tiny (Siêu tốc - Nhẹ nhất, RAM 1GB)", "tiny")
+        self.sub_whisper_model.addItem("base (Cân bằng - Khuyên dùng, RAM 1GB)", "base")
+        self.sub_whisper_model.addItem("small (Chính xác cao, RAM 2GB)", "small")
+        self.sub_whisper_model.addItem("medium (Chính xác rất cao, RAM 5GB)", "medium")
+        self.sub_whisper_model.addItem("large-v3-turbo (Tối ưu tốc độ & chuẩn xác GPU, RAM 6GB)", "large-v3-turbo")
+        self.sub_whisper_model.addItem("large-v3 (Mô hình lớn nhất - Chuẩn xác 100%, RAM 10GB)", "large-v3")
+        self.sub_whisper_model.addItem("large-v2 (Large v2)", "large-v2")
         self.sub_whisper_model.setCurrentIndex(1)
-        auto_row.addWidget(self.sub_auto_transcribe, 2)
-        auto_row.addWidget(QLabel("Model:"))
-        auto_row.addWidget(self.sub_whisper_model, 1)
+        auto_row.addWidget(self.sub_auto_transcribe, 3)
+        auto_row.addWidget(QLabel("Ngôn ngữ:"))
+        auto_row.addWidget(self.sub_whisper_lang, 2)
+        auto_row.addWidget(QLabel("Model AI:"))
+        auto_row.addWidget(self.sub_whisper_model, 2)
+
+        # Hàng chọn Kiểu hiển thị phụ đề (3 chế độ)
+        mode_row = QHBoxLayout()
+        self.sub_mode_combo = QComboBox()
+        self.sub_mode_combo.addItem("📜 Cuộn 2 dòng (Truyện dài / Podcast - Dễ đọc nhất)", "rolling_2line")
+        self.sub_mode_combo.addItem("🎬 Chuẩn điện ảnh (Cụm câu trọn vẹn + Giữ đệm tối thiểu 2.5s)", "cinema_hold")
+        self.sub_mode_combo.addItem("✨ Karaoke Highlight (Shorts / TikTok - Sáng từng từ)", "karaoke_highlight")
+        self.sub_mode_combo.setToolTip("Chọn cách hiển thị phụ đề:\n- Cuộn 2 dòng: Giữ câu cũ ở trên, câu mới ở dưới giúp đọc kịp\n- Chuẩn điện ảnh: Giữ câu tối thiểu 2.5s không bị mất vội\n- Karaoke Highlight: Sáng từng từ theo nhịp giọng đọc")
+        
+        self.sub_highlight_color_btn = QPushButton("🎨 Chọn Màu Highlight...")
+        self.sub_highlight_color_btn.setFixedWidth(160)
+        self.sub_highlight_color_btn.clicked.connect(self._choose_sub_highlight_color)
+        self.sub_highlight_color_edit = QLineEdit("#FFE600")
+        self.sub_highlight_color_edit.setFixedWidth(85)
+        self.sub_highlight_color_edit.textChanged.connect(self._update_sub_highlight_btn_style)
+
+        mode_row.addWidget(self.sub_mode_combo, 2)
+        self.sub_highlight_widget = QWidget()
+        hw_layout = QHBoxLayout(self.sub_highlight_widget)
+        hw_layout.setContentsMargins(0, 0, 0, 0)
+        hw_layout.addWidget(QLabel("Màu Highlight:"))
+        hw_layout.addWidget(self.sub_highlight_color_edit)
+        hw_layout.addWidget(self.sub_highlight_color_btn)
+        mode_row.addWidget(self.sub_highlight_widget, 1)
+
+        self.sub_mode_combo.currentIndexChanged.connect(self._on_sub_mode_changed)
 
         form.addRow("Trạng thái", self.sub_enabled)
+        form.addRow("Kiểu hiển thị", mode_row)
         form.addRow("Quét Sub tự động", auto_row)
         form.addRow("Thư mục Sub (.srt)", folder_row)
-        form.addRow("Phông chữ & Kiểu", font_row)
-        form.addRow("Màu & Độ dày viền", color_row)
+
+        note_label = QLabel("💡 <i>Vị trí hiển thị, phông chữ, cỡ chữ, màu sắc, viền, độ dày và căn lề phụ đề hiện được quản lý trực quan tại tab <b>Studio Layout</b>.</i>")
+        note_label.setStyleSheet("color: #88c0d0; font-size: 11px;")
+        form.addRow(note_label)
+
         layout.addLayout(form)
 
-        # Bounding box selector widget
-        box_desc = QLabel("Vùng hiển thị phụ đề (Kéo thả khung để định vị & co giãn; Mặc định: 2 bên 15%, cao 20%, cách đáy 10%):")
-        box_desc.setStyleSheet("color: #00e5ff; font-weight: bold; font-size: 11px; margin-top: 4px;")
-        layout.addWidget(box_desc)
-
-        self.sub_box_selector = SubtitleBoxSelectorWidget()
-        self.sub_box_selector.setMinimumHeight(240)
-        layout.addWidget(self.sub_box_selector)
-
-        # Connect signals
-        self.sub_box_selector.box_changed.connect(lambda x, y, w, h: self._emit())
-        self.sub_font_color.textChanged.connect(self._update_sub_color_previews)
-        self.sub_outline_color.textChanged.connect(self._update_sub_color_previews)
-
-        for w in (self.sub_enabled, self.sub_auto_transcribe, self.sub_whisper_model, self.sub_folder_edit, self.sub_font_family, self.sub_font_size,
-                  self.sub_bold, self.sub_italic, self.sub_font_color, self.sub_outline_color, self.sub_outline_width):
+        for w in (self.sub_enabled, self.sub_auto_transcribe, self.sub_whisper_lang, self.sub_whisper_model, self.sub_folder_edit, self.sub_mode_combo, self.sub_highlight_color_edit):
             if hasattr(w, "stateChanged"):
-                w.stateChanged.connect(self._on_sub_style_changed)
+                w.stateChanged.connect(lambda: self._emit())
             elif hasattr(w, "currentIndexChanged"):
-                w.currentIndexChanged.connect(self._on_sub_style_changed)
-            elif hasattr(w, "valueChanged"):
-                w.valueChanged.connect(self._on_sub_style_changed)
+                w.currentIndexChanged.connect(lambda: self._emit())
             elif hasattr(w, "textChanged"):
-                w.textChanged.connect(self._on_sub_style_changed)
+                w.textChanged.connect(lambda: self._emit())
 
-        self._update_sub_color_previews()
+        self._on_sub_mode_changed()
+        self._update_sub_highlight_btn_style()
         return group
+
+    def _on_sub_mode_changed(self) -> None:
+        if hasattr(self, "sub_highlight_widget") and hasattr(self, "sub_mode_combo"):
+            is_karaoke = (self.sub_mode_combo.currentData() == "karaoke_highlight")
+            self.sub_highlight_widget.setVisible(is_karaoke)
+
+    def _update_sub_highlight_btn_style(self) -> None:
+        if hasattr(self, "sub_highlight_color_btn") and hasattr(self, "sub_highlight_color_edit"):
+            c = self.sub_highlight_color_edit.text().strip() or "#FFE600"
+            self.sub_highlight_color_btn.setStyleSheet(f"background-color: {c}; color: #000000; font-weight: bold; border-radius: 3px;")
+
+    def _choose_sub_highlight_color(self) -> None:
+        current_c = QColor(self.sub_highlight_color_edit.text().strip() or "#FFE600")
+        color = QColorDialog.getColor(current_c, self, "Chọn màu Highlight Karaoke")
+        if color.isValid():
+            self.sub_highlight_color_edit.setText(color.name().upper())
+            self._update_sub_highlight_btn_style()
+            self._emit()
 
     def _choose_sub_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục chứa file phụ đề (.srt)", self.sub_folder_edit.text().strip())
@@ -1073,35 +1256,15 @@ class SettingTab(QWidget):
             self._emit()
 
     def _choose_sub_font_color(self) -> None:
-        c = QColorDialog.getColor(QColor(self.sub_font_color.text().strip() or "#FFFFFF"), self, "Chọn màu chữ phụ đề")
-        if c.isValid():
-            self.sub_font_color.setText(c.name().upper())
-            self._on_sub_style_changed()
+        pass
 
     def _choose_sub_outline_color(self) -> None:
-        c = QColorDialog.getColor(QColor(self.sub_outline_color.text().strip() or "#000000"), self, "Chọn màu viền phụ đề")
-        if c.isValid():
-            self.sub_outline_color.setText(c.name().upper())
-            self._on_sub_style_changed()
+        pass
 
     def _update_sub_color_previews(self) -> None:
-        fc = self.sub_font_color.text().strip() or "#FFFFFF"
-        oc = self.sub_outline_color.text().strip() or "#000000"
-        self.sub_color_preview.setStyleSheet(f"background-color: {fc}; border: 1px solid #555; border-radius: 3px;")
-        self.sub_outline_color_preview.setStyleSheet(f"background-color: {oc}; border: 1px solid #555; border-radius: 3px;")
+        pass
 
     def _on_sub_style_changed(self) -> None:
-        self._update_sub_color_previews()
-        if hasattr(self, "sub_box_selector"):
-            self.sub_box_selector.set_style(
-                font_family=self.sub_font_family.currentText(),
-                font_size=self.sub_font_size.value(),
-                font_color=self.sub_font_color.text().strip() or "#FFFFFF",
-                outline_color=self.sub_outline_color.text().strip() or "#000000",
-                outline_width=self.sub_outline_width.value(),
-                bold=self.sub_bold.isChecked(),
-                italic=self.sub_italic.isChecked(),
-            )
         self._emit()
 
     def _build_background_music_group(self) -> QGroupBox:
@@ -1269,9 +1432,22 @@ class SettingTab(QWidget):
         self.image_motion_enabled = QCheckBox("Bật chuyển động")
         self.image_motion_enabled.setChecked(True)
         self.effect_combo = QComboBox()
-        self.effect_combo.addItem("Nhẹ (Auto Light)", "auto_light")
-        self.effect_combo.addItem("Đa dạng (Auto Rich)", "auto_rich")
-        self.effect_combo.addItem("Tắt hiệu ứng", "none")
+        self.effect_combo.addItem("✨ Xoay tua thông minh (Auto Smart)", "auto_smart")
+        self.effect_combo.addItem("🌟 Nhẹ nhàng (Auto Light)", "auto_light")
+        self.effect_combo.addItem("🔥 Đa dạng (Auto Rich)", "auto_rich")
+        self.effect_combo.addItem("🔍 Zoom In (Tâm)", "zoom_in_center")
+        self.effect_combo.addItem("🔎 Zoom Out (Tâm)", "zoom_out_center")
+        self.effect_combo.addItem("↖️ Zoom In (Góc Trên Trái)", "zoom_in_top_left")
+        self.effect_combo.addItem("↗️ Zoom In (Góc Trên Phải)", "zoom_in_top_right")
+        self.effect_combo.addItem("↙️ Zoom In (Góc Dưới Trái)", "zoom_in_bottom_left")
+        self.effect_combo.addItem("↘️ Zoom In (Góc Dưới Phải)", "zoom_in_bottom_right")
+        self.effect_combo.addItem("⬅️ Pan Sang Trái", "pan_left")
+        self.effect_combo.addItem("➡️ Pan Sang Phải", "pan_right")
+        self.effect_combo.addItem("⬆️ Pan Lên Trên", "pan_up")
+        self.effect_combo.addItem("⬇️ Pan Xuống Dưới", "pan_down")
+        self.effect_combo.addItem("💓 Smooth Pulse (Nhịp thở)", "smooth_pulse")
+        self.effect_combo.addItem("🔄 Loop Pan & Zoom", "loop_pan_zoom")
+        self.effect_combo.addItem("⛔ Tắt hiệu ứng (Ảnh tĩnh)", "none")
         self.image_motion_demo = ImageMotionDemoWidget()
         col1_layout.addWidget(self.image_motion_enabled)
         col1_layout.addWidget(self.effect_combo)
@@ -1338,9 +1514,28 @@ class SettingTab(QWidget):
         self.transition_enabled = QCheckBox("Bật chuyển cảnh")
         self.transition_enabled.setChecked(True)
         self.transition_combo = QComboBox()
-        self.transition_combo.addItem("Nhẹ (Auto Light)", "auto_light")
-        self.transition_combo.addItem("Đa dạng (Auto Rich)", "auto_rich")
-        self.transition_combo.addItem("Cut (Tắt hiệu ứng)", "none")
+        self.transition_combo.addItem("✨ Auto Mượt mà (Soft Blend)", "auto_soft")
+        self.transition_combo.addItem("⚡ Auto Đa dạng (All FX)", "auto_dynamic")
+        self.transition_combo.addItem("🌟 Auto Light (Cơ bản)", "auto_light")
+        self.transition_combo.addItem("🔥 Auto Rich (Phong phú)", "auto_rich")
+        self.transition_combo.addItem("🌫️ Crossfade (Mờ dần)", "fade")
+        self.transition_combo.addItem("⬛ Fade to Black (Đen dần)", "fadeblack")
+        self.transition_combo.addItem("⬜ Fade to White (Trắng chớp)", "fadewhite")
+        self.transition_combo.addItem("💫 Dissolve (Hòa tan)", "dissolve")
+        self.transition_combo.addItem("⬅️ Slide Left (Trượt trái)", "slideleft")
+        self.transition_combo.addItem("➡️ Slide Right (Trượt phải)", "slideright")
+        self.transition_combo.addItem("⬆️ Slide Up (Trượt lên)", "slideup")
+        self.transition_combo.addItem("⬇️ Slide Down (Trượt xuống)", "slidedown")
+        self.transition_combo.addItem("🧹 Wipe Left (Quét trái)", "wipeleft")
+        self.transition_combo.addItem("🧹 Wipe Right (Quét phải)", "wiperight")
+        self.transition_combo.addItem("🧹 Wipe Up (Quét lên)", "wipeup")
+        self.transition_combo.addItem("🧹 Wipe Down (Quét xuống)", "wipedown")
+        self.transition_combo.addItem("⭕ Circle Open (Vòng tròn)", "circleopen")
+        self.transition_combo.addItem("⚫ Circle Close", "circleclose")
+        self.transition_combo.addItem("🔍 Zoom In", "zoomin")
+        self.transition_combo.addItem("👾 Pixelize (Vỡ hạt)", "pixelize")
+        self.transition_combo.addItem("🌀 Radial (Quạt xoay)", "radial")
+        self.transition_combo.addItem("✂️ Cut (Tắt chuyển cảnh)", "none")
         self.transition_demo = TransitionDemoWidget()
         col3_layout.addWidget(self.transition_enabled)
         col3_layout.addWidget(self.transition_combo)
@@ -1457,9 +1652,21 @@ class SettingTab(QWidget):
         self.fps_spin.setValue(30)
 
         self.quality_combo = QComboBox()
-        self.quality_combo.addItem("High (CRF 18 / Tốt nhất)", "high")
-        self.quality_combo.addItem("Standard (CRF 23 / Chuẩn)", "standard")
-        self.quality_combo.addItem("Low (CRF 28 / Nhẹ)", "low")
+        self.quality_combo.addItem("Siêu nhẹ - Audio/Truyện dài (~1.5 Mbps, ~1.2 GB/2h)", "economy")
+        self.quality_combo.addItem("Chuẩn 1080p Audio/Slide (~2.2 Mbps, ~1.8 GB/2h - Khuyên dùng)", "standard")
+        self.quality_combo.addItem("Chất lượng cao (~3.5 Mbps, ~2.8 GB/2h)", "high")
+        self.quality_combo.addItem("Tùy chỉnh Bitrate (Custom Kbps)", "custom")
+
+        self.custom_bitrate_spin = QSpinBox()
+        self.custom_bitrate_spin.setRange(500, 30000)
+        self.custom_bitrate_spin.setSingleStep(100)
+        self.custom_bitrate_spin.setValue(2200)
+        self.custom_bitrate_spin.setSuffix(" kbps")
+
+        self.custom_bitrate_label = QLabel("Bitrate tùy chỉnh:")
+
+        self.estimated_size_label = QLabel()
+        self.estimated_size_label.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 11px;")
 
         out_row = QHBoxLayout()
         self.output_edit = QLineEdit("output")
@@ -1471,9 +1678,57 @@ class SettingTab(QWidget):
         form.addRow("Tỉ lệ khung hình", self.ratio_combo)
         form.addRow("FPS", self.fps_spin)
         form.addRow("Chất lượng xuất", self.quality_combo)
+        form.addRow(self.custom_bitrate_label, self.custom_bitrate_spin)
+        form.addRow("Ước tính dung lượng", self.estimated_size_label)
         form.addRow("Thư mục xuất", out_row)
-        self._connect_change_widgets(self.ratio_combo, self.fps_spin, self.quality_combo, self.output_edit)
+
+        self.quality_combo.currentIndexChanged.connect(self._on_quality_changed)
+        self.fps_spin.valueChanged.connect(self._update_estimated_size)
+        self.ratio_combo.currentIndexChanged.connect(self._update_estimated_size)
+        self.custom_bitrate_spin.valueChanged.connect(self._update_estimated_size)
+
+        self._connect_change_widgets(
+            self.ratio_combo, self.fps_spin, self.quality_combo,
+            self.custom_bitrate_spin, self.output_edit
+        )
+        self._on_quality_changed()
         return group
+
+    def _on_quality_changed(self) -> None:
+        if hasattr(self, "quality_combo") and hasattr(self, "custom_bitrate_label") and hasattr(self, "custom_bitrate_spin"):
+            is_custom = (self.quality_combo.currentData() == "custom")
+            self.custom_bitrate_label.setVisible(is_custom)
+            self.custom_bitrate_spin.setVisible(is_custom)
+        self._update_estimated_size()
+        self._emit()
+
+    def _update_estimated_size(self) -> None:
+        if not hasattr(self, "quality_combo") or not hasattr(self, "estimated_size_label"):
+            return
+        q = str(self.quality_combo.currentData() or "standard").lower()
+        if q in ["economy", "low", "draft"]:
+            base_kbps = 1500
+        elif q == "high":
+            base_kbps = 3500
+        elif q == "ultra":
+            base_kbps = 5500
+        elif q == "custom":
+            base_kbps = self.custom_bitrate_spin.value() if hasattr(self, "custom_bitrate_spin") else 2200
+        else:
+            base_kbps = 2200
+
+        fps = self.fps_spin.value() if hasattr(self, "fps_spin") else 30
+        fps_scale = min(1.30, max(0.70, fps / 30.0))
+        video_kbps = base_kbps * fps_scale
+        total_kbps = video_kbps + 192  # Audio AAC 192k
+
+        # Tính dung lượng: (total_kbps * 1000 bits * seconds) / (8 * 1024 * 1024 * 1024)
+        size_1h_gb = (total_kbps * 1000 * 3600) / (8 * (1024**3))
+        size_2h_gb = size_1h_gb * 2.0
+
+        self.estimated_size_label.setText(
+            f"💡 Dự kiến: ~{size_1h_gb:.1f} GB / 1 giờ  (~{size_2h_gb:.1f} GB / 2 giờ) — Tải lên YouTube cực nhanh"
+        )
 
     def _build_performance_group(self) -> QGroupBox:
         group = QGroupBox()
@@ -1611,16 +1866,6 @@ class SettingTab(QWidget):
         settings.update({
             "intro_file": self.intro_edit.text().strip(),
             "outro_file": self.outro_edit.text().strip(),
-            "logo_file": self.logo_edit.text().strip(),
-            "logo_enabled": self.logo_enabled.isChecked(),
-            "logo_position": self.logo_position.currentData(),
-            "logo_scale": self.logo_scale.value(),
-            "logo_margin_x": self.logo_margin_x.value(),
-            "logo_margin_y": self.logo_margin_y.value(),
-            "watermark_file": self.watermark_edit.text().strip(),
-            "watermark_enabled": self.watermark_enabled.isChecked(),
-            "watermark_opacity": self.watermark_opacity.value(),
-            "watermark_scale": self.watermark_scale.value(),
             "background_music": {
                 "enabled": self.bgm_enabled.isChecked(),
                 "file": self._list_items(self.bgm_list)[0] if self._list_items(self.bgm_list) else "",
@@ -1679,7 +1924,10 @@ class SettingTab(QWidget):
             },
             "subtitle": {
                 "enabled": self.sub_enabled.isChecked() if hasattr(self, "sub_enabled") else False,
+                "sub_mode": self.sub_mode_combo.currentData() if hasattr(self, "sub_mode_combo") else "rolling_2line",
+                "highlight_color": self.sub_highlight_color_edit.text().strip() or "#FFE600" if hasattr(self, "sub_highlight_color_edit") else "#FFE600",
                 "auto_transcribe": self.sub_auto_transcribe.isChecked() if hasattr(self, "sub_auto_transcribe") else False,
+                "whisper_language": self.sub_whisper_lang.currentData() if hasattr(self, "sub_whisper_lang") else "auto",
                 "whisper_model": self.sub_whisper_model.currentData() if hasattr(self, "sub_whisper_model") else "base",
                 "folder": self.sub_folder_edit.text().strip() if hasattr(self, "sub_folder_edit") else "",
                 "font_family": self.sub_font_family.currentText() if hasattr(self, "sub_font_family") else "Arial",
@@ -1700,6 +1948,7 @@ class SettingTab(QWidget):
                 "height": height,
                 "fps": self.fps_spin.value(),
                 "quality": self.quality_combo.currentData(),
+                "custom_bitrate_kbps": self.custom_bitrate_spin.value() if hasattr(self, "custom_bitrate_spin") else 2200,
                 "format": "mp4",
                 "output_folder": self.output_edit.text().strip() or "output",
             },
@@ -1712,16 +1961,6 @@ class SettingTab(QWidget):
 
         self.intro_edit.setText(settings.get("intro_file", ""))
         self.outro_edit.setText(settings.get("outro_file", ""))
-        self.logo_edit.setText(settings.get("logo_file", ""))
-        self.logo_enabled.setChecked(bool(settings.get("logo_enabled", False)))
-        self._set_combo_by_data(self.logo_position, settings.get("logo_position", "top_right"))
-        self.logo_scale.setValue(float(settings.get("logo_scale", 0.12)))
-        self.logo_margin_x.setValue(int(settings.get("logo_margin_x", 30)))
-        self.logo_margin_y.setValue(int(settings.get("logo_margin_y", 30)))
-        self.watermark_edit.setText(settings.get("watermark_file", ""))
-        self.watermark_enabled.setChecked(bool(settings.get("watermark_enabled", False)))
-        self.watermark_opacity.setValue(float(settings.get("watermark_opacity", 0.2)))
-        self.watermark_scale.setValue(float(settings.get("watermark_scale", 1.0)))
 
         bgm = settings.get("background_music", {}) or {}
         self.bgm_list.clear()
@@ -1749,15 +1988,9 @@ class SettingTab(QWidget):
         self.promo_avoid_repeat.setChecked(bool(promo.get("avoid_repeat", True)))
 
         self.image_duration_combo.setCurrentText(str(settings.get("image_duration_mode", "auto")))
-        effect_mode = settings.get("effect_mode", "auto_light")
+        effect_mode = settings.get("effect_mode", "auto_smart")
         im_on = bool(settings.get("image_motion_enabled", effect_mode != "none"))
         self.image_motion_enabled.setChecked(im_on)
-        if effect_mode in ["random_light", "auto_light"]:
-            effect_mode = "auto_light"
-        elif effect_mode in ["random_rich", "auto_rich"]:
-            effect_mode = "auto_rich"
-        elif effect_mode == "none":
-            effect_mode = "auto_light"
         self._set_combo_by_data(self.effect_combo, effect_mode)
 
         video_fx = settings.get("video_effect_mode", "bubbles")
@@ -1773,13 +2006,9 @@ class SettingTab(QWidget):
         if hasattr(self, "custom_layer_row"):
             self.custom_layer_row.setVisible(ve_on and self.video_effect_combo.currentData() == "custom")
 
-        transition_mode = settings.get("transition_mode", "auto_light")
+        transition_mode = settings.get("transition_mode", "auto_soft")
         tr_on = bool(settings.get("transition_enabled", transition_mode != "none"))
         self.transition_enabled.setChecked(tr_on)
-        if transition_mode in ["random_basic", "auto_light", "fade"]:
-            transition_mode = "auto_light"
-        elif transition_mode == "none":
-            transition_mode = "auto_light"
         self._set_combo_by_data(self.transition_combo, transition_mode)
         self.transition_duration.setValue(float(settings.get("transition_duration", 0.5)))
         self.audio_speed_spin.setValue(float(settings.get("audio_speed", 1.0)))
@@ -1813,54 +2042,32 @@ class SettingTab(QWidget):
         sub_cfg = settings.get("subtitle", {}) or {}
         if hasattr(self, "sub_enabled"):
             self.sub_enabled.setChecked(bool(sub_cfg.get("enabled", False)))
+            if hasattr(self, "sub_mode_combo"):
+                self._set_combo_by_data(self.sub_mode_combo, sub_cfg.get("sub_mode", "rolling_2line"))
+            if hasattr(self, "sub_highlight_color_edit"):
+                self.sub_highlight_color_edit.setText(str(sub_cfg.get("highlight_color", "#FFE600") or "#FFE600"))
+                self._update_sub_highlight_btn_style()
             if hasattr(self, "sub_auto_transcribe"):
                 self.sub_auto_transcribe.setChecked(bool(sub_cfg.get("auto_transcribe", False)))
+            if hasattr(self, "sub_whisper_lang"):
+                self._set_combo_by_data(self.sub_whisper_lang, sub_cfg.get("whisper_language", "auto"))
             if hasattr(self, "sub_whisper_model"):
                 self._set_combo_by_data(self.sub_whisper_model, sub_cfg.get("whisper_model", "base"))
             self.sub_folder_edit.setText(str(sub_cfg.get("folder", "") or ""))
-            font_fam = str(sub_cfg.get("font_family", "Arial") or "Arial")
-            idx = self.sub_font_family.findText(font_fam)
-            if idx >= 0:
-                self.sub_font_family.setCurrentIndex(idx)
-            else:
-                self.sub_font_family.setEditText(font_fam)
-            self.sub_font_size.setValue(int(sub_cfg.get("font_size", 38) or 38))
-            self.sub_bold.setChecked(bool(sub_cfg.get("bold", True)))
-            self.sub_italic.setChecked(bool(sub_cfg.get("italic", False)))
-            self.sub_font_color.setText(str(sub_cfg.get("font_color", "#FFFFFF") or "#FFFFFF"))
-            self.sub_outline_color.setText(str(sub_cfg.get("outline_color", "#000000") or "#000000"))
-            self.sub_outline_width.setValue(float(sub_cfg.get("outline_width", 2.5) or 2.5))
-            self._update_sub_color_previews()
-
-            bx = float(sub_cfg.get("box_x", 0.15))
-            by = float(sub_cfg.get("box_y", 0.70))
-            bw = float(sub_cfg.get("box_w", 0.70))
-            bh = float(sub_cfg.get("box_h", 0.20))
-            if hasattr(self, "sub_box_selector"):
-                self.sub_box_selector.set_box(bx, by, bw, bh)
-                self.sub_box_selector.set_style(
-                    font_family=font_fam,
-                    font_size=self.sub_font_size.value(),
-                    font_color=self.sub_font_color.text().strip(),
-                    outline_color=self.sub_outline_color.text().strip(),
-                    outline_width=self.sub_outline_width.value(),
-                    bold=self.sub_bold.isChecked(),
-                    italic=self.sub_italic.isChecked(),
-                )
 
         export = settings.get("export", {})
         self.fps_spin.setValue(int(export.get("fps", 30)))
         self.output_edit.setText(export.get("output_folder", "output"))
         self._set_ratio(export.get("width", 1920), export.get("height", 1080))
-        self._set_combo_by_data(self.quality_combo, export.get("quality", "standard"))
-
-        if hasattr(self, "sub_box_selector") and hasattr(self, "ratio_combo"):
-            r_data = self.ratio_combo.currentData()
-            if r_data:
-                self.sub_box_selector.set_aspect_ratio(r_data[2], r_data[0], r_data[1])
+        quality_val = str(export.get("quality", "standard") or "standard").lower()
+        if quality_val in ["draft", "low"]:
+            quality_val = "economy"
+        self._set_combo_by_data(self.quality_combo, quality_val)
+        if hasattr(self, "custom_bitrate_spin"):
+            self.custom_bitrate_spin.setValue(int(export.get("custom_bitrate_kbps", 2200) or 2200))
+        self._on_quality_changed()
 
         self._update_effect_demo()
-        self.layout_preview.update_settings(settings)
         self._lock_emit = False
 
     def _update_all_effect_demos(self) -> None:
@@ -1936,7 +2143,7 @@ class SettingTab(QWidget):
 
     def set_locked(self, locked: bool) -> None:
         for widget in self.findChildren(QWidget):
-            if widget is not self and widget is not self.layout_preview:
+            if widget is not self:
                 widget.setEnabled(not locked)
 
     def _set_ratio(self, width: int, height: int) -> None:
@@ -1967,11 +2174,6 @@ class SettingTab(QWidget):
     def _emit(self, *args: Any) -> None:
         if self._lock_emit:
             return
-        if hasattr(self, "sub_box_selector") and hasattr(self, "ratio_combo"):
-            r_data = self.ratio_combo.currentData()
-            if r_data:
-                self.sub_box_selector.set_aspect_ratio(r_data[2], r_data[0], r_data[1])
         settings = self.collect_settings()
         self.settings = settings
         self.settings_changed.emit(settings)
-        self.layout_preview.update_settings(settings)
