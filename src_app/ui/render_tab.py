@@ -17,7 +17,7 @@ from PySide6.QtCore import QThread, Signal, Slot, QTimer, Qt, QUrl
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem,
     QTextEdit, QProgressBar, QMessageBox, QAbstractItemView, QGroupBox, QListWidget,
     QFileDialog, QCheckBox, QLabel, QSlider, QFrame, QSplitter, QHeaderView, QComboBox,
     QDialog, QLineEdit, QRadioButton, QButtonGroup, QSpinBox
@@ -77,212 +77,250 @@ class DurationLoaderThread(QThread):
 
 
 class TitleMixerDialog(QDialog):
-    """Hộp thoại thông minh phối lại và làm sạch tiêu đề video hàng loạt."""
+    """Hộp thoại chỉnh sửa & phối lại tiêu đề hàng loạt dạng 2 cột:
+    - Bên trái: Danh sách tiêu đề hiện tại (có số thứ tự STT, nút Sao chép toàn bộ).
+    - Bên phải: Textarea để nhập/dán danh sách tiêu đề mới (mỗi dòng 1 tiêu đề).
+    - Tự động giữ nguyên tiêu đề gốc nếu nhập thiếu dòng.
+    """
 
     def __init__(self, parent: QWidget | None, current_items: List[Tuple[str, str]]) -> None:
         super().__init__(parent)
-        self.setWindowTitle("🪄 Phối lại & Làm sạch Tiêu đề Video")
-        self.resize(780, 560)
+        self.setWindowTitle("🪄 Phối lại & Nhập Hàng Loạt Tiêu Đề Video")
+        self.resize(1000, 640)
         self.current_items = current_items  # List of (audio_path, current_title)
         self.result_titles: List[str] = [t for _, t in current_items]
 
         self._build_ui()
-        self._update_preview()
+        self._sync_preview()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
-        # 1. Khung tùy chọn phối tiêu đề
-        opt_group = QGroupBox("Cấu hình Phối & Làm sạch Tiêu đề")
-        opt_layout = QVBoxLayout(opt_group)
-        opt_layout.setSpacing(8)
+        # Thanh hướng dẫn trên cùng
+        guide_frame = QFrame()
+        guide_frame.setStyleSheet("background-color: #f0f7ff; border: 1px solid #cce3ff; border-radius: 6px; padding: 6px;")
+        guide_layout = QHBoxLayout(guide_frame)
+        guide_layout.setContentsMargins(8, 4, 8, 4)
+        info_icon = QLabel("💡")
+        info_icon.setStyleSheet("font-size: 16px;")
+        guide_layout.addWidget(info_icon)
+        guide_text = QLabel(
+            "<b>Hướng dẫn nhanh:</b> Bấm <b>'📋 Sao chép toàn bộ'</b> bên trái ➔ Dán sang AI / ChatGPT viết lại ➔ Dán danh sách tiêu đề mới vào ô bên phải (mỗi tiêu đề 1 dòng).<br>"
+            "Nếu nhập thiếu dòng, các video còn lại sẽ tự động giữ nguyên tiêu đề ban đầu."
+        )
+        guide_text.setStyleSheet("color: #1a56a0; font-size: 12px;")
+        guide_layout.addWidget(guide_text, 1)
+        layout.addWidget(guide_frame)
 
-        # Hàng 1: Cắt bỏ tên kênh sau ký tự phân cách
-        sep_row = QHBoxLayout()
-        self.chk_sep = QCheckBox("Cắt bỏ tên kênh sau ký tự phân cách:")
-        self.chk_sep.setChecked(True)
-        self.chk_sep.toggled.connect(self._update_preview)
-        self.edit_sep = QLineEdit("|")
-        self.edit_sep.setMaximumWidth(60)
-        self.edit_sep.textChanged.connect(self._update_preview)
-        sep_hint = QLabel("(Ví dụ: cắt bỏ ' | Barangay Love Stories | Papa Dudut')")
-        sep_hint.setStyleSheet("color: #888; font-size: 11px;")
-        sep_row.addWidget(self.chk_sep)
-        sep_row.addWidget(self.edit_sep)
-        sep_row.addWidget(sep_hint)
-        sep_row.addStretch(1)
-        opt_layout.addLayout(sep_row)
+        # Khung chính 2 cột (Splitter)
+        splitter = QSplitter(Qt.Horizontal)
 
-        # Hàng 2: Tìm và thay thế cụm từ
-        replace_row = QHBoxLayout()
-        self.chk_replace = QCheckBox("Tìm và thay thế cụm từ:")
-        self.chk_replace.toggled.connect(self._update_preview)
-        self.edit_find = QLineEdit("")
-        self.edit_find.setPlaceholderText("Từ cần tìm (ví dụ: Papa Dudut)")
-        self.edit_find.textChanged.connect(self._update_preview)
-        self.edit_replace = QLineEdit("")
-        self.edit_replace.setPlaceholderText("Thay bằng (để trống nếu muốn xóa)")
-        self.edit_replace.textChanged.connect(self._update_preview)
-        replace_row.addWidget(self.chk_replace)
-        replace_row.addWidget(self.edit_find)
-        replace_row.addWidget(QLabel("➔"))
-        replace_row.addWidget(self.edit_replace)
-        opt_layout.addLayout(replace_row)
+        # === CỘT TRÁI: DANH SÁCH GỐC ===
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 5, 0)
+        left_layout.setSpacing(6)
 
-        # Hàng 3: Tiền tố & Hậu tố
-        fix_row = QHBoxLayout()
-        self.chk_prefix = QCheckBox("Thêm Tiền tố:")
-        self.chk_prefix.toggled.connect(self._update_preview)
-        self.edit_prefix = QLineEdit("")
-        self.edit_prefix.setPlaceholderText("VD: Tập {stt:02d} - ")
-        self.edit_prefix.textChanged.connect(self._update_preview)
+        left_header = QHBoxLayout()
+        self.left_title_label = QLabel(f"<b>📄 Danh sách Tiêu đề hiện tại ({len(self.current_items)} video):</b>")
+        left_header.addWidget(self.left_title_label)
+        left_header.addStretch(1)
 
-        self.chk_suffix = QCheckBox("Thêm Hậu tố:")
-        self.chk_suffix.toggled.connect(self._update_preview)
-        self.edit_suffix = QLineEdit("")
-        self.edit_suffix.setPlaceholderText("VD: (Bản Chuẩn)")
-        self.edit_suffix.textChanged.connect(self._update_preview)
+        self.btn_copy_all = QPushButton("📋 Sao chép toàn bộ")
+        self.btn_copy_all.setStyleSheet("font-weight: bold; background-color: #0288d1; color: white; padding: 4px 10px; border-radius: 4px;")
+        self.btn_copy_all.setToolTip("Sao chép toàn bộ danh sách tiêu đề vào Clipboard (mỗi tiêu đề 1 dòng)")
+        self.btn_copy_all.clicked.connect(self._copy_all_titles)
+        left_header.addWidget(self.btn_copy_all)
+        left_layout.addLayout(left_header)
 
-        fix_row.addWidget(self.chk_prefix)
-        fix_row.addWidget(self.edit_prefix)
-        fix_row.addSpacing(15)
-        fix_row.addWidget(self.chk_suffix)
-        fix_row.addWidget(self.edit_suffix)
-        opt_layout.addLayout(fix_row)
+        # Bảng danh sách tiêu đề gốc
+        self.left_table = QTableWidget(len(self.current_items), 2)
+        self.left_table.setHorizontalHeaderLabels(["STT", "Tiêu đề hiện tại"])
+        self.left_table.setColumnWidth(0, 50)
+        self.left_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.left_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.left_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.left_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
 
-        # Hàng 4: Định dạng chữ & Làm sạch khoảng trắng
-        fmt_row = QHBoxLayout()
-        fmt_row.addWidget(QLabel("Định dạng chữ:"))
-        self.rb_keep = QRadioButton("Giữ nguyên")
-        self.rb_keep.setChecked(True)
-        self.rb_title = QRadioButton("Viết Hoa Đầu Từ")
-        self.rb_upper = QRadioButton("VIẾT HOA")
-        self.rb_lower = QRadioButton("viết thường")
-        self.bg_fmt = QButtonGroup(self)
-        self.bg_fmt.addButton(self.rb_keep)
-        self.bg_fmt.addButton(self.rb_title)
-        self.bg_fmt.addButton(self.rb_upper)
-        self.bg_fmt.addButton(self.rb_lower)
-        self.bg_fmt.buttonToggled.connect(self._update_preview)
+        for r, (audio_p, title) in enumerate(self.current_items):
+            stt_item = QTableWidgetItem(f"{r + 1}")
+            stt_item.setTextAlignment(Qt.AlignCenter)
+            self.left_table.setItem(r, 0, stt_item)
+            t_item = QTableWidgetItem(title)
+            t_item.setToolTip(f"File gốc: {Path(audio_p).name}")
+            self.left_table.setItem(r, 1, t_item)
 
-        fmt_row.addWidget(self.rb_keep)
-        fmt_row.addWidget(self.rb_title)
-        fmt_row.addWidget(self.rb_upper)
-        fmt_row.addWidget(self.rb_lower)
-        fmt_row.addStretch(1)
+        left_layout.addWidget(self.left_table, 1)
 
-        self.chk_clean_space = QCheckBox("Xóa khoảng trắng thừa")
-        self.chk_clean_space.setChecked(True)
-        self.chk_clean_space.toggled.connect(self._update_preview)
-        fmt_row.addWidget(self.chk_clean_space)
-        opt_layout.addLayout(fmt_row)
+        # Công cụ lọc nhanh cho cột trái
+        quick_bar = QHBoxLayout()
+        self.btn_quick_strip = QPushButton("✂️ Lọc sau dấu |")
+        self.btn_quick_strip.setToolTip("Cắt bỏ phần tên kênh sau dấu | cho toàn bộ tiêu đề (ví dụ: '3 AM | Papa Dudut' ➔ '3 AM')")
+        self.btn_quick_strip.clicked.connect(self._quick_strip_channel_names)
+        quick_bar.addWidget(self.btn_quick_strip)
 
-        layout.addWidget(opt_group)
+        self.btn_quick_number = QPushButton("🔢 Thêm Tập 01, 02...")
+        self.btn_quick_number.setToolTip("Thêm tiền tố 'Tập 01 - ', 'Tập 02 - ' vào trước danh sách")
+        self.btn_quick_number.clicked.connect(self._quick_add_episode_numbers)
+        quick_bar.addWidget(self.btn_quick_number)
+        quick_bar.addStretch(1)
+        left_layout.addLayout(quick_bar)
 
-        # 2. Khung xem trước trực tiếp (Live Preview)
-        preview_group = QGroupBox("Xem trước Tiêu đề Video (Trước ➔ Sau)")
-        preview_layout = QVBoxLayout(preview_group)
+        splitter.addWidget(left_widget)
 
-        self.preview_table = QTableWidget(0, 2)
-        self.preview_table.setHorizontalHeaderLabels(["Tiêu đề hiện tại", "Tiêu đề sau khi phối"])
-        self.preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        # === CỘT PHẢI: TEXTAREA NHẬP HÀNG LOẠT ===
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(5, 0, 0, 0)
+        right_layout.setSpacing(6)
+
+        right_header = QHBoxLayout()
+        self.right_title_label = QLabel("<b>✍️ Nhập Tiêu đề mới (Mỗi dòng 1 tiêu đề):</b>")
+        right_header.addWidget(self.right_title_label)
+        right_header.addStretch(1)
+
+        self.line_count_label = QLabel("Đã nhập: 0 dòng")
+        self.line_count_label.setStyleSheet("color: #777; font-weight: bold; font-size: 11px;")
+        right_header.addWidget(self.line_count_label)
+
+        self.btn_paste = QPushButton("📋 Dán từ Clipboard")
+        self.btn_paste.clicked.connect(self._paste_from_clipboard)
+        right_header.addWidget(self.btn_paste)
+
+        self.btn_clear_text = QPushButton("🧹 Xóa trắng")
+        self.btn_clear_text.clicked.connect(self._clear_input_text)
+        right_header.addWidget(self.btn_clear_text)
+        right_layout.addLayout(right_header)
+
+        # Textarea nhập tiêu đề
+        self.text_input = QTextEdit()
+        self.text_input.setPlaceholderText(
+            "Dán danh sách tiêu đề mới vào đây...\n"
+            "Mỗi dòng tương ứng với 1 video theo STT bên trái.\n\n"
+            "Ví dụ:\n"
+            "Tập 01 - Câu chuyện đêm muộn 3 AM\n"
+            "Tập 02 - Tàu ma lúc nửa đêm\n"
+            "Tập 03 - Người lạ trong ngôi nhà cổ"
+        )
+        self.text_input.textChanged.connect(self._on_input_text_changed)
+        right_layout.addWidget(self.text_input, 1)
+
+        splitter.addWidget(right_widget)
+        splitter.setSizes([460, 540])
+        layout.addWidget(splitter, 1)
+
+        # Bảng xem trước kết quả thay đổi (Trước ➔ Sau)
+        preview_box = QGroupBox("Xem trước Kết quả Thay đổi sẽ Áp dụng")
+        preview_layout = QVBoxLayout(preview_box)
+        preview_layout.setContentsMargins(6, 6, 6, 6)
+
+        self.preview_table = QTableWidget(len(self.current_items), 3)
+        self.preview_table.setHorizontalHeaderLabels(["STT", "Tiêu đề hiện tại", "Tiêu đề mới (Sẽ thay thế)"])
+        self.preview_table.setColumnWidth(0, 45)
+        self.preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self.preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.preview_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.preview_table.setMaximumHeight(150)
         self.preview_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         preview_layout.addWidget(self.preview_table)
-        layout.addWidget(preview_group, 1)
+        layout.addWidget(preview_box)
 
-        # 3. Hàng nút xác nhận
-        btn_box = QHBoxLayout()
-        self.btn_reset = QPushButton("Khôi phục tiêu đề gốc")
-        self.btn_reset.clicked.connect(self._reset_to_original_stems)
-        btn_box.addWidget(self.btn_reset)
-        btn_box.addStretch(1)
+        # Hàng nút điều khiển dưới cùng
+        bottom_bar = QHBoxLayout()
+        self.status_msg_label = QLabel("")
+        self.status_msg_label.setStyleSheet("color: #2e7d32; font-weight: bold; font-size: 12px;")
+        bottom_bar.addWidget(self.status_msg_label)
+        bottom_bar.addStretch(1)
 
-        self.btn_cancel = QPushButton("Hủy")
+        self.btn_cancel = QPushButton("Đóng / Hủy")
         self.btn_cancel.clicked.connect(self.reject)
-        self.btn_apply = QPushButton("✔ Áp dụng vào bảng Queue")
-        self.btn_apply.setStyleSheet("font-weight: bold; background-color: #2e7d32; color: white; padding: 6px 18px; border-radius: 4px;")
+        self.btn_apply = QPushButton("✔ Áp dụng Tiêu đề Mới vào Queue")
+        self.btn_apply.setStyleSheet("font-weight: bold; font-size: 13px; background-color: #2e7d32; color: white; padding: 7px 20px; border-radius: 4px;")
         self.btn_apply.clicked.connect(self.accept)
 
-        btn_box.addWidget(self.btn_cancel)
-        btn_box.addWidget(self.btn_apply)
-        layout.addLayout(btn_box)
+        bottom_bar.addWidget(self.btn_cancel)
+        bottom_bar.addWidget(self.btn_apply)
+        layout.addLayout(bottom_bar)
 
-    def _reset_to_original_stems(self) -> None:
-        self.chk_sep.setChecked(False)
-        self.chk_replace.setChecked(False)
-        self.chk_prefix.setChecked(False)
-        self.chk_suffix.setChecked(False)
-        self.rb_keep.setChecked(True)
-        self._update_preview()
+    def _copy_all_titles(self) -> None:
+        titles = [t for _, t in self.current_items]
+        QApplication.clipboard().setText("\n".join(titles))
+        self.status_msg_label.setText(f"✔ Đã sao chép {len(titles)} tiêu đề vào Clipboard!")
 
-    def _update_preview(self) -> None:
-        use_sep = self.chk_sep.isChecked()
-        sep_char = self.edit_sep.text()
-        use_replace = self.chk_replace.isChecked()
-        find_str = self.edit_find.text()
-        replace_str = self.edit_replace.text()
-        use_prefix = self.chk_prefix.isChecked()
-        prefix_pattern = self.edit_prefix.text()
-        use_suffix = self.chk_suffix.isChecked()
-        suffix_str = self.edit_suffix.text()
-        clean_space = self.chk_clean_space.isChecked()
+    def _paste_from_clipboard(self) -> None:
+        text = QApplication.clipboard().text()
+        if text:
+            self.text_input.setPlainText(text)
+            self.status_msg_label.setText("✔ Đã dán nội dung từ Clipboard!")
+
+    def _clear_input_text(self) -> None:
+        self.text_input.clear()
+        self.status_msg_label.setText("Đã xóa trắng ô nhập.")
+
+    def _quick_strip_channel_names(self) -> None:
+        lines = []
+        for _, t in self.current_items:
+            if "|" in t:
+                lines.append(t.split("|", 1)[0].strip())
+            else:
+                lines.append(t.strip())
+        self.text_input.setPlainText("\n".join(lines))
+        self.status_msg_label.setText("✔ Đã tự động lọc bỏ tên kênh sau dấu '|' vào khung nhập!")
+
+    def _quick_add_episode_numbers(self) -> None:
+        raw = self.text_input.toPlainText().strip()
+        if raw:
+            lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        else:
+            lines = [t for _, t in self.current_items]
+
+        new_lines = []
+        for idx, t in enumerate(lines):
+            clean_t = re.sub(r"^Tập\s*\d+\s*[-:]*\s*", "", t, flags=re.IGNORECASE).strip()
+            new_lines.append(f"Tập {idx + 1:02d} - {clean_t}")
+        self.text_input.setPlainText("\n".join(new_lines))
+        self.status_msg_label.setText("✔ Đã thêm số Tập 01, 02... vào danh sách tiêu đề!")
+
+    def _on_input_text_changed(self) -> None:
+        self._sync_preview()
+
+    def _sync_preview(self) -> None:
+        text = self.text_input.toPlainText()
+        lines = [l.strip() for l in text.splitlines()]
+        while lines and not lines[-1]:
+            lines.pop()
+
+        entered_count = len([l for l in lines if l])
+        total = len(self.current_items)
+        self.line_count_label.setText(f"Đã nhập: {entered_count}/{total} dòng")
 
         new_titles = []
-        for idx, (audio_p, curr_title) in enumerate(self.current_items):
-            title = curr_title
-
-            # 1. Cắt separator
-            if use_sep and sep_char and sep_char in title:
-                title = title.split(sep_char, 1)[0].strip()
-
-            # 2. Find and replace
-            if use_replace and find_str:
-                title = title.replace(find_str, replace_str)
-
-            # 3. Clean spaces
-            if clean_space:
-                title = re.sub(r"\s+", " ", title).strip()
-
-            # 4. Formatting
-            if self.rb_title.isChecked():
-                title = title.title()
-            elif self.rb_upper.isChecked():
-                title = title.upper()
-            elif self.rb_lower.isChecked():
-                title = title.lower()
-
-            # 5. Prefix / Suffix with STT formatting
-            stt = idx + 1
-            if use_prefix and prefix_pattern:
-                p_text = prefix_pattern
-                p_text = p_text.replace("{stt:02d}", f"{stt:02d}")
-                p_text = p_text.replace("{stt:03d}", f"{stt:03d}")
-                p_text = p_text.replace("{stt}", str(stt))
-                title = f"{p_text}{title}"
-
-            if use_suffix and suffix_str:
-                s_text = suffix_str
-                s_text = s_text.replace("{stt:02d}", f"{stt:02d}")
-                s_text = s_text.replace("{stt:03d}", f"{stt:03d}")
-                s_text = s_text.replace("{stt}", str(stt))
-                title = f"{title}{s_text}"
-
-            if clean_space:
-                title = re.sub(r"\s+", " ", title).strip()
-
-            new_titles.append(title)
+        for idx, (audio_p, orig_title) in enumerate(self.current_items):
+            if idx < len(lines) and lines[idx]:
+                new_titles.append(lines[idx])
+            else:
+                new_titles.append(orig_title)
 
         self.result_titles = new_titles
 
         # Update preview table
-        self.preview_table.setRowCount(len(self.current_items))
-        for r, ((_, orig_t), new_t) in enumerate(zip(self.current_items, new_titles)):
-            self.preview_table.setItem(r, 0, QTableWidgetItem(orig_t))
-            res_item = QTableWidgetItem(new_t)
-            res_item.setForeground(Qt.green)
-            self.preview_table.setItem(r, 1, res_item)
+        for r, ((audio_p, orig_title), new_title) in enumerate(zip(self.current_items, new_titles)):
+            stt_item = QTableWidgetItem(f"{r + 1}")
+            stt_item.setTextAlignment(Qt.AlignCenter)
+            self.preview_table.setItem(r, 0, stt_item)
+
+            orig_item = QTableWidgetItem(orig_title)
+            self.preview_table.setItem(r, 1, orig_item)
+
+            res_item = QTableWidgetItem(new_title)
+            if new_title != orig_title:
+                res_item.setForeground(Qt.darkGreen)
+                res_item.setFont(QFont("Arial", 9, QFont.Bold))
+            else:
+                res_item.setForeground(Qt.gray)
+            self.preview_table.setItem(r, 2, res_item)
 
     def get_titles(self) -> List[str]:
         return self.result_titles
@@ -1055,38 +1093,55 @@ class RenderTab(QWidget):
 
         try:
             if p.suffix.lower() == ".xlsx":
-                import openpyxl
-                from openpyxl.styles import Font, PatternFill, Alignment
-                wb = openpyxl.Workbook()
-                ws = wb.active
-                ws.title = "Tiêu đề Video"
+                try:
+                    import openpyxl
+                    from openpyxl.styles import Font, PatternFill, Alignment
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = "Tiêu đề Video"
 
-                headers = ["STT", "Tên File Gốc", "Tiêu đề Video (Sửa cột này)", "Đường dẫn File Audio"]
-                ws.append(headers)
+                    headers = ["STT", "Tên File Gốc", "Tiêu đề Video (Sửa cột này)", "Đường dẫn File Audio"]
+                    ws.append(headers)
 
-                # Header styling
-                header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
-                header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
-                for col_idx in range(1, len(headers) + 1):
-                    cell = ws.cell(row=1, column=col_idx)
-                    cell.fill = header_fill
-                    cell.font = header_font
-                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    # Header styling
+                    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+                    header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+                    for col_idx in range(1, len(headers) + 1):
+                        cell = ws.cell(row=1, column=col_idx)
+                        cell.fill = header_fill
+                        cell.font = header_font
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
 
-                for row_idx, data in enumerate(rows_data, start=2):
-                    for col_idx, val in enumerate(data, start=1):
-                        cell = ws.cell(row=row_idx, column=col_idx, value=val)
-                        if col_idx == 1:
-                            cell.alignment = Alignment(horizontal="center")
-                        elif col_idx == 3:
-                            cell.font = Font(name="Arial", size=11, bold=True, color="0070C0")
+                    for row_idx, data in enumerate(rows_data, start=2):
+                        for col_idx, val in enumerate(data, start=1):
+                            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+                            if col_idx == 1:
+                                cell.alignment = Alignment(horizontal="center")
+                            elif col_idx == 3:
+                                cell.font = Font(name="Arial", size=11, bold=True, color="0070C0")
 
-                ws.column_dimensions["A"].width = 8
-                ws.column_dimensions["B"].width = 45
-                ws.column_dimensions["C"].width = 50
-                ws.column_dimensions["D"].width = 40
+                    ws.column_dimensions["A"].width = 8
+                    ws.column_dimensions["B"].width = 45
+                    ws.column_dimensions["C"].width = 50
+                    ws.column_dimensions["D"].width = 40
 
-                wb.save(str(p))
+                    wb.save(str(p))
+                except (ImportError, ModuleNotFoundError):
+                    # Tự động xuất ra CSV chuẩn UTF-8-BOM nếu môi trường thiếu openpyxl
+                    csv_p = p.with_suffix(".csv")
+                    with open(csv_p, "w", newline="", encoding="utf-8-sig") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(["STT", "Tên File Gốc", "Tiêu đề Video (Sửa cột này)", "Đường dẫn File Audio"])
+                        for data in rows_data:
+                            writer.writerow(data)
+                    self.append_log(f"📊 Đã tự động xuất {len(rows_data)} tiêu đề ra file Excel CSV (.csv): {csv_p.name}")
+                    QMessageBox.information(
+                        self,
+                        "Xuất thành công (Excel CSV)",
+                        f"Máy bạn chưa có gói 'openpyxl', hệ thống đã tự động xuất ra file Excel CSV (.csv chuẩn UTF-8) tại:\n{csv_p}\n\nFile này mở trực tiếp trên Microsoft Excel xem và sửa bình thường mà không bị lỗi font."
+                    )
+                    return
+
             elif p.suffix.lower() == ".csv":
                 with open(p, "w", newline="", encoding="utf-8-sig") as f:
                     writer = csv.writer(f)
@@ -1124,7 +1179,15 @@ class RenderTab(QWidget):
 
         try:
             if p.suffix.lower() == ".xlsx":
-                import openpyxl
+                try:
+                    import openpyxl
+                except (ImportError, ModuleNotFoundError):
+                    QMessageBox.warning(
+                        self,
+                        "Thiếu gói openpyxl",
+                        "Máy bạn chưa có gói 'openpyxl' để đọc file .xlsx trực tiếp.\n\nBạn hãy xuất/lưu file dưới định dạng CSV (.csv) hoặc Text (.txt) để nhập nhanh chóng."
+                    )
+                    return
                 wb = openpyxl.load_workbook(str(p), data_only=True)
                 ws = wb.active
                 rows = list(ws.iter_rows(values_only=True))
