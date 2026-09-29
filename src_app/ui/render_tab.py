@@ -714,11 +714,15 @@ class RenderTab(QWidget):
         self.project_btn.clicked.connect(self.project_requested.emit)
         self.remove_btn.clicked.connect(self.remove_selected)
         self.clear_btn.clicked.connect(self.clear_rows)
+        self.clean_cache_btn = QPushButton("🧹 Dọn dẹp Cache")
+        self.clean_cache_btn.setToolTip("Quét và dọn sạch các file tạm _avr_temp, cache Python và rác hệ thống để giải phóng dung lượng.")
+        self.clean_cache_btn.clicked.connect(self._clean_temp_caches)
 
         buttons.addWidget(self.run_btn)
         buttons.addWidget(self.stop_btn)
         buttons.addWidget(self.project_btn)
         buttons.addWidget(self.change_out_btn)
+        buttons.addWidget(self.clean_cache_btn)
         buttons.addWidget(self.project_info_label)
         buttons.addWidget(self.out_info_label)
         buttons.addSpacing(15)
@@ -1621,7 +1625,31 @@ class RenderTab(QWidget):
     def stop_render(self) -> None:
         if self.worker and self.worker.isRunning():
             self.worker.stop()
-            self.append_log("Đã yêu cầu dừng. Các tiến trình FFmpeg đang chạy sẽ được kết thúc an toàn.")
+            self.append_log("Đã yêu cầu dừng. Các tiến trình Whisper AI và FFmpeg đang chạy sẽ được kết thúc an toàn.")
+
+    def _clean_temp_caches(self) -> None:
+        from core.paths import cleanup_all_temp_caches
+        reply = QMessageBox.question(
+            self,
+            "Xác nhận dọn dẹp Cache",
+            "Bạn có chắc muốn dọn sạch toàn bộ file tạm _avr_temp, cache Python và rác hệ thống?\n\nThao tác này giúp giải phóng dung lượng ổ đĩa và tránh lỗi đơ tool.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        out_dir = str(self._output_folder())
+        res = cleanup_all_temp_caches(output_dir=out_dir)
+        freed = res.get("freed_formatted", "0 B")
+        files = res.get("deleted_files", 0)
+        folders = res.get("deleted_folders", 0)
+        self.append_log(f"🧹 Dọn dẹp cache hoàn tất: Giải phóng {freed} ({files} file tạm, {folders} thư mục).")
+        QMessageBox.information(
+            self,
+            "Dọn dẹp hoàn tất",
+            f"🧹 Đã dọn dẹp rác & cache thành công!\n\n• Dung lượng giải phóng: {freed}\n• Đã xóa: {files} file tạm, {folders} thư mục cache.",
+        )
 
     @Slot()
     def render_finished(self) -> None:

@@ -308,17 +308,46 @@ def format_timestamp_srt(seconds: float) -> str:
     return f"{hrs:02d}:{mins:02d}:{secs:02d},{ms:03d}"
 
 
+class RenderCancelled(RuntimeError):
+    """Ngoại lệ khi người dùng chủ động bấm Dừng render."""
+    pass
+
+
+def format_timestamp_short(seconds: float) -> str:
+    """Định dạng giây thành chuỗi MM:SS hoặc HH:MM:SS ngắn gọn."""
+    sec = max(0, int(seconds))
+    hrs = sec // 3600
+    mins = (sec % 3600) // 60
+    secs = sec % 60
+    if hrs > 0:
+        return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
 def build_accurate_subtitles(
     segments: Any,
     max_words_per_line: int = 6,
     max_duration_sec: float = 2.8,
     speed: float = 1.0,
+    cancel_event: Any = None,
+    progress_callback: Any = None,
+    total_duration_sec: float = 0.0,
 ) -> List[Tuple[float, float, str]]:
-    """Gom nhóm từ theo cụm ngắn tự nhiên và bắt đúng mili-giây thời điểm phát âm."""
+    """Gom nhóm từ theo cụm ngắn tự nhiên, bắt đúng mili-giây và hỗ trợ ngắt khi hủy cùng cập nhật tiến trình."""
     events: List[Tuple[float, float, str]] = []
     eff_speed = speed if (speed > 0.001) else 1.0
 
     for seg in segments:
+        if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
+            raise RenderCancelled("Đã dừng bởi người dùng")
+
+        if progress_callback and total_duration_sec > 0:
+            cur_sec = float(getattr(seg, "end", 0.0) or 0.0)
+            pct = min(99, max(12, int((cur_sec / total_duration_sec) * 100)))
+            cur_str = format_timestamp_short(cur_sec)
+            tot_str = format_timestamp_short(total_duration_sec)
+            progress_callback(pct, f"Whisper AI: {cur_str} / {tot_str} ({pct}%)")
+
         words = list(getattr(seg, "words", None) or [])
         if not words:
             start = seg.start / eff_speed
@@ -332,6 +361,9 @@ def build_accurate_subtitles(
         chunk_start: float | None = None
 
         for w in words:
+            if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
+                raise RenderCancelled("Đã dừng bởi người dùng")
+
             w_text = str(w.word or "").strip()
             if not w_text:
                 continue
@@ -359,10 +391,11 @@ def build_accurate_subtitles(
 
 
 def _register_cuda_dll_directories() -> None:
-    """Tự động tìm kiếm và nạp các thư mục chứa DLL của CUDA/cuBLAS/cuDNN vào Windows search PATH."""
-    import sys, os
+    """Tự động tìm kiếm, nạp và preload các thư mục chứa DLL của CUDA/cuBLAS/cuDNN vào Windows process."""
+    import sys, os, ctypes
     if sys.platform != "win32":
         return
+
     added = set()
     for p in sys.path:
         if not p or not os.path.exists(p):
@@ -373,6 +406,8 @@ def _register_cuda_dll_directories() -> None:
             p_path / "nvidia" / "cublas" / "lib",
             p_path / "nvidia" / "cudnn" / "bin",
             p_path / "nvidia" / "cudnn" / "lib",
+            p_path / "nvidia" / "cuda_nvrtc" / "bin",
+            p_path / "nvidia" / "cuda_nvrtc" / "lib",
             p_path / "ctranslate2",
             p_path / "torch" / "lib",
         ]
@@ -386,6 +421,51 @@ def _register_cuda_dll_directories() -> None:
                 except Exception:
                     pass
 
+                # Preload các dll quan trọng nếu có trong thư mục
+                for dll_file in c.glob("*.dll"):
+                    try:
+                        ctypes.CDLL(str(dll_file))
+                    except Exception:
+                        pass
+
+
+def check_cuda_whisper_support() -> bool:
+    """Kiểm tra thực tế xem CUDA và các thư viện DLL cuBLAS / cuDNN có sẵn sàng chạy Whisper AI trên GPU không."""
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() <= 0:
+            return False
+    except Exception:
+        return False
+
+    _register_cuda_dll_directories()
+
+    import ctypes
+    # Thử nạp cublas DLL trực tiếp
+    for dll_name in ("cublas64_12.dll", "cublasLt64_12.dll", "cublas64_11.dll", "cublasLt64_11.dll"):
+        try:
+            ctypes.CDLL(dll_name)
+            return True
+        except Exception:
+            continue
+
+    # Thử tìm file DLL trong sys.path
+    import sys
+    for p in sys.path:
+        if not p or not os.path.exists(p):
+            continue
+        p_path = Path(p)
+        for cand in [p_path / "nvidia" / "cublas" / "bin", p_path / "torch" / "lib", p_path / "ctranslate2"]:
+            for dll_name in ("cublas64_12.dll", "cublasLt64_12.dll", "cublas64_11.dll"):
+                target = cand / dll_name
+                if target.exists():
+                    try:
+                        ctypes.CDLL(str(target))
+                        return True
+                    except Exception:
+                        pass
+    return False
+
 
 def transcribe_audio_to_srt(
     audio_path: str | Path,
@@ -393,14 +473,21 @@ def transcribe_audio_to_srt(
     model_size: str = "base",
     language: str | None = None,
     log_callback: Any = None,
+    progress_callback: Any = None,
     speed: float = 1.0,
+    cancel_event: Any = None,
+    audio_duration: float = 0.0,
 ) -> Tuple[Path, str]:
     """Tự động nghe audio bằng Whisper AI, nhận diện ngôn ngữ và xuất file .srt chuẩn xác theo từng từ với cơ chế Safe Fallback 100%."""
+    if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
+        raise RenderCancelled("Đã dừng bởi người dùng")
+
     _register_cuda_dll_directories()
     p_audio = Path(audio_path)
     p_out = Path(out_srt_path)
     p_out.parent.mkdir(parents=True, exist_ok=True)
 
+    import gc
     from faster_whisper import WhisperModel
 
     model_size = str(model_size or "base").strip()
@@ -415,26 +502,28 @@ def transcribe_audio_to_srt(
             else:
                 target_lang = lang_clean
 
-    # Kiểm tra khả năng hỗ trợ CUDA
-    has_cuda = False
-    try:
-        import ctranslate2
-        has_cuda = ctranslate2.get_cuda_device_count() > 0
-    except Exception:
-        try:
-            import torch
-            has_cuda = torch.cuda.is_available()
-        except Exception:
-            has_cuda = False
+    # Preflight Check CUDA cuBLAS thực tế
+    has_cuda_runtime = check_cuda_whisper_support()
 
     def _do_transcribe(device: str, compute_type: str) -> Tuple[List[Tuple[float, float, str]], str]:
+        if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
+            raise RenderCancelled("Đã dừng bởi người dùng")
+
         if log_callback:
             if device == "cuda":
                 log_callback(f"🚀 Đang khởi tạo Whisper AI [{model_size}] trên GPU (NVIDIA CUDA / {compute_type})...")
             else:
-                log_callback(f"💻 Đang xử lý Whisper AI model [{model_size}] trên CPU (An toàn / {compute_type})...")
+                cpu_threads = max(4, (os.cpu_count() or 4))
+                log_callback(f"💻 Đang xử lý Whisper AI model [{model_size}] trên CPU (Đa luồng {cpu_threads} cores / {compute_type})...")
 
-        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        cpu_threads = max(4, (os.cpu_count() or 4)) if device == "cpu" else 0
+        model = WhisperModel(
+            model_size,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=cpu_threads if device == "cpu" else 4,
+            num_workers=2,
+        )
 
         lang_msg = f"ngôn ngữ chỉ định: [{target_lang.upper()}]" if target_lang else "chế độ tự động nhận diện ngôn ngữ"
         if log_callback:
@@ -454,34 +543,51 @@ def transcribe_audio_to_srt(
         detected = target_lang or getattr(info, "language", "unknown") or "unknown"
         prob = getattr(info, "language_probability", 1.0) * 100
         if log_callback:
-            log_callback(f"✔ Nhận diện giọng nói hoàn tất: [{detected.upper()}] (độ tin cậy: {prob:.1f}%)")
+            log_callback(f"✔ Nhận diện giọng nói: [{detected.upper()}] (độ tin cậy: {prob:.1f}%) — Đang xử lý bóc tách...")
 
-        # Generator segments chỉ thực sự chạy tính toán CUDA khi duyệt phần tử tại đây:
-        events_list = build_accurate_subtitles(segments, max_words_per_line=6, max_duration_sec=2.8, speed=speed)
+        try:
+            events_list = build_accurate_subtitles(
+                segments,
+                max_words_per_line=6,
+                max_duration_sec=2.8,
+                speed=speed,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+                total_duration_sec=audio_duration,
+            )
+        finally:
+            # Giải phóng model và bộ nhớ
+            del model
+            gc.collect()
+
         return events_list, detected
 
     events: List[Tuple[float, float, str]] = []
     detected_lang = target_lang or "unknown"
     used_device = "cpu"
+    cuda_success = False
 
-    # Giai đoạn 1: Thử chạy bằng GPU CUDA nếu có
-    if has_cuda:
+    # Giai đoạn 1: Chạy bằng GPU CUDA nếu Preflight Check đạt chuẩn
+    if has_cuda_runtime:
         try:
             events, detected_lang = _do_transcribe("cuda", "float16")
             used_device = "cuda"
+            cuda_success = True
+        except RenderCancelled:
+            raise
         except Exception as cuda_ex:
             if log_callback:
-                log_callback(f"⚠️ GPU CUDA float16 gặp sự cố ({cuda_ex}) -> Thử int8_float16...")
-            try:
-                events, detected_lang = _do_transcribe("cuda", "int8_float16")
-                used_device = "cuda"
-            except Exception as cuda_ex2:
-                if log_callback:
-                    log_callback(f"⚠️ GPU CUDA không thể thực thi ({cuda_ex2}) -> Tự động chuyển ngay sang CPU để đảm bảo 100% có Sub...")
-                events = []
+                log_callback(f"⚠️ GPU CUDA float16 gặp sự cố ({cuda_ex}) -> Tự động chuyển sang CPU int8 đa luồng...")
+            events = []
+            cuda_success = False
+    else:
+        if log_callback:
+            log_callback("💡 GPU chưa đủ bộ thư viện CUDA cuBLAS -> Tự động xử lý Whisper AI bằng CPU đa luồng an toàn.")
 
-    # Giai đoạn 2: Nếu chưa có events (không có GPU hoặc GPU thiếu DLL/VRAM), fallback sang CPU 100%
-    if not events:
+    # Giai đoạn 2: Fallback sang CPU 100% an toàn nếu CUDA không khả dụng hoặc bị lỗi
+    if not cuda_success:
+        if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
+            raise RenderCancelled("Đã dừng bởi người dùng")
         events, detected_lang = _do_transcribe("cpu", "int8")
         used_device = "cpu"
 

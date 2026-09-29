@@ -165,8 +165,13 @@ class RenderEngine:
                             model_size=model_size,
                             language=lang_param,
                             log_callback=self.log,
+                            progress_callback=self.progress,
                             speed=audio_speed,
+                            cancel_event=self.cancel_event,
+                            audio_duration=audio_duration,
                         )
+                    except RenderCancelled:
+                        raise
                     except Exception as ex:
                         self.log(f"⚠️ Lỗi khi tự động tạo phụ đề Whisper: {ex}")
                         raw_sub = None

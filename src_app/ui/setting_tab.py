@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QPushButton, QListWidget,
     QFileDialog, QCheckBox, QComboBox, QSpinBox, QDoubleSpinBox,
     QLineEdit, QFormLayout, QScrollArea, QTextEdit, QColorDialog,
-    QToolButton, QLabel, QAbstractItemView, QSplitter
+    QToolButton, QLabel, QAbstractItemView, QSplitter, QMessageBox
 )
 
 from core.media_utils import AUDIO_EXTENSIONS
@@ -1769,6 +1769,13 @@ class SettingTab(QWidget):
         self.gpu_preflight_checkbox = QCheckBox("Kiểm tra phần cứng GPU trước khi chạy")
         self.gpu_preflight_checkbox.setChecked(True)
 
+        self.clean_cache_btn = QPushButton("🧹 Dọn dẹp Cache & Rác tạm (Giải phóng dung lượng)")
+        self.clean_cache_btn.setStyleSheet(
+            "QPushButton { background-color: #2e7d32; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px; } "
+            "QPushButton:hover { background-color: #388e3c; }"
+        )
+        self.clean_cache_btn.clicked.connect(self.clean_temp_caches)
+
         form.addRow("Bộ mã hóa (Encoder)", self.encoder_combo)
         form.addRow("Render song song (Jobs)", self.max_parallel_spin)
         form.addRow("Số luồng CPU (Threads)", self.cpu_threads_spin)
@@ -1778,6 +1785,7 @@ class SettingTab(QWidget):
         form.addRow("Giữ temp khi lỗi", self.keep_temp_on_error_checkbox)
         form.addRow("Fallback về CPU", self.allow_cpu_fallback_checkbox)
         form.addRow("Preflight test GPU", self.gpu_preflight_checkbox)
+        form.addRow("Dọn rác hệ thống", self.clean_cache_btn)
 
         self._connect_change_widgets(
             self.encoder_combo, self.max_parallel_spin, self.cpu_threads_spin,
@@ -1786,6 +1794,30 @@ class SettingTab(QWidget):
             self.allow_cpu_fallback_checkbox, self.gpu_preflight_checkbox
         )
         return group
+
+    def clean_temp_caches(self) -> None:
+        from core.paths import cleanup_all_temp_caches
+        reply = QMessageBox.question(
+            self,
+            "Xác nhận dọn dẹp Cache",
+            "Bạn có chắc muốn dọn sạch toàn bộ file tạm _avr_temp, cache Python và rác hệ thống?\n\nThao tác này giúp giải phóng dung lượng ổ đĩa và tăng tốc độ xử lý của tool.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        custom_temp = self.temp_folder_edit.text().strip() if hasattr(self, "temp_folder_edit") else ""
+        out_folder = self.output_edit.text().strip() if hasattr(self, "output_edit") else ""
+        res = cleanup_all_temp_caches(custom_temp_dir=custom_temp, output_dir=out_folder)
+        freed = res.get("freed_formatted", "0 B")
+        files = res.get("deleted_files", 0)
+        folders = res.get("deleted_folders", 0)
+        QMessageBox.information(
+            self,
+            "Dọn dẹp hoàn tất",
+            f"🧹 Đã dọn dẹp rác & cache thành công!\n\n• Dung lượng giải phóng: {freed}\n• Đã xóa: {files} file tạm, {folders} thư mục cache.",
+        )
 
     def _position_combo(self) -> QComboBox:
         combo = QComboBox()
