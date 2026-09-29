@@ -4,6 +4,7 @@ import copy
 import os
 import json
 import random
+import re
 import shlex
 import shutil
 import subprocess
