@@ -72,7 +72,7 @@ class RenderEngine:
         except Exception:
             return find_binary(name)
 
-    def render_audio(self, audio_file: str) -> RenderResult:
+    def render_audio(self, audio_file: str, custom_title: str = "") -> RenderResult:
         job_id = uuid.uuid4().hex[:10]
         job_temp: Path | None = None
         success = False
@@ -82,6 +82,9 @@ class RenderEngine:
             audio_path = Path(audio_file)
             if not audio_path.exists():
                 raise FileNotFoundError(f"Không tìm thấy audio: {audio_file}")
+
+            # Tiêu đề video hiển thị và đặt tên file: Ưu tiên custom_title nếu có
+            title_to_use = str(custom_title).strip() if custom_title and str(custom_title).strip() else audio_path.stem
 
             export = self.settings.get("export", {})
             width = int(export.get("width", 1080))
@@ -98,7 +101,9 @@ class RenderEngine:
             job_temp = self._make_job_temp(output_folder, job_id)
             self._cleanup_old_temp_dirs(job_temp.parent)
 
-            output_file = self._dedupe_output(output_folder / f"{audio_path.stem}.mp4")
+            # Tên file video xuất ra theo tiêu đề đã chọn (loại bỏ ký tự cấm của file hệ thống)
+            clean_out_name = re.sub(r'[\\/*?:"<>|]', '_', title_to_use).strip() or audio_path.stem
+            output_file = self._dedupe_output(output_folder / f"{clean_out_name}.mp4")
 
             self.progress(5, "Chuẩn bị audio")
             original_audio_path = audio_path
@@ -211,7 +216,7 @@ class RenderEngine:
             if can_single_pass:
                 self.progress(50, "Nối transition & gắn overlay (1-pass siêu tốc)")
                 visual_out = job_temp / "visual_video.mp4"
-                self._concat_and_overlay_single_pass(clips, visual_out, clip_durations, width, height, sub_ass_file=sub_ass_file, audio_title=original_audio_path.stem)
+                self._concat_and_overlay_single_pass(clips, visual_out, clip_durations, width, height, sub_ass_file=sub_ass_file, audio_title=title_to_use)
                 self._delete_temp_files(clips, "clip tạm sau khi nối 1-pass")
                 current_video = visual_out
             else:
@@ -224,7 +229,7 @@ class RenderEngine:
                 if self._has_visual_overlays(sub_ass_file=sub_ass_file):
                     self.progress(72, "Gắn visual overlay 1 lần")
                     visual_out = job_temp / "visual_video.mp4"
-                    self._apply_visual_overlays(base_video, visual_out, width, height, sub_ass_file=sub_ass_file, audio_title=original_audio_path.stem)
+                    self._apply_visual_overlays(base_video, visual_out, width, height, sub_ass_file=sub_ass_file, audio_title=title_to_use)
                     current_video = visual_out
                     self._delete_temp_file(base_video, "base_video sau khi gắn visual overlay")
                 else:

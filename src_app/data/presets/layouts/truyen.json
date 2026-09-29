@@ -87,7 +87,7 @@
       "box_radius": 8,
       "box_w": 1.0,
       "box_x": 0.0,
-      "box_y": 0.7962,
+      "box_y": 0.2677,
       "enabled": true,
       "file_path": "",
       "font_color": "#ffbe4e",
@@ -101,7 +101,7 @@
       "outline_color": "#ffffff",
       "outline_width": 2.0,
       "scale_mode": "stretch",
-      "text_content": "GÃ ĐẠO TẶC AUDIO",
+      "text_content": "{title}",
       "type": "text"
     },
     {

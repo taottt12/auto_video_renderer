@@ -1089,9 +1089,19 @@ class CrawlerTab(QWidget):
     def _stop_crawler(self) -> None:
         if self._crawler_thread and self._crawler_thread.isRunning():
             self.stop_btn.setEnabled(False)
-            self.status_label.setText("Đang yêu cầu dừng tác vụ...")
-            self.append_log("⏹ Người dùng bấm dừng. Đang dọn dẹp các tiến trình...")
+            self.status_label.setText("Đang dừng tác vụ...")
+            self.append_log("⏹ Người dùng bấm dừng. Đang ngắt ngay lập tức...")
             self._crawler_thread.stop()
+            if not self._crawler_thread.wait(300):
+                try:
+                    self._crawler_thread.terminate()
+                    self._crawler_thread.wait(300)
+                except Exception:
+                    pass
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.status_label.setText("Đã dừng tác vụ.")
+            self.append_log("🛑 Đã dừng toàn bộ tiến trình cào MP3 tức thì.")
 
     @Slot(int, int, str)
     def _on_progress(self, cur: int, total: int, txt: str) -> None:

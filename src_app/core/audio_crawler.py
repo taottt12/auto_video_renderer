@@ -470,6 +470,9 @@ def extract_entry_list(
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
+        "socket_timeout": 5,
+        "retries": 1,
+        "fragment_retries": 1,
         "ffmpeg_location": ffmpeg_dir,
         "extractor_args": {
             "youtube": {
@@ -663,6 +666,9 @@ def download_single_audio(
         "http_chunk_size": 10485760,
         "outtmpl": out_template,
         "ffmpeg_location": ffmpeg_dir,
+        "socket_timeout": 5,
+        "retries": 1,
+        "fragment_retries": 1,
         "quiet": False,
         "no_warnings": False,
         "ignoreerrors": False,

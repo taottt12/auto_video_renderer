@@ -12,13 +12,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+import csv
 from PySide6.QtCore import QThread, Signal, Slot, QTimer, Qt, QUrl
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem,
     QTextEdit, QProgressBar, QMessageBox, QAbstractItemView, QGroupBox, QListWidget,
-    QFileDialog, QCheckBox, QLabel, QSlider, QFrame, QSplitter, QHeaderView, QComboBox
+    QFileDialog, QCheckBox, QLabel, QSlider, QFrame, QSplitter, QHeaderView, QComboBox,
+    QDialog, QLineEdit, QRadioButton, QButtonGroup, QSpinBox
 )
 
 from core.media_utils import (
@@ -74,6 +76,218 @@ class DurationLoaderThread(QThread):
                 self.duration_loaded.emit(row, dur_str)
 
 
+class TitleMixerDialog(QDialog):
+    """Hộp thoại thông minh phối lại và làm sạch tiêu đề video hàng loạt."""
+
+    def __init__(self, parent: QWidget | None, current_items: List[Tuple[str, str]]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("🪄 Phối lại & Làm sạch Tiêu đề Video")
+        self.resize(780, 560)
+        self.current_items = current_items  # List of (audio_path, current_title)
+        self.result_titles: List[str] = [t for _, t in current_items]
+
+        self._build_ui()
+        self._update_preview()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        # 1. Khung tùy chọn phối tiêu đề
+        opt_group = QGroupBox("Cấu hình Phối & Làm sạch Tiêu đề")
+        opt_layout = QVBoxLayout(opt_group)
+        opt_layout.setSpacing(8)
+
+        # Hàng 1: Cắt bỏ tên kênh sau ký tự phân cách
+        sep_row = QHBoxLayout()
+        self.chk_sep = QCheckBox("Cắt bỏ tên kênh sau ký tự phân cách:")
+        self.chk_sep.setChecked(True)
+        self.chk_sep.toggled.connect(self._update_preview)
+        self.edit_sep = QLineEdit("|")
+        self.edit_sep.setMaximumWidth(60)
+        self.edit_sep.textChanged.connect(self._update_preview)
+        sep_hint = QLabel("(Ví dụ: cắt bỏ ' | Barangay Love Stories | Papa Dudut')")
+        sep_hint.setStyleSheet("color: #888; font-size: 11px;")
+        sep_row.addWidget(self.chk_sep)
+        sep_row.addWidget(self.edit_sep)
+        sep_row.addWidget(sep_hint)
+        sep_row.addStretch(1)
+        opt_layout.addLayout(sep_row)
+
+        # Hàng 2: Tìm và thay thế cụm từ
+        replace_row = QHBoxLayout()
+        self.chk_replace = QCheckBox("Tìm và thay thế cụm từ:")
+        self.chk_replace.toggled.connect(self._update_preview)
+        self.edit_find = QLineEdit("")
+        self.edit_find.setPlaceholderText("Từ cần tìm (ví dụ: Papa Dudut)")
+        self.edit_find.textChanged.connect(self._update_preview)
+        self.edit_replace = QLineEdit("")
+        self.edit_replace.setPlaceholderText("Thay bằng (để trống nếu muốn xóa)")
+        self.edit_replace.textChanged.connect(self._update_preview)
+        replace_row.addWidget(self.chk_replace)
+        replace_row.addWidget(self.edit_find)
+        replace_row.addWidget(QLabel("➔"))
+        replace_row.addWidget(self.edit_replace)
+        opt_layout.addLayout(replace_row)
+
+        # Hàng 3: Tiền tố & Hậu tố
+        fix_row = QHBoxLayout()
+        self.chk_prefix = QCheckBox("Thêm Tiền tố:")
+        self.chk_prefix.toggled.connect(self._update_preview)
+        self.edit_prefix = QLineEdit("")
+        self.edit_prefix.setPlaceholderText("VD: Tập {stt:02d} - ")
+        self.edit_prefix.textChanged.connect(self._update_preview)
+
+        self.chk_suffix = QCheckBox("Thêm Hậu tố:")
+        self.chk_suffix.toggled.connect(self._update_preview)
+        self.edit_suffix = QLineEdit("")
+        self.edit_suffix.setPlaceholderText("VD: (Bản Chuẩn)")
+        self.edit_suffix.textChanged.connect(self._update_preview)
+
+        fix_row.addWidget(self.chk_prefix)
+        fix_row.addWidget(self.edit_prefix)
+        fix_row.addSpacing(15)
+        fix_row.addWidget(self.chk_suffix)
+        fix_row.addWidget(self.edit_suffix)
+        opt_layout.addLayout(fix_row)
+
+        # Hàng 4: Định dạng chữ & Làm sạch khoảng trắng
+        fmt_row = QHBoxLayout()
+        fmt_row.addWidget(QLabel("Định dạng chữ:"))
+        self.rb_keep = QRadioButton("Giữ nguyên")
+        self.rb_keep.setChecked(True)
+        self.rb_title = QRadioButton("Viết Hoa Đầu Từ")
+        self.rb_upper = QRadioButton("VIẾT HOA")
+        self.rb_lower = QRadioButton("viết thường")
+        self.bg_fmt = QButtonGroup(self)
+        self.bg_fmt.addButton(self.rb_keep)
+        self.bg_fmt.addButton(self.rb_title)
+        self.bg_fmt.addButton(self.rb_upper)
+        self.bg_fmt.addButton(self.rb_lower)
+        self.bg_fmt.buttonToggled.connect(self._update_preview)
+
+        fmt_row.addWidget(self.rb_keep)
+        fmt_row.addWidget(self.rb_title)
+        fmt_row.addWidget(self.rb_upper)
+        fmt_row.addWidget(self.rb_lower)
+        fmt_row.addStretch(1)
+
+        self.chk_clean_space = QCheckBox("Xóa khoảng trắng thừa")
+        self.chk_clean_space.setChecked(True)
+        self.chk_clean_space.toggled.connect(self._update_preview)
+        fmt_row.addWidget(self.chk_clean_space)
+        opt_layout.addLayout(fmt_row)
+
+        layout.addWidget(opt_group)
+
+        # 2. Khung xem trước trực tiếp (Live Preview)
+        preview_group = QGroupBox("Xem trước Tiêu đề Video (Trước ➔ Sau)")
+        preview_layout = QVBoxLayout(preview_group)
+
+        self.preview_table = QTableWidget(0, 2)
+        self.preview_table.setHorizontalHeaderLabels(["Tiêu đề hiện tại", "Tiêu đề sau khi phối"])
+        self.preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.preview_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        preview_layout.addWidget(self.preview_table)
+        layout.addWidget(preview_group, 1)
+
+        # 3. Hàng nút xác nhận
+        btn_box = QHBoxLayout()
+        self.btn_reset = QPushButton("Khôi phục tiêu đề gốc")
+        self.btn_reset.clicked.connect(self._reset_to_original_stems)
+        btn_box.addWidget(self.btn_reset)
+        btn_box.addStretch(1)
+
+        self.btn_cancel = QPushButton("Hủy")
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_apply = QPushButton("✔ Áp dụng vào bảng Queue")
+        self.btn_apply.setStyleSheet("font-weight: bold; background-color: #2e7d32; color: white; padding: 6px 18px; border-radius: 4px;")
+        self.btn_apply.clicked.connect(self.accept)
+
+        btn_box.addWidget(self.btn_cancel)
+        btn_box.addWidget(self.btn_apply)
+        layout.addLayout(btn_box)
+
+    def _reset_to_original_stems(self) -> None:
+        self.chk_sep.setChecked(False)
+        self.chk_replace.setChecked(False)
+        self.chk_prefix.setChecked(False)
+        self.chk_suffix.setChecked(False)
+        self.rb_keep.setChecked(True)
+        self._update_preview()
+
+    def _update_preview(self) -> None:
+        use_sep = self.chk_sep.isChecked()
+        sep_char = self.edit_sep.text()
+        use_replace = self.chk_replace.isChecked()
+        find_str = self.edit_find.text()
+        replace_str = self.edit_replace.text()
+        use_prefix = self.chk_prefix.isChecked()
+        prefix_pattern = self.edit_prefix.text()
+        use_suffix = self.chk_suffix.isChecked()
+        suffix_str = self.edit_suffix.text()
+        clean_space = self.chk_clean_space.isChecked()
+
+        new_titles = []
+        for idx, (audio_p, curr_title) in enumerate(self.current_items):
+            title = curr_title
+
+            # 1. Cắt separator
+            if use_sep and sep_char and sep_char in title:
+                title = title.split(sep_char, 1)[0].strip()
+
+            # 2. Find and replace
+            if use_replace and find_str:
+                title = title.replace(find_str, replace_str)
+
+            # 3. Clean spaces
+            if clean_space:
+                title = re.sub(r"\s+", " ", title).strip()
+
+            # 4. Formatting
+            if self.rb_title.isChecked():
+                title = title.title()
+            elif self.rb_upper.isChecked():
+                title = title.upper()
+            elif self.rb_lower.isChecked():
+                title = title.lower()
+
+            # 5. Prefix / Suffix with STT formatting
+            stt = idx + 1
+            if use_prefix and prefix_pattern:
+                p_text = prefix_pattern
+                p_text = p_text.replace("{stt:02d}", f"{stt:02d}")
+                p_text = p_text.replace("{stt:03d}", f"{stt:03d}")
+                p_text = p_text.replace("{stt}", str(stt))
+                title = f"{p_text}{title}"
+
+            if use_suffix and suffix_str:
+                s_text = suffix_str
+                s_text = s_text.replace("{stt:02d}", f"{stt:02d}")
+                s_text = s_text.replace("{stt:03d}", f"{stt:03d}")
+                s_text = s_text.replace("{stt}", str(stt))
+                title = f"{title}{s_text}"
+
+            if clean_space:
+                title = re.sub(r"\s+", " ", title).strip()
+
+            new_titles.append(title)
+
+        self.result_titles = new_titles
+
+        # Update preview table
+        self.preview_table.setRowCount(len(self.current_items))
+        for r, ((_, orig_t), new_t) in enumerate(zip(self.current_items, new_titles)):
+            self.preview_table.setItem(r, 0, QTableWidgetItem(orig_t))
+            res_item = QTableWidgetItem(new_t)
+            res_item.setForeground(Qt.green)
+            self.preview_table.setItem(r, 1, res_item)
+
+    def get_titles(self) -> List[str]:
+        return self.result_titles
+
+
 class RenderWorker(QThread):
     log_signal = Signal(str)
     row_update_signal = Signal(int, str, str, int, str)
@@ -81,11 +295,12 @@ class RenderWorker(QThread):
     row_finished_signal = Signal(int)
     finished_signal = Signal()
 
-    def __init__(self, settings: Dict[str, Any], rows: List[int], audio_files: List[str]) -> None:
+    def __init__(self, settings: Dict[str, Any], rows: List[int], audio_files: List[str], titles: List[str] | None = None) -> None:
         super().__init__()
         self.settings = settings
         self.rows = rows
         self.audio_files = audio_files
+        self.titles = titles or [""] * len(audio_files)
         self.cancel_event = threading.Event()
 
     def stop(self) -> None:
@@ -98,7 +313,7 @@ class RenderWorker(QThread):
         except Exception:
             return 1
 
-    def _render_one(self, row: int, audio: str, bgm_file: str = "") -> Tuple[int, RenderResult]:
+    def _render_one(self, row: int, audio: str, bgm_file: str = "", title: str = "") -> Tuple[int, RenderResult]:
         def log(msg: str, row=row) -> None:
             self.log_signal.emit(f"[Dòng {row + 1}] {msg}")
 
@@ -107,12 +322,13 @@ class RenderWorker(QThread):
 
         self.row_started_signal.emit(row)
         self.row_update_signal.emit(row, "Đang chạy", "Bắt đầu", 0, "")
-        self.log_signal.emit(f"[Dòng {row + 1}] Bắt đầu render: {audio}")
+        log_title = f" (Tiêu đề: {title})" if title else ""
+        self.log_signal.emit(f"[Dòng {row + 1}] Bắt đầu render: {Path(audio).name}{log_title}")
         job_settings = copy.deepcopy(self.settings)
         if bgm_file:
             job_settings.setdefault("background_music", {})["selected_file"] = bgm_file
         engine = RenderEngine(job_settings, log=log, progress=progress, cancel_event=self.cancel_event)
-        result = engine.render_audio(audio)
+        result = engine.render_audio(audio, custom_title=title)
         self.row_finished_signal.emit(row)
         return row, result
 
@@ -154,11 +370,11 @@ class RenderWorker(QThread):
         delete_audio = bool(self.settings.get("delete_audio_after_render", False))
         futures = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for idx, (row, audio) in enumerate(zip(self.rows, self.audio_files)):
+            for idx, (row, audio, title) in enumerate(zip(self.rows, self.audio_files, self.titles)):
                 if self.cancel_event.is_set():
                     self.row_update_signal.emit(row, "Đã dừng", "Dừng bởi người dùng", 0, "")
                     continue
-                futures.append(executor.submit(self._render_one, row, audio, bgm_assignments[idx] if idx < len(bgm_assignments) else ""))
+                futures.append(executor.submit(self._render_one, row, audio, bgm_assignments[idx] if idx < len(bgm_assignments) else "", title))
             for future in as_completed(futures):
                 try:
                     row, result = future.result()
@@ -473,11 +689,33 @@ class RenderTab(QWidget):
         buttons.addStretch(1)
         root.addLayout(buttons)
 
+        # Thanh công cụ Quản lý & Phối lại Tiêu đề video (Excel / CSV / Inline Edit)
+        title_toolbar = QHBoxLayout()
+        title_toolbar.addWidget(QLabel("<b>🏷️ Quản lý Tiêu đề Video:</b>"))
+
+        self.btn_export_titles = QPushButton("📊 Xuất Tiêu đề (Excel / CSV)")
+        self.btn_export_titles.setToolTip("Xuất danh sách tiêu đề video ra file Excel (.xlsx) hoặc CSV để mang đi sửa hàng loạt bằng AI / ChatGPT")
+        self.btn_export_titles.clicked.connect(self._export_titles_to_file)
+
+        self.btn_import_titles = QPushButton("📥 Nhập Tiêu đề (Excel / CSV)")
+        self.btn_import_titles.setToolTip("Nạp file Excel / CSV / TXT tiêu đề đã sửa để cập nhật hàng loạt vào danh sách render")
+        self.btn_import_titles.clicked.connect(self._import_titles_from_file)
+
+        self.btn_mix_titles = QPushButton("🪄 Phối lại tiêu đề nhanh")
+        self.btn_mix_titles.setToolTip("Công cụ 1-click: Xóa tên kênh cũ sau dấu |, xóa từ khóa rác, thêm tiền tố Tập 1, 2..., viết hoa chữ cái đầu")
+        self.btn_mix_titles.clicked.connect(self._open_title_mixer_dialog)
+
+        title_toolbar.addWidget(self.btn_export_titles)
+        title_toolbar.addWidget(self.btn_import_titles)
+        title_toolbar.addWidget(self.btn_mix_titles)
+        title_toolbar.addStretch(1)
+        root.addLayout(title_toolbar)
+
         # Bảng Queue
         self.table = QTableWidget(0, 7)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setHorizontalHeaderLabels(["Audio", "Thời lượng", "Trạng thái", "Giai đoạn", "Tiến trình", "Thời gian chạy", "Video xuất"])
+        self.table.setHorizontalHeaderLabels(["Tiêu đề video (Nháy đúp để sửa)", "Thời lượng", "Trạng thái", "Giai đoạn", "Tiến trình", "Thời gian chạy", "Video xuất"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -767,9 +1005,11 @@ class RenderTab(QWidget):
 
     def add_audio_row_fast(self, row: int, audio: str) -> None:
         self.table.insertRow(row)
-        name_item = QTableWidgetItem(Path(audio).name)
+        title_text = Path(audio).stem
+        name_item = QTableWidgetItem(title_text)
         name_item.setData(Qt.UserRole, audio)
-        name_item.setToolTip(audio)
+        name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+        name_item.setToolTip(f"Tiêu đề: {title_text}\nAudio gốc: {Path(audio).name}\nĐường dẫn: {audio}\n(Nháy đúp chuột để chỉnh sửa tiêu đề)")
         self.table.setItem(row, 0, name_item)
         self.table.setItem(row, 1, QTableWidgetItem("Đang đọc..."))
         self.table.setItem(row, 2, QTableWidgetItem("Chưa chạy"))
@@ -782,6 +1022,240 @@ class RenderTab(QWidget):
         ph_item = QTableWidgetItem("-")
         ph_item.setTextAlignment(Qt.AlignCenter)
         self.table.setItem(row, 6, ph_item)
+
+    # ------------------ Quản lý & Xuất / Nhập Tiêu đề Video ------------------
+
+    def _export_titles_to_file(self) -> None:
+        """Xuất danh sách tiêu đề video ra file Excel (.xlsx), CSV (.csv) hoặc Text (.txt)."""
+        if self.table.rowCount() == 0:
+            QMessageBox.information(self, "Danh sách trống", "Chưa có audio nào trong danh sách để xuất tiêu đề.")
+            return
+
+        out_dir = self.settings.get("project", {}).get("output_folder") or ""
+        default_file = str(Path(out_dir) / "danh_sach_tieu_de.xlsx") if out_dir else "danh_sach_tieu_de.xlsx"
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Xuất danh sách tiêu đề video",
+            default_file,
+            "Excel Workbook (*.xlsx);;CSV UTF-8 (Excel) (*.csv);;Text File (*.txt)"
+        )
+        if not file_path:
+            return
+
+        p = Path(file_path)
+        rows_data = []
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item:
+                audio_path = str(item.data(Qt.UserRole) or item.text())
+                orig_name = Path(audio_path).name
+                title = item.text().strip()
+                rows_data.append((r + 1, orig_name, title, audio_path))
+
+        try:
+            if p.suffix.lower() == ".xlsx":
+                import openpyxl
+                from openpyxl.styles import Font, PatternFill, Alignment
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = "Tiêu đề Video"
+
+                headers = ["STT", "Tên File Gốc", "Tiêu đề Video (Sửa cột này)", "Đường dẫn File Audio"]
+                ws.append(headers)
+
+                # Header styling
+                header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+                header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+                for col_idx in range(1, len(headers) + 1):
+                    cell = ws.cell(row=1, column=col_idx)
+                    cell.fill = header_fill
+                    cell.font = header_font
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+
+                for row_idx, data in enumerate(rows_data, start=2):
+                    for col_idx, val in enumerate(data, start=1):
+                        cell = ws.cell(row=row_idx, column=col_idx, value=val)
+                        if col_idx == 1:
+                            cell.alignment = Alignment(horizontal="center")
+                        elif col_idx == 3:
+                            cell.font = Font(name="Arial", size=11, bold=True, color="0070C0")
+
+                ws.column_dimensions["A"].width = 8
+                ws.column_dimensions["B"].width = 45
+                ws.column_dimensions["C"].width = 50
+                ws.column_dimensions["D"].width = 40
+
+                wb.save(str(p))
+            elif p.suffix.lower() == ".csv":
+                with open(p, "w", newline="", encoding="utf-8-sig") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["STT", "Tên File Gốc", "Tiêu đề Video (Sửa cột này)", "Đường dẫn File Audio"])
+                    for data in rows_data:
+                        writer.writerow(data)
+            else:
+                with open(p, "w", encoding="utf-8") as f:
+                    for data in rows_data:
+                        f.write(f"{data[2]}\n")
+
+            self.append_log(f"📊 Đã xuất thành công {len(rows_data)} tiêu đề video ra file: {p.name}")
+            QMessageBox.information(self, "Xuất thành công", f"Đã xuất {len(rows_data)} tiêu đề video ra file:\n{p}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Lỗi xuất file", f"Không thể xuất file tiêu đề:\n{exc}")
+
+    def _import_titles_from_file(self) -> None:
+        """Nhập tiêu đề video đã sửa từ file Excel (.xlsx), CSV (.csv) hoặc Text (.txt)."""
+        if self.table.rowCount() == 0:
+            QMessageBox.information(self, "Danh sách trống", "Chưa có audio nào trong danh sách render để cập nhật tiêu đề.")
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Chọn file tiêu đề đã chỉnh sửa",
+            "",
+            "Tất cả định dạng hỗ trợ (*.xlsx *.csv *.txt);;Excel Workbook (*.xlsx);;CSV File (*.csv);;Text File (*.txt)"
+        )
+        if not file_path:
+            return
+
+        p = Path(file_path)
+        imported_titles: List[str] = []
+        name_to_title_map: Dict[str, str] = {}
+
+        try:
+            if p.suffix.lower() == ".xlsx":
+                import openpyxl
+                wb = openpyxl.load_workbook(str(p), data_only=True)
+                ws = wb.active
+                rows = list(ws.iter_rows(values_only=True))
+                if not rows:
+                    QMessageBox.warning(self, "File rỗng", "File Excel không có dữ liệu.")
+                    return
+                # Xác định header
+                first_row = [str(c or "").strip().lower() for c in rows[0]]
+                title_col = -1
+                orig_col = -1
+                for idx, col_name in enumerate(first_row):
+                    if "tiêu đề" in col_name or "title" in col_name:
+                        title_col = idx
+                    elif "tên file" in col_name or "file gốc" in col_name or "audio" in col_name:
+                        orig_col = idx
+
+                # Nếu không tìm thấy cột theo header -> mặc định cột 3 (index 2) hoặc cột 1
+                if title_col == -1:
+                    title_col = 2 if len(first_row) >= 3 else 0
+
+                start_row = 1 if any("stt" in c or "tiêu đề" in c or "title" in c for c in first_row) else 0
+                for r in rows[start_row:]:
+                    if not r or len(r) <= title_col:
+                        continue
+                    t_val = str(r[title_col] or "").strip()
+                    if t_val:
+                        imported_titles.append(t_val)
+                    if orig_col != -1 and len(r) > orig_col:
+                        orig_val = str(r[orig_col] or "").strip()
+                        if orig_val and t_val:
+                            name_to_title_map[orig_val.lower()] = t_val
+                            name_to_title_map[Path(orig_val).stem.lower()] = t_val
+
+            elif p.suffix.lower() == ".csv":
+                reader = None
+                for enc in ["utf-8-sig", "utf-8", "cp1258", "latin-1"]:
+                    try:
+                        with open(p, "r", encoding=enc) as f:
+                            reader = list(csv.reader(f))
+                        break
+                    except Exception:
+                        continue
+                if not reader:
+                    QMessageBox.warning(self, "File rỗng", "File CSV không có dữ liệu.")
+                    return
+                first_row = [str(c or "").strip().lower() for c in reader[0]]
+                title_col = -1
+                orig_col = -1
+                for idx, col_name in enumerate(first_row):
+                    if "tiêu đề" in col_name or "title" in col_name:
+                        title_col = idx
+                    elif "tên file" in col_name or "file gốc" in col_name or "audio" in col_name:
+                        orig_col = idx
+                if title_col == -1:
+                    title_col = 2 if len(first_row) >= 3 else 0
+
+                start_row = 1 if any("stt" in c or "tiêu đề" in c or "title" in c for c in first_row) else 0
+                for r in reader[start_row:]:
+                    if not r or len(r) <= title_col:
+                        continue
+                    t_val = str(r[title_col] or "").strip()
+                    if t_val:
+                        imported_titles.append(t_val)
+                    if orig_col != -1 and len(r) > orig_col:
+                        orig_val = str(r[orig_col] or "").strip()
+                        if orig_val and t_val:
+                            name_to_title_map[orig_val.lower()] = t_val
+                            name_to_title_map[Path(orig_val).stem.lower()] = t_val
+
+            else:  # .txt
+                with open(p, "r", encoding="utf-8") as f:
+                    imported_titles = [line.strip() for line in f if line.strip()]
+
+            # Áp dụng cập nhật vào bảng Queue
+            updated_count = 0
+            for r in range(self.table.rowCount()):
+                item = self.table.item(r, 0)
+                if not item:
+                    continue
+                audio_path = str(item.data(Qt.UserRole) or item.text())
+                orig_name = Path(audio_path).name.lower()
+                stem_name = Path(audio_path).stem.lower()
+
+                new_title = ""
+                # Ưu tiên khớp theo tên file gốc nếu có map
+                if orig_name in name_to_title_map:
+                    new_title = name_to_title_map[orig_name]
+                elif stem_name in name_to_title_map:
+                    new_title = name_to_title_map[stem_name]
+                elif r < len(imported_titles):
+                    new_title = imported_titles[r]
+
+                if new_title:
+                    item.setText(new_title)
+                    item.setToolTip(f"Tiêu đề: {new_title}\nAudio gốc: {Path(audio_path).name}\nĐường dẫn: {audio_path}\n(Nháy đúp chuột để chỉnh sửa)")
+                    updated_count += 1
+
+            self.append_log(f"📥 Đã nạp thành công {updated_count} tiêu đề mới từ file: {p.name}")
+            QMessageBox.information(
+                self,
+                "Nhập tiêu đề thành công",
+                f"Đã cập nhật tiêu đề cho {updated_count}/{self.table.rowCount()} video trong hàng đợi render."
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Lỗi đọc file", f"Không thể đọc file tiêu đề:\n{exc}")
+
+    def _open_title_mixer_dialog(self) -> None:
+        """Mở hộp thoại phối lại tiêu đề hàng loạt."""
+        if self.table.rowCount() == 0:
+            QMessageBox.information(self, "Danh sách trống", "Chưa có audio nào trong danh sách để phối lại tiêu đề.")
+            return
+
+        current_items = []
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item:
+                audio_path = str(item.data(Qt.UserRole) or item.text())
+                curr_title = item.text().strip()
+                current_items.append((audio_path, curr_title))
+
+        dlg = TitleMixerDialog(self, current_items)
+        if dlg.exec() == QDialog.Accepted:
+            new_titles = dlg.get_titles()
+            for r, new_t in enumerate(new_titles):
+                if r < self.table.rowCount():
+                    item = self.table.item(r, 0)
+                    if item:
+                        item.setText(new_t)
+                        audio_path = str(item.data(Qt.UserRole) or item.text())
+                        item.setToolTip(f"Tiêu đề: {new_t}\nAudio gốc: {Path(audio_path).name}\nĐường dẫn: {audio_path}\n(Nháy đúp chuột để chỉnh sửa)")
+            self.append_log(f"🪄 Đã phối lại và cập nhật {len(new_titles)} tiêu đề video thành công.")
 
     @Slot(int, str)
     def _on_duration_loaded(self, row: int, dur_str: str) -> None:
@@ -1046,7 +1520,16 @@ class RenderTab(QWidget):
         self.settings["delete_audio_after_render"] = self.chk_delete_audio_after_render.isChecked()
 
         rows = self.selected_rows() or list(range(self.table.rowCount()))
-        audio_files = [str(self.table.item(row, 0).data(Qt.UserRole) or self.table.item(row, 0).text()) for row in rows]
+        audio_files = []
+        custom_titles = []
+        for row in rows:
+            item = self.table.item(row, 0)
+            if item:
+                audio_path = str(item.data(Qt.UserRole) or item.text())
+                custom_title = item.text().strip()
+                audio_files.append(audio_path)
+                custom_titles.append(custom_title)
+
         if not audio_files:
             QMessageBox.warning(self, "Thiếu audio", "Chưa có audio nào để render. Hãy thêm audio từ máy hoặc cào từ tab Cào MP3.")
             return
@@ -1059,7 +1542,7 @@ class RenderTab(QWidget):
             ph_item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, 6, ph_item)
 
-        self.worker = RenderWorker(self.settings, rows, audio_files)
+        self.worker = RenderWorker(self.settings, rows, audio_files, custom_titles)
         self.worker.log_signal.connect(self.append_log)
         self.worker.row_update_signal.connect(self.update_row)
         self.worker.row_started_signal.connect(self.mark_row_started)

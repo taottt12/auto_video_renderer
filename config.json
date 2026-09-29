@@ -1,5 +1,9 @@
 {
-  "audio_files": [],
+  "audio_files": [
+    "F:\\YT\\clip-bam\\3 AM - The Eron Story ｜ Barangay Love Stories ｜ Papa Dudut.mp3",
+    "F:\\YT\\clip-bam\\BARANGAY LOVE STORIES - ''ALL IS WELL - BOYET'' - 2IN1 FULL STORY _ Papa Dudut.mp3",
+    "F:\\YT\\clip-bam\\RAMON： The Love Story That Left Him WINASAK ｜ Papa Dudut.mp3"
+  ],
   "audio_source_mode": "crawler",
   "audio_crawler": {
     "platform": "youtube",
@@ -8,7 +12,7 @@
     "save_folder": "F:/YT/clip-bam",
     "auto_add_to_audio_list": true,
     "mode": "video",
-    "video_urls": "https://www.youtube.com/shorts/4lPe5bkvYWk\nhttps://www.youtube.com/shorts/3rsXJjYtAvw\nhttps://www.youtube.com/shorts/KAInDKRbx6k\nhttps://www.youtube.com/shorts/zHThAmTaR5Y\nhttps://www.youtube.com/shorts/LSoyyejk0EQ\nhttps://www.youtube.com/shorts/7GNSqlBDcBI\nhttps://www.youtube.com/shorts/O5zqRSsbbdI\nhttps://www.youtube.com/shorts/ovr64fmErYc\nhttps://www.youtube.com/shorts/2_eiW5x7te8\nhttps://www.youtube.com/shorts/-NfdEucaBt8\nhttps://www.youtube.com/shorts/CyqGsZawvRw\nhttps://www.youtube.com/shorts/zGd_qbjDnH4\nhttps://www.youtube.com/shorts/IN3bKGnbcW4",
+    "video_urls": "https://www.youtube.com/watch?v=8-GqQBSBsLM\nhttps://www.youtube.com/watch?v=u95LKUhJs7w\nhttps://www.youtube.com/watch?v=sqVI__Mb6sI&list=PLnBei4e3wfhrBf01vfuHG5iVjn3LBUx7F",
     "playlist_url": "https://www.youtube.com/watch?v=OQIFDwu_2Vc&list=PLcS_tNqCfrqGT7PTlL07vmPvn3z-p8-iJ",
     "playlist_limit": 20,
     "channel_url": "",
@@ -20,7 +24,7 @@
     "direct_crawl": false,
     "audio_quality": "128",
     "audio_trim": {
-      "enabled": true,
+      "enabled": false,
       "end_time": "00:00:10",
       "mode": "remove_segment",
       "start_time": "00:00:00"
@@ -165,7 +169,7 @@
         "box_radius": 8,
         "box_w": 1.0,
         "box_x": 0.0,
-        "box_y": 0.2574,
+        "box_y": 0.2677,
         "enabled": true,
         "file_path": "",
         "font_color": "#ffbe4e",
@@ -179,7 +183,7 @@
         "outline_color": "#ffffff",
         "outline_width": 2.0,
         "scale_mode": "stretch",
-        "text_content": "GÃ ĐẠO TẶC AUDIO",
+        "text_content": "{title}",
         "type": "text"
       },
       {
@@ -308,7 +312,7 @@
     "quality": "economy",
     "custom_bitrate_kbps": 2200,
     "format": "mp4",
-    "output_folder": "F:/YT/txt-test"
+    "output_folder": "F:/YT/thumb"
   },
   "youtube_uploader": {
     "gemini_api_key": "",
@@ -355,7 +359,7 @@
   "project": {
     "current_name": "XUYÊN KHÔNG BỊ ÉP RA BIÊN QUAN LÀM DÂN PHU_ MAIN KHÔNG TRỐN MÀ QUYẾT DÙNG CHIẾN TRƯỜNG ĐỂ ĐỔI ĐỜI",
     "current_path": "E:\\auto_video_renderer\\auto_video_renderer\\projects\\XUYÊN KHÔNG BỊ ÉP RA BIÊN QUAN LÀM DÂN PHU_ MAIN KHÔNG TRỐN MÀ QUYẾT DÙNG CHIẾN TRƯỜNG ĐỂ ĐỔI ĐỜI.avr.json",
-    "output_folder": "F:/YT/txt-test"
+    "output_folder": "F:/YT/thumb"
   },
   "video_effect_opacity": 0.3,
   "video_effect_custom_file": "",
