@@ -322,7 +322,18 @@ class CrawlerTab(QWidget):
         self.platform_combo.addItem("TikTok (Sắp hỗ trợ)", "tiktok")
         form_layout.addRow("Nền tảng:", self.platform_combo)
 
-        # Cookie vượt chặn Bot (Nhập/Dán trực tiếp hoặc chọn file)
+        # 1. Chế độ Cookie vượt chặn Bot
+        self.cookie_mode_combo = QComboBox()
+        self.cookie_mode_combo.addItem("🌐 Trực tiếp từ Google Chrome (Khuyến nghị 95% thành công)", "chrome")
+        self.cookie_mode_combo.addItem("🌐 Trực tiếp từ Microsoft Edge", "edge")
+        self.cookie_mode_combo.addItem("🌐 Trực tiếp từ Brave", "brave")
+        self.cookie_mode_combo.addItem("🌐 Trực tiếp từ Firefox", "firefox")
+        self.cookie_mode_combo.addItem("📁 Dùng File Cookie / Dán chuỗi tùy chỉnh (cc.txt, JSON)", "file")
+        self.cookie_mode_combo.addItem("🚫 Tắt Cookie (Dùng đa Client Mobile/TV vượt Bot)", "none")
+        self.cookie_mode_combo.currentIndexChanged.connect(self._on_cookie_mode_changed)
+        form_layout.addRow("Chế độ Cookie:", self.cookie_mode_combo)
+
+        # 2. Chi tiết File Cookie tùy chỉnh (chỉ hiện khi chọn chế độ File Cookie)
         self.cookie_file_widget = QWidget()
         cookie_file_row = QHBoxLayout(self.cookie_file_widget)
         cookie_file_row.setContentsMargins(0, 0, 0, 0)
@@ -347,7 +358,7 @@ class CrawlerTab(QWidget):
         cookie_file_row.addWidget(self.check_cookie_btn)
         cookie_file_row.addWidget(self.edit_cookie_btn)
         cookie_file_row.addWidget(self.clear_cookie_btn)
-        form_layout.addRow("Cookie YouTube (vượt Bot):", self.cookie_file_widget)
+        form_layout.addRow("File / Mã Cookie:", self.cookie_file_widget)
 
         # Chất lượng Audio MP3
         self.audio_quality_combo = QComboBox()
@@ -674,6 +685,11 @@ class CrawlerTab(QWidget):
             self.date_from_edit, self.date_to_edit,
             self.trim_enabled_cb, self.trim_mode_combo, self.trim_start_edit, self.trim_end_edit
         )
+
+    def _on_cookie_mode_changed(self) -> None:
+        mode = self.cookie_mode_combo.currentData() or "chrome"
+        self.cookie_file_widget.setVisible(mode == "file")
+        self._emit()
 
     def _clear_cookie(self) -> None:
         self.cookie_file_edit.clear()
@@ -1176,7 +1192,7 @@ class CrawlerTab(QWidget):
         settings = dict(self.settings)
         crawler_settings = {
             "platform": self.platform_combo.currentData() or "youtube",
-            "browser_cookie": "file" if self.cookie_file_edit.text().strip() else "none",
+            "browser_cookie": self.cookie_mode_combo.currentData() or "chrome",
             "cookie_file_path": self.cookie_file_edit.text().strip(),
             "audio_quality": self.audio_quality_combo.currentData() or "192",
             "save_folder": self.folder_edit.text().strip(),
@@ -1208,7 +1224,10 @@ class CrawlerTab(QWidget):
         crawler_cfg = settings.get("audio_crawler", {}) or {}
 
         self._set_combo_by_data(self.platform_combo, crawler_cfg.get("platform", "youtube"))
+        b_cookie = str(crawler_cfg.get("browser_cookie", "chrome"))
+        self._set_combo_by_data(self.cookie_mode_combo, b_cookie)
         self.cookie_file_edit.setText(str(crawler_cfg.get("cookie_file_path", "")))
+        self._on_cookie_mode_changed()
         self._set_combo_by_data(self.audio_quality_combo, crawler_cfg.get("audio_quality", "192"))
         self.folder_edit.setText(str(crawler_cfg.get("save_folder", "")))
         self.auto_add_checkbox.setChecked(bool(crawler_cfg.get("auto_add_to_audio_list", True)))
