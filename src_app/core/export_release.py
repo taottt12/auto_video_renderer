@@ -151,6 +151,8 @@ def create_clean_release(output_dir_name: str = "AutoVideoRenderer_Clean_Release
         shutil.copy2(root_dir / "ChayTool.vbs", target_dir / "ChayTool.vbs")
     shutil.copy2(root_dir / "run.bat", target_dir / "run.bat")
     shutil.copy2(root_dir / "run_debug.bat", target_dir / "run_debug.bat")
+    if (root_dir / "DongGoiTool.bat").exists():
+        shutil.copy2(root_dir / "DongGoiTool.bat", target_dir / "DongGoiTool.bat")
     if (root_dir / "KiemTraPhanCung.bat").exists():
         shutil.copy2(root_dir / "KiemTraPhanCung.bat", target_dir / "KiemTraPhanCung.bat")
 

@@ -8,7 +8,7 @@ echo        🚀 AUTO VIDEO RENDERER - DANG KHOI DONG...
 echo ================================================================
 echo.
 
-REM 1. Kiem tra moi truong Python va tinh hop le
+REM 1. Kiem tra moi truong Python
 if not exist ".venv\Scripts\python.exe" (
     echo [THONG BAO] Chua co moi truong .venv. Dang thiet lap tu dong qua setup.bat...
     call setup.bat
@@ -16,13 +16,6 @@ if not exist ".venv\Scripts\python.exe" (
         echo [LOI] Khoi tao moi truong that bai!
         pause
         exit /b 1
-    )
-) else (
-    for /f "tokens=*" %%C in ('".venv\Scripts\python.exe" -c "import sys; print('INVALID' if sys.version_info >= (3, 13) or sys.version_info < (3, 10) else 'VALID')" 2^>nul') do (
-        if "%%C"=="INVALID" (
-            echo [CANH BAO] Moi truong .venv hien tai khong tuong thich AI. Dang thiet lap lai...
-            call setup.bat
-        )
     )
 )
 
