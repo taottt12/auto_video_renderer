@@ -69,10 +69,13 @@ if not defined PY_EXE (
 REM 3. Kiem tra python.exe mac dinh trong PATH co thuoc 3.10 -> 3.12 hay khong
 if not defined PY_EXE (
     for /f "delims=" %%P in ('where python.exe 2^>nul') do (
-        if not defined PY_EXE (
-            "%%P" -c "import sys; exit(0 if sys.version_info.major == 3 and sys.version_info.minor in (10, 11, 12) else 1)" >nul 2>&1
-            if not errorlevel 1 (
-                set "PY_EXE=%%P"
+        echo "%%P" | findstr /i "WindowsApps" >nul
+        if errorlevel 1 (
+            if not defined PY_EXE (
+                "%%P" -c "import sys; exit(0 if sys.version_info.major == 3 and sys.version_info.minor in (10, 11, 12) else 1)" >nul 2>&1
+                if not errorlevel 1 (
+                    set "PY_EXE=%%P"
+                )
             )
         )
     )
@@ -104,12 +107,15 @@ if not defined PY_EXE (
     )
 
     echo [OK] Da tai xong bo cai. Dang tu dong cai dat vao he thong...
-    "!INSTALLER_FILE!" /quiet InstallAllUsers=0 PrependPath=1 Include_test=0 Include_pip=1 SimpleInstall=1
-    timeout /t 6 >nul
+    start /wait "" "!INSTALLER_FILE!" /quiet InstallAllUsers=0 PrependPath=1 Include_test=0 Include_pip=1 SimpleInstall=1
     del "!INSTALLER_FILE!" 2>nul
 
     if exist "%LOCALAPPDATA%\Programs\Python\Python311\python.exe" (
         set "PY_EXE=%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
+    ) else if exist "%ProgramFiles%\Python311\python.exe" (
+        set "PY_EXE=%ProgramFiles%\Python311\python.exe"
+    ) else if exist "C:\Python311\python.exe" (
+        set "PY_EXE=C:\Python311\python.exe"
     ) else (
         for /f "delims=" %%P in ('py -3.11 -c "import sys; print(sys.executable)" 2^>nul') do set "PY_EXE=%%P"
     )

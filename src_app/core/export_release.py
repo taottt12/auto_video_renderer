@@ -113,15 +113,15 @@ def create_clean_release(output_dir_name: str = "AutoVideoRenderer_Clean_Release
 
     # 3. Sao chép mã nguồn core, ui, __init__.py
     print("📋 Đang sao chép mã nguồn src_app...")
-    shutil.copytree(SRC_APP_DIR / "core", target_dir / "src_app" / "core", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    shutil.copytree(SRC_APP_DIR / "ui", target_dir / "src_app" / "ui", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    shutil.copytree(SRC_APP_DIR / "core", target_dir / "src_app" / "core", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"), dirs_exist_ok=True)
+    shutil.copytree(SRC_APP_DIR / "ui", target_dir / "src_app" / "ui", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"), dirs_exist_ok=True)
     if (SRC_APP_DIR / "__init__.py").exists():
         shutil.copy2(SRC_APP_DIR / "__init__.py", target_dir / "src_app" / "__init__.py")
 
     # 4. Sao chép tài nguyên assets (Fonts chữ & Overlays)
     if (SRC_APP_DIR / "assets").exists():
         print("🎨 Đang sao chép Fonts chữ và Video Overlays mẫu...")
-        shutil.copytree(SRC_APP_DIR / "assets", target_dir / "src_app" / "assets", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copytree(SRC_APP_DIR / "assets", target_dir / "src_app" / "assets", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"), dirs_exist_ok=True)
 
     # 5. Sao chép Mẫu Bố Cục Presets Layout
     source_layouts = SRC_APP_DIR / "data" / "presets" / "layouts"
@@ -134,7 +134,7 @@ def create_clean_release(output_dir_name: str = "AutoVideoRenderer_Clean_Release
     # 6. Sao chép công cụ nhúng FFmpeg
     if TOOLS_DIR.exists():
         print("🛠 Đang sao chép công cụ nhúng FFmpeg...")
-        shutil.copytree(TOOLS_DIR, target_dir / "tools")
+        shutil.copytree(TOOLS_DIR, target_dir / "tools", dirs_exist_ok=True)
 
     # 7. Tạo file config.json SẠCH 100% (Không chứa API Key / Token / Đường dẫn riêng)
     print("🔒 Đang làm sạch và bảo mật config.json (xóa API Key & thông tin nhạy cảm)...")
