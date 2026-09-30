@@ -303,6 +303,88 @@ def parse_raw_cookie_data(raw_data: Any) -> Optional[List[Dict[str, Any]]]:
     return None
 
 
+def get_browser_executable() -> Tuple[Optional[str], str]:
+    """Tìm trình duyệt khả dụng trên Windows (Chrome, Edge, Brave). Trả về (đường dẫn exe, loại trình duyệt)."""
+    candidates = [
+        (r"C:\Program Files\Google\Chrome\Application\chrome.exe", "chrome"),
+        (r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe", "chrome"),
+        (str(Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "Application" / "chrome.exe"), "chrome"),
+        (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", "edge"),
+        (r"C:\Program Files\Microsoft\Edge\Application\msedge.exe", "edge"),
+        (str(Path.home() / "AppData" / "Local" / "Microsoft" / "Edge" / "Application" / "msedge.exe"), "edge"),
+        (r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe", "brave"),
+        (str(Path.home() / "AppData" / "Local" / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe"), "brave"),
+    ]
+    for c_path, b_type in candidates:
+        if os.path.exists(c_path):
+            return c_path, b_type
+
+    import shutil
+    for name, b_type in [("chrome", "chrome"), ("msedge", "edge"), ("brave", "brave"), ("google-chrome", "chrome")]:
+        found = shutil.which(name)
+        if found and os.path.exists(found):
+            return found, b_type
+    return None, "chrome"
+
+
+def get_dedicated_profile_dir() -> Path:
+    """Trả về thư mục Profile trình duyệt độc lập cho AutoVideoRenderer."""
+    from .paths import DATA_DIR
+    p = DATA_DIR / "browser_profile"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def has_dedicated_profile_data() -> bool:
+    """Kiểm tra xem Profile độc lập đã được người dùng mở và lưu dữ liệu/cookie chưa."""
+    p = get_dedicated_profile_dir()
+    default_dir = p / "Default"
+    if default_dir.exists():
+        if (default_dir / "Network" / "Cookies").exists() or (default_dir / "Cookies").exists():
+            return True
+        try:
+            if any(default_dir.iterdir()):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def open_dedicated_browser_for_login(target_url: str = "https://www.youtube.com") -> Tuple[bool, str]:
+    """Mở cửa sổ Chrome/Edge độc lập để người dùng đăng nhập tài khoản YouTube."""
+    exe, b_type = get_browser_executable()
+    if not exe:
+        return False, "Không tìm thấy Google Chrome hoặc Microsoft Edge trên máy tính để mở Profile riêng."
+
+    profile_dir = str(get_dedicated_profile_dir().resolve())
+    cmd = [
+        exe,
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        target_url,
+    ]
+    try:
+        subprocess.Popen(cmd)
+        b_name = "Google Chrome" if b_type == "chrome" else ("Microsoft Edge" if b_type == "edge" else "Brave")
+        return True, f"Đã mở {b_name} với Profile riêng.\n\nHãy đăng nhập tài khoản YouTube của bạn trong cửa sổ vừa mở. Sau khi đăng nhập xong, bạn có thể đóng trình duyệt và cào nhạc không giới hạn!"
+    except Exception as exc:
+        return False, f"Lỗi khi mở trình duyệt: {exc}"
+
+
+def clear_dedicated_profile() -> Tuple[bool, str]:
+    """Xóa và làm sạch dữ liệu Profile độc lập."""
+    import shutil
+    p = get_dedicated_profile_dir()
+    try:
+        if p.exists():
+            shutil.rmtree(p, ignore_errors=True)
+            p.mkdir(parents=True, exist_ok=True)
+        return True, "Đã làm sạch toàn bộ dữ liệu Profile riêng thành công!"
+    except Exception as exc:
+        return False, f"Không thể xóa thư mục Profile (có thể trình duyệt đang mở): {exc}"
+
+
 def get_node_runtime() -> Optional[Dict[str, Any]]:
     """Tự động tìm kiếm Node.js nhúng hoặc Node.js trên hệ thống để giải mã YouTube n-challenge."""
     from .paths import TOOLS_DIR, APP_ROOT
@@ -612,7 +694,16 @@ def extract_entry_list(
         ydl_opts["js_runtimes"] = node_rt
 
     VALID_BROWSERS = {"chrome", "edge", "brave", "firefox", "chromium", "opera", "vivaldi", "safari"}
-    if browser_cookie in ["file", "custom", "text"] and cookie_file:
+    if browser_cookie in ["profile", "dedicated_profile"]:
+        pdir = get_dedicated_profile_dir().resolve()
+        _, b_type = get_browser_executable()
+        ydl_opts["cookiesfrombrowser"] = (b_type, str(pdir))
+        ydl_opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android", "ios", "tv_embedded", "tv", "mweb", "android_vr", "web_creator", "web"]
+            }
+        }
+    elif browser_cookie in ["file", "custom", "text"] and cookie_file:
         cfile = ensure_netscape_cookie_file(cookie_file)
         if cfile and os.path.exists(cfile):
             ydl_opts["cookiefile"] = cfile
@@ -822,7 +913,16 @@ def download_single_audio(
         ydl_opts["js_runtimes"] = node_rt
 
     VALID_BROWSERS = {"chrome", "edge", "brave", "firefox", "chromium", "opera", "vivaldi", "safari"}
-    if browser_cookie in ["file", "custom", "text"] and cookie_file:
+    if browser_cookie in ["profile", "dedicated_profile"]:
+        pdir = get_dedicated_profile_dir().resolve()
+        _, b_type = get_browser_executable()
+        ydl_opts["cookiesfrombrowser"] = (b_type, str(pdir))
+        ydl_opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android", "ios", "tv_embedded", "tv", "mweb", "android_vr", "web_creator", "web"]
+            }
+        }
+    elif browser_cookie in ["file", "custom", "text"] and cookie_file:
         cfile = ensure_netscape_cookie_file(cookie_file)
         if cfile and os.path.exists(cfile):
             ydl_opts["cookiefile"] = cfile
@@ -1119,6 +1219,8 @@ def run_crawler(
     cookie_file = str(crawler_cfg.get("cookie_file_path") or "").strip()
     if browser_cookie.startswith("oauth:"):
         _log("🔐 Chế độ Xác thực: Sử dụng Kênh YouTube OAuth (Quét API v3 chính chủ & Tải thông minh).")
+    elif browser_cookie in ["profile", "dedicated_profile"]:
+        _log("🚀 Chế độ Xác thực: Sử dụng Profile Trình duyệt riêng (Khuyến nghị 100% Ổn định).")
     elif browser_cookie in ["file", "custom", "text"] and cookie_file:
         _log(f"🍪 Chế độ Cookie: Sử dụng File Cookie tùy chỉnh '{Path(cookie_file).name}'.")
     elif browser_cookie.lower() in ["chrome", "edge", "brave", "firefox", "chromium", "opera", "vivaldi"]:

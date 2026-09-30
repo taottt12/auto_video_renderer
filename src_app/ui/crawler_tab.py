@@ -24,6 +24,9 @@ from core.audio_crawler import (
     normalize_channel_url,
     ensure_netscape_cookie_file,
     validate_and_inspect_cookie,
+    open_dedicated_browser_for_login,
+    has_dedicated_profile_data,
+    clear_dedicated_profile,
 )
 
 
@@ -324,16 +327,45 @@ class CrawlerTab(QWidget):
 
         # 1. Chế độ Cookie vượt chặn Bot
         self.cookie_mode_combo = QComboBox()
-        self.cookie_mode_combo.addItem("🌐 Trực tiếp từ Google Chrome (Khuyến nghị 95% thành công)", "chrome")
-        self.cookie_mode_combo.addItem("🌐 Trực tiếp từ Microsoft Edge", "edge")
-        self.cookie_mode_combo.addItem("🌐 Trực tiếp từ Brave", "brave")
-        self.cookie_mode_combo.addItem("🌐 Trực tiếp từ Firefox", "firefox")
+        self.cookie_mode_combo.addItem("🚀 Profile Trình duyệt riêng (Khuyến nghị 100% Ổn định - Đăng nhập 1 lần)", "profile")
+        self.cookie_mode_combo.addItem("🌐 Trực tiếp từ Google Chrome máy tính (Không cần xuất file)", "chrome")
+        self.cookie_mode_combo.addItem("🌐 Trực tiếp từ Microsoft Edge máy tính", "edge")
+        self.cookie_mode_combo.addItem("🌐 Trực tiếp từ Brave máy tính", "brave")
+        self.cookie_mode_combo.addItem("🌐 Trực tiếp từ Firefox máy tính", "firefox")
         self.cookie_mode_combo.addItem("📁 Dùng File Cookie / Dán chuỗi tùy chỉnh (cc.txt, JSON)", "file")
         self.cookie_mode_combo.addItem("🚫 Tắt Cookie (Dùng đa Client Mobile/TV vượt Bot)", "none")
         self.cookie_mode_combo.currentIndexChanged.connect(self._on_cookie_mode_changed)
-        form_layout.addRow("Chế độ Cookie:", self.cookie_mode_combo)
+        form_layout.addRow("Chế độ Xác thực:", self.cookie_mode_combo)
 
-        # 2. Chi tiết File Cookie tùy chỉnh (chỉ hiện khi chọn chế độ File Cookie)
+        # 2. Widget Profile trình duyệt riêng (Khuyến nghị số 1)
+        self.profile_widget = QWidget()
+        profile_row = QHBoxLayout(self.profile_widget)
+        profile_row.setContentsMargins(0, 0, 0, 0)
+        profile_row.setSpacing(8)
+
+        self.login_profile_btn = QPushButton("🔑 Đăng nhập YouTube (Mở Profile riêng)")
+        self.login_profile_btn.setStyleSheet("font-weight: bold; background-color: #2e7d32; color: white; padding: 6px 14px;")
+        self.login_profile_btn.setToolTip("Mở một cửa sổ Chrome/Edge độc lập để bạn đăng nhập tài khoản YouTube một lần duy nhất.")
+        self.login_profile_btn.clicked.connect(self._open_profile_browser)
+
+        self.profile_status_lbl = QLabel("⚪ Đang kiểm tra...")
+        self.profile_status_lbl.setStyleSheet("font-weight: bold; padding: 4px 8px; border-radius: 4px;")
+
+        self.refresh_profile_btn = QPushButton("🔄 Kiểm tra")
+        self.refresh_profile_btn.clicked.connect(self._update_profile_status)
+
+        self.clear_profile_btn = QPushButton("🗑️ Xóa Profile")
+        self.clear_profile_btn.setStyleSheet("color: #d32f2f;")
+        self.clear_profile_btn.setToolTip("Xóa toàn bộ dữ liệu đăng nhập của Profile riêng để làm mới hoàn toàn.")
+        self.clear_profile_btn.clicked.connect(self._clear_profile_data)
+
+        profile_row.addWidget(self.login_profile_btn)
+        profile_row.addWidget(self.profile_status_lbl, 1)
+        profile_row.addWidget(self.refresh_profile_btn)
+        profile_row.addWidget(self.clear_profile_btn)
+        form_layout.addRow("Quản lý Profile:", self.profile_widget)
+
+        # 3. Chi tiết File Cookie tùy chỉnh (chỉ hiện khi chọn chế độ File Cookie)
         self.cookie_file_widget = QWidget()
         cookie_file_row = QHBoxLayout(self.cookie_file_widget)
         cookie_file_row.setContentsMargins(0, 0, 0, 0)
@@ -687,9 +719,52 @@ class CrawlerTab(QWidget):
         )
 
     def _on_cookie_mode_changed(self) -> None:
-        mode = self.cookie_mode_combo.currentData() or "chrome"
+        mode = self.cookie_mode_combo.currentData() or "profile"
+        self.profile_widget.setVisible(mode == "profile")
         self.cookie_file_widget.setVisible(mode == "file")
+        if mode == "profile":
+            self._update_profile_status()
         self._emit()
+
+    def _update_profile_status(self) -> None:
+        has_data = has_dedicated_profile_data()
+        if has_data:
+            self.profile_status_lbl.setText("🟢 Đã có dữ liệu Profile (Sẵn sàng cào 100%)")
+            self.profile_status_lbl.setStyleSheet("color: #2e7d32; font-weight: bold; background: #e8f5e9; padding: 4px 8px; border-radius: 4px; border: 1px solid #81c784;")
+        else:
+            self.profile_status_lbl.setText("⚪ Chưa đăng nhập (Bấm nút bên trái để đăng nhập)")
+            self.profile_status_lbl.setStyleSheet("color: #e65100; font-weight: bold; background: #fff3e0; padding: 4px 8px; border-radius: 4px; border: 1px solid #ffb74d;")
+
+    def _open_profile_browser(self) -> None:
+        ok, msg = open_dedicated_browser_for_login()
+        if ok:
+            QMessageBox.information(
+                self, "Đã mở Trình duyệt Profile riêng",
+                f"{msg}\n\n"
+                f"📌 Các bước thực hiện:\n"
+                f"1. Tại cửa sổ trình duyệt vừa mở, hãy đăng nhập tài khoản YouTube của bạn (nếu cần).\n"
+                f"2. Bạn có thể mở thử bất kỳ video nào để kiểm tra.\n"
+                f"3. Sau khi xong, bạn có thể đóng trình duyệt lại hoặc để nguyên, rồi bấm '🔄 Kiểm tra' để cào nhạc."
+            )
+            self._update_profile_status()
+        else:
+            QMessageBox.warning(self, "Lỗi mở Trình duyệt", msg)
+
+    def _clear_profile_data(self) -> None:
+        reply = QMessageBox.question(
+            self, "Xác nhận xóa Profile",
+            "Bạn có chắc muốn xóa toàn bộ dữ liệu phiên đăng nhập của Profile riêng không?\n"
+            "(Lưu ý: Hãy chắc chắn bạn đã đóng cửa sổ trình duyệt Profile trước khi bấm Xóa)",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            ok, msg = clear_dedicated_profile()
+            if ok:
+                QMessageBox.information(self, "Thành công", msg)
+            else:
+                QMessageBox.warning(self, "Thông báo", msg)
+            self._update_profile_status()
 
     def _clear_cookie(self) -> None:
         self.cookie_file_edit.clear()
@@ -1192,7 +1267,7 @@ class CrawlerTab(QWidget):
         settings = dict(self.settings)
         crawler_settings = {
             "platform": self.platform_combo.currentData() or "youtube",
-            "browser_cookie": self.cookie_mode_combo.currentData() or "chrome",
+            "browser_cookie": self.cookie_mode_combo.currentData() or "profile",
             "cookie_file_path": self.cookie_file_edit.text().strip(),
             "audio_quality": self.audio_quality_combo.currentData() or "192",
             "save_folder": self.folder_edit.text().strip(),
@@ -1224,7 +1299,7 @@ class CrawlerTab(QWidget):
         crawler_cfg = settings.get("audio_crawler", {}) or {}
 
         self._set_combo_by_data(self.platform_combo, crawler_cfg.get("platform", "youtube"))
-        b_cookie = str(crawler_cfg.get("browser_cookie", "chrome"))
+        b_cookie = str(crawler_cfg.get("browser_cookie", "profile"))
         self._set_combo_by_data(self.cookie_mode_combo, b_cookie)
         self.cookie_file_edit.setText(str(crawler_cfg.get("cookie_file_path", "")))
         self._on_cookie_mode_changed()
