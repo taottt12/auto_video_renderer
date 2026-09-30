@@ -13,6 +13,8 @@ env/
 tools/ffmpeg/bin/*.exe
 tools/ffmpeg/bin/
 tools/ffmpeg/
+tools/js/
+tools/js/*.exe
 tools/*.exe
 
 # Temporary files, caches & outputs

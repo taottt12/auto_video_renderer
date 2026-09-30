@@ -280,7 +280,18 @@ def parse_raw_cookie_data(raw_data: Any) -> Optional[List[Dict[str, Any]]]:
 
 
 def get_node_runtime() -> Optional[Dict[str, Any]]:
-    """Tự động tìm kiếm Node.js trên hệ thống để giải mã YouTube n-challenge."""
+    """Tự động tìm kiếm Node.js nhúng hoặc Node.js trên hệ thống để giải mã YouTube n-challenge."""
+    from .paths import TOOLS_DIR, APP_ROOT
+    embedded_candidates = [
+        TOOLS_DIR / "js" / "node.exe",
+        TOOLS_DIR / "nodejs" / "node.exe",
+        TOOLS_DIR / "node.exe",
+        APP_ROOT / "tools" / "js" / "node.exe",
+    ]
+    for c in embedded_candidates:
+        if c.exists() and os.path.isfile(c):
+            return {"node": {"path": str(c.resolve())}}
+
     candidates = [
         r"C:\Program Files\nodejs\node.exe",
         r"C:\Program Files (x86)\nodejs\node.exe",
@@ -640,7 +651,13 @@ def download_single_audio(
 
         def warning(self, msg: str) -> None:
             clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", msg).strip()
-            if "No supported JavaScript runtime" in clean:
+            if any(ign in clean for ign in [
+                "No supported JavaScript runtime",
+                "Skipping client",
+                "Remote component challenge solver",
+                "GVS PO Token",
+                "SABR-only streaming experiment",
+            ]):
                 return
             if clean:
                 _log(f"   ⚠ [Cảnh báo] {clean}")
@@ -653,7 +670,7 @@ def download_single_audio(
     out_template = str(save_dir / "%(title)s.%(ext)s")
 
     ydl_opts: Dict[str, Any] = {
-        "format": "ba[ext=m4a]/ba[ext=aac]/bestaudio/best",
+        "format": "ba/b*/bestaudio/best",
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
@@ -677,7 +694,7 @@ def download_single_audio(
         "progress_hooks": [progress_hook],
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "tv", "mweb", "web"]
+                "player_client": ["tv", "ios", "android", "mweb", "web"]
             }
         },
     }
@@ -693,7 +710,7 @@ def download_single_audio(
             ydl_opts["cookiefile"] = cfile
             ydl_opts["extractor_args"] = {
                 "youtube": {
-                    "player_client": ["web", "mweb", "android", "ios"]
+                    "player_client": ["tv", "web_creator", "mweb", "web", "android", "ios"]
                 }
             }
     elif browser_cookie.lower() in VALID_BROWSERS:

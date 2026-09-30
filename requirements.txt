@@ -6,3 +6,4 @@ google-auth-httplib2>=0.2.0
 pillow>=10.0.0
 requests>=2.31.0
 openai-whisper>=20250625
+openpyxl>=3.1.0
