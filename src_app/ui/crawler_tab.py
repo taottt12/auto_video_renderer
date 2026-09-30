@@ -698,9 +698,10 @@ class CrawlerTab(QWidget):
             "", "Cookie Files (*.txt *.json);;JSON Files (*.json);;Text Files (*.txt);;All Files (*)"
         )
         if fname:
-            self.cookie_file_edit.setText(fname)
+            abs_fname = str(Path(fname).resolve().as_posix())
+            self.cookie_file_edit.setText(abs_fname)
             self._emit()
-            res = validate_and_inspect_cookie(fname)
+            res = validate_and_inspect_cookie(abs_fname)
             if res.get("valid") and not res.get("is_expired"):
                 days = res.get("days_remaining", 0)
                 exp_str = res.get("expiry_date_str", "")

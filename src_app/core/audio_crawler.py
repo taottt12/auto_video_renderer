@@ -58,13 +58,37 @@ def extract_cookies_from_any_source(source: str) -> Tuple[List[Dict[str, Any]], 
     if not source:
         return [], "empty"
 
-    # 1. Nếu là đường dẫn file
-    if os.path.exists(source) and os.path.isfile(source):
+    # 1. Nếu là đường dẫn file hoặc tên file (tự động tìm kiếm đa vị trí)
+    resolved_file = None
+    if "\n" not in source and len(source) < 500:
+        candidate_paths = [
+            Path(source),
+            Path.cwd() / source,
+            Path.home() / "Desktop" / source,
+            Path.home() / "Downloads" / source,
+            Path.home() / source,
+        ]
         try:
-            with open(source, "r", encoding="utf-8", errors="ignore") as f:
+            from .paths import APP_ROOT
+            candidate_paths.append(APP_ROOT / source)
+        except Exception:
+            pass
+
+        for cp in candidate_paths:
+            try:
+                if cp.exists() and cp.is_file():
+                    resolved_file = cp
+                    break
+            except Exception:
+                pass
+
+    if resolved_file:
+        try:
+            with open(resolved_file, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read().strip()
-            cookies, _ = extract_cookies_from_any_source(content)
-            return cookies, f"File ({Path(source).name})"
+            cookies, sub_fmt = extract_cookies_from_any_source(content)
+            if cookies:
+                return cookies, f"File ({resolved_file.name})"
         except Exception:
             pass
 
@@ -424,6 +448,43 @@ def normalize_channel_url(url: str) -> str:
     return url
 
 
+def sanitize_video_url_for_single_download(url: str) -> str:
+    """
+    Tự động làm sạch URL khi cào video đơn lẻ:
+    Loại bỏ triệt để các tham số playlist (&list=..., &index=..., &pp=..., &t=...) 
+    để yt-dlp không kích hoạt cào toàn bộ playlist ngầm.
+    """
+    if not url:
+        return ""
+    url = str(url).strip()
+    try:
+        import urllib.parse
+        # 1. Dạng https://www.youtube.com/watch?v=XXXX&list=YYYY&index=1
+        if "youtube.com/watch" in url or "m.youtube.com/watch" in url:
+            parsed = urllib.parse.urlparse(url)
+            query_dict = urllib.parse.parse_qs(parsed.query)
+            v_val = query_dict.get("v")
+            if v_val and v_val[0]:
+                return f"https://www.youtube.com/watch?v={v_val[0]}"
+        # 2. Dạng https://youtu.be/XXXX?list=YYYY
+        elif "youtu.be/" in url:
+            parsed = urllib.parse.urlparse(url)
+            v_id = parsed.path.strip("/")
+            if v_id:
+                return f"https://www.youtube.com/watch?v={v_id}"
+        # 3. Dạng Shorts https://www.youtube.com/shorts/XXXX?feature=share
+        elif "youtube.com/shorts/" in url:
+            parsed = urllib.parse.urlparse(url)
+            parts = parsed.path.split("/shorts/")
+            if len(parts) > 1:
+                s_id = parts[1].split("/")[0].split("?")[0]
+                if s_id:
+                    return f"https://www.youtube.com/watch?v={s_id}"
+    except Exception:
+        pass
+    return url
+
+
 def filter_by_date(
     entries: List[Dict[str, Any]],
     date_filter: str,
@@ -720,10 +781,12 @@ def download_single_audio(
             if clean:
                 _log(f"   ❌ [Lỗi] {clean}")
 
+    clean_url = sanitize_video_url_for_single_download(url)
     out_template = str(save_dir / "%(title)s.%(ext)s")
 
     ydl_opts: Dict[str, Any] = {
         "format": "ba/b*/bestaudio/best",
+        "noplaylist": True,
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
@@ -767,6 +830,8 @@ def download_single_audio(
                     "player_client": ["android", "ios", "tv", "web"]
                 }
             }
+        else:
+            _log(f"   ⚠ Không tìm thấy nội dung cookie hợp lệ tại '{cookie_file}'. Tự động chạy chế độ vượt Bot không dùng Cookie...")
     elif browser_cookie.lower() in VALID_BROWSERS:
         ydl_opts["cookiesfrombrowser"] = (browser_cookie.lower(), )
 
@@ -776,7 +841,7 @@ def download_single_audio(
     info = None
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(clean_url, download=True)
     except Exception as exc:
         err_str = str(exc)
 
@@ -794,7 +859,7 @@ def download_single_audio(
         ) and "requested format is not available" not in err_str.lower() and "the page needs to be reloaded" not in err_str.lower()
 
         if is_truly_deleted:
-            _log(f"   ⚠ [Bỏ qua: Video không khả dụng] Video '{title_hint}' ({url}) đã bị xóa hoặc đặt ở chế độ riêng tư.")
+            _log(f"   ⚠ [Bỏ qua: Video không khả dụng] Video '{title_hint}' ({clean_url}) đã bị xóa hoặc đặt ở chế độ riêng tư.")
             return None
 
         # 2. Nếu lỗi liên quan đến cookie, bot, PO token, hoặc format không tải được qua Web
@@ -823,6 +888,7 @@ def download_single_audio(
             opts_fallback = dict(ydl_opts)
             opts_fallback.pop("cookiesfrombrowser", None)
             opts_fallback.pop("cookiefile", None)
+            opts_fallback["noplaylist"] = True
             opts_fallback["extractor_args"] = {
                 "youtube": {
                     "player_client": ["android", "ios", "tv"]
@@ -830,7 +896,7 @@ def download_single_audio(
             }
             try:
                 with yt_dlp.YoutubeDL(opts_fallback) as ydl_fb:
-                    info = ydl_fb.extract_info(url, download=True)
+                    info = ydl_fb.extract_info(clean_url, download=True)
             except Exception as fb_exc:
                 fb_err = str(fb_exc)
                 if any(k in fb_err.lower() for k in ["this video has been removed", "private video", "video is private"]):
@@ -1053,8 +1119,10 @@ def run_crawler(
         raw_text = str(crawler_cfg.get("video_urls") or "")
         lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
         for line in lines:
-            targets.append({"url": line, "title": "", "id": ""})
-        _log(f"Chế độ cào Video: tìm thấy {len(targets)} link hợp lệ.")
+            cleaned_l = sanitize_video_url_for_single_download(line)
+            if cleaned_l:
+                targets.append({"url": cleaned_l, "title": "", "id": ""})
+        _log(f"Chế độ cào Video: tìm thấy {len(targets)} link hợp lệ (đã làm sạch tham số playlist).")
 
     elif mode == "playlist":
         playlist_url = str(crawler_cfg.get("playlist_url") or "").strip()
