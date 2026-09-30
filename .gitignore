@@ -38,6 +38,7 @@ src_app/data/temp/
 src_app/data/output/
 src_app/data/logs/
 src_app/data/tokens/
+src_app/data/browser_profile/
 src_app/data/projects/*.json
 src_app/data/projects/*.avr.json
 src_app/tools/
