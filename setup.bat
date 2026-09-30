@@ -102,12 +102,23 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 echo.
-echo [2/3] Kiem tra va nang cap trinh quan ly pip...
+echo [2/4] Kiem tra va nang cap trinh quan ly pip...
 ".venv\Scripts\python.exe" -m pip install --upgrade pip >nul 2>&1
 
 echo.
-echo [3/3] Dang tu dong cai dat tat ca thu vien tu requirements.txt...
-echo (Qua trinh nay chi dien ra 1 lan duy nhat khi setup)...
+echo [3/4] Dang quet GPU va cai dat PyTorch CUDA phu hop cho card do hoa...
+where nvidia-smi.exe >nul 2>&1
+if not errorlevel 1 (
+    echo [OK] Phat hien card do hoa NVIDIA GPU!
+    echo Dang cai dat PyTorch CUDA 12.4 chinh thuc cho GPU...
+    ".venv\Scripts\python.exe" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+) else (
+    echo [THONG BAO] Khong tim thay GPU NVIDIA. Dang cai dat PyTorch CPU...
+    ".venv\Scripts\python.exe" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+)
+
+echo.
+echo [4/4] Dang tu dong cai dat tat ca thu vien con lai tu requirements.txt...
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 if errorlevel 1 (
     echo [CANH BAO] Co loi khi cai dat thu vien. Vui long kiem tra ket noi mang va thu lai!
@@ -116,6 +127,9 @@ if errorlevel 1 (
 )
 
 echo.
+echo ================================================================
+echo 🔍 KIEM TRA TINH TRANG PYTORCH CUDA:
+".venv\Scripts\python.exe" -c "import torch; print('• PyTorch Version:', torch.__version__); print('• CUDA Available:', torch.cuda.is_available()); print('• GPU Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'Khong co GPU')"
 echo ================================================================
 echo 🎉 THIET LAP HOAN TAT! HE THONG DA SAN SANG 100%.
 echo Tu nay ban chi can nhap dup vao [ ChayTool.bat ] de mo app.

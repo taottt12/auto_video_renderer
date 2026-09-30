@@ -47,10 +47,10 @@ class DurationLoaderThread(QThread):
         self._stop_event = threading.Event()
 
     def add_tasks(self, tasks: List[Tuple[int, str]]) -> None:
+        self._stop_event.clear()
         with self._lock:
             self.queue.extend(tasks)
         if not self.isRunning():
-            self._stop_event.clear()
             self.start()
 
     def stop(self) -> None:
@@ -467,6 +467,15 @@ class RenderTab(QWidget):
 
         self._build_ui()
         self.load_settings(settings)
+
+    @Slot(int, str)
+    def _on_duration_loaded(self, row: int, dur_str: str) -> None:
+        if 0 <= row < self.table.rowCount():
+            item = self.table.item(row, 1)
+            if item:
+                item.setText(dur_str)
+            else:
+                self.table.setItem(row, 1, QTableWidgetItem(dur_str))
 
     def _ffmpeg_path(self) -> str:
         if not self._ffmpeg_bin:
@@ -1510,6 +1519,31 @@ class RenderTab(QWidget):
             return False
         self.settings["media_files"] = valid_media
 
+        # 6. Kiểm tra cấu hình Subtitle
+        sub_cfg = self.settings.get("subtitle", {}) or {}
+        ls_layers = (self.settings.get("layout_studio", {}) or {}).get("layers", [])
+        has_studio_sub = any(isinstance(l, dict) and l.get("type") == "subtitle" and l.get("enabled", True) for l in ls_layers)
+        sub_is_enabled = bool(sub_cfg.get("enabled") or has_studio_sub)
+
+        if sub_is_enabled:
+            sub_folder = str(sub_cfg.get("folder", "")).strip()
+            if sub_folder and not os.path.exists(sub_folder):
+                alt_found = None
+                for drive in ["F:", "E:", "D:", "C:"]:
+                    if len(sub_folder) > 2 and sub_folder[1] == ":":
+                        cand = drive + sub_folder[2:]
+                        if os.path.exists(cand):
+                            alt_found = cand
+                            break
+                if alt_found:
+                    sub_cfg["folder"] = alt_found
+                    self.append_log(f"💡 Đã tự động chuyển đường dẫn thư mục Sub sang: {alt_found}")
+                else:
+                    self.append_log(f"⚠️ Không tìm thấy thư mục phụ đề: {sub_folder}. Tự động tìm cạnh file audio hoặc dùng Whisper AI.")
+                    sub_cfg["folder"] = ""
+            sub_cfg["auto_transcribe"] = True
+            self.settings["subtitle"] = sub_cfg
+
         return True
 
     def _reload_render_layout_presets(self) -> None:
@@ -1639,7 +1673,12 @@ class RenderTab(QWidget):
         if reply != QMessageBox.Yes:
             return
 
-        out_dir = str(self._output_folder())
+        out_dir = ""
+        if hasattr(self, "output_edit"):
+            out_dir = self.output_edit.text().strip()
+        elif hasattr(self, "get_settings"):
+            settings = self.get_settings()
+            out_dir = settings.get("output_folder", "") or settings.get("output_dir", "")
         res = cleanup_all_temp_caches(output_dir=out_dir)
         freed = res.get("freed_formatted", "0 B")
         files = res.get("deleted_files", 0)
@@ -1767,3 +1806,16 @@ class RenderTab(QWidget):
         self.row_elapsed_final.clear()
         self._stop_playback()
         self._sync_audio_settings()
+
+    def cleanup(self) -> None:
+        """Dọn dẹp và dừng an toàn các luồng nền khi đóng ứng dụng."""
+        try:
+            if hasattr(self, "duration_loader") and self.duration_loader.isRunning():
+                self.duration_loader.stop()
+                self.duration_loader.wait(1000)
+            if self.worker and self.worker.isRunning():
+                self.worker.stop()
+                self.worker.wait(1500)
+            self._stop_playback()
+        except Exception:
+            pass

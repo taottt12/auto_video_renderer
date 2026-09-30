@@ -252,3 +252,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Đã mở", f"Đã mở dự án:\n{dlg.selected_path.name}")
         except Exception as exc:
             QMessageBox.critical(self, "Lỗi", f"Không xử lý được dự án: {exc}")
+
+    def closeEvent(self, event) -> None:
+        try:
+            if hasattr(self, "render_tab"):
+                self.render_tab.cleanup()
+        except Exception:
+            pass
+        super().closeEvent(event)

@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.media_utils import AUDIO_EXTENSIONS
+from core.subtitle_utils import preflight_whisper_model, check_cuda_whisper_support, ensure_cuda_whisper_libraries
 from ui.subtitle_widget import SubtitleBoxSelectorWidget
 
 
@@ -1146,6 +1147,11 @@ class SettingTab(QWidget):
         self.sub_auto_transcribe.setStyleSheet("color: #ffca28; font-weight: bold;")
         self.sub_auto_transcribe.setToolTip("Khi bật, lúc nhấn 'Chạy render' hệ thống sẽ tự động nghe MP3 theo đúng ngôn ngữ đã chọn để tạo file .srt rồi gắn vào video.")
 
+        def _on_sub_enabled_changed(checked: bool):
+            if checked and not self.sub_folder_edit.text().strip() and not self.sub_auto_transcribe.isChecked():
+                self.sub_auto_transcribe.setChecked(True)
+        self.sub_enabled.toggled.connect(_on_sub_enabled_changed)
+
         self.sub_whisper_lang = QComboBox()
         self.sub_whisper_lang.addItem("🌐 Tự động nhận diện (Auto Detect)", "auto")
         self.sub_whisper_lang.addItem("🇵🇭 Philippines (Tagalog / Filipino)", "tl")
@@ -1168,19 +1174,25 @@ class SettingTab(QWidget):
         self.sub_whisper_lang.setToolTip("Chọn ngôn ngữ của giọng đọc audio để Whisper AI nhận diện chính xác 100%, không bị nhầm lẫn ngôn ngữ.")
 
         self.sub_whisper_model = QComboBox()
-        self.sub_whisper_model.addItem("tiny (Siêu tốc - Nhẹ nhất, RAM 1GB)", "tiny")
-        self.sub_whisper_model.addItem("base (Cân bằng - Khuyên dùng, RAM 1GB)", "base")
-        self.sub_whisper_model.addItem("small (Chính xác cao, RAM 2GB)", "small")
-        self.sub_whisper_model.addItem("medium (Chính xác rất cao, RAM 5GB)", "medium")
-        self.sub_whisper_model.addItem("large-v3-turbo (Tối ưu tốc độ & chuẩn xác GPU, RAM 6GB)", "large-v3-turbo")
-        self.sub_whisper_model.addItem("large-v3 (Mô hình lớn nhất - Chuẩn xác 100%, RAM 10GB)", "large-v3")
-        self.sub_whisper_model.addItem("large-v2 (Large v2)", "large-v2")
-        self.sub_whisper_model.setCurrentIndex(1)
+        self.sub_whisper_model.addItem("turbo (⚡ Large-v3-Turbo - Tối ưu GPU RTX)", "turbo")
+        self.sub_whisper_model.addItem("large-v3 (Độ chính xác tối đa - GPU CUDA)", "large-v3")
+        self.sub_whisper_model.addItem("large-v2 (Chất lượng cao - GPU CUDA)", "large-v2")
+        self.sub_whisper_model.addItem("medium (Cân bằng cao - GPU CUDA)", "medium")
+        self.sub_whisper_model.addItem("small (⚡ Siêu tốc GPU RTX 1.2GB VRAM)", "small")
+        self.sub_whisper_model.addItem("base (Nhẹ - GPU/CPU)", "base")
+        self.sub_whisper_model.addItem("tiny (Siêu nhẹ)", "tiny")
+        self.sub_whisper_model.setCurrentIndex(0)
+
+        self.sub_check_model_btn = QPushButton("🔍 Kiểm tra GPU")
+        self.sub_check_model_btn.setToolTip("Kiểm tra khả năng tương thích và nạp thử model trên GPU NVIDIA trước khi render để đảm bảo 100% không bị lỗi.")
+        self.sub_check_model_btn.clicked.connect(self._check_whisper_gpu_model)
+
         auto_row.addWidget(self.sub_auto_transcribe, 3)
         auto_row.addWidget(QLabel("Ngôn ngữ:"))
         auto_row.addWidget(self.sub_whisper_lang, 2)
         auto_row.addWidget(QLabel("Model AI:"))
         auto_row.addWidget(self.sub_whisper_model, 2)
+        auto_row.addWidget(self.sub_check_model_btn, 1)
 
         # Hàng chọn Kiểu hiển thị phụ đề (3 chế độ)
         mode_row = QHBoxLayout()
@@ -1230,6 +1242,38 @@ class SettingTab(QWidget):
         self._on_sub_mode_changed()
         self._update_sub_highlight_btn_style()
         return group
+
+    def _check_whisper_gpu_model(self) -> None:
+        import threading
+        model_name = self.sub_whisper_model.currentData() if hasattr(self, "sub_whisper_model") else "large-v3-turbo"
+        self.sub_check_model_btn.setEnabled(False)
+        self.sub_check_model_btn.setText("⏳ Đang kiểm tra...")
+
+        def _bg():
+            ok, msg = preflight_whisper_model(model_name)
+            def _done():
+                self.sub_check_model_btn.setEnabled(True)
+                self.sub_check_model_btn.setText("🔍 Kiểm tra GPU")
+                if ok:
+                    QMessageBox.information(
+                        self,
+                        "Kiểm tra Model & GPU thành công",
+                        f"✅ Model Whisper [{model_name}] hoạt động 100% hoàn hảo trên GPU NVIDIA!\n\n"
+                        f"• Chi tiết: {msg}\n"
+                        f"• Chế độ: PyTorch CUDA GPU (fp16 Native)\n"
+                        f"• Đã sẵn sàng phục vụ render video không lo phát sinh lỗi."
+                    )
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Cảnh báo tương thích GPU",
+                        f"⚠️ Model [{model_name}] gặp cảnh báo trên GPU:\n{msg}\n\n"
+                        f"Vui lòng kiểm tra lại kết nối mạng để tải weights hoặc cấu hình GPU."
+                    )
+            QTimer.singleShot(0, _done)
+
+        threading.Thread(target=_bg, daemon=True).start()
+
 
     def _on_sub_mode_changed(self) -> None:
         if hasattr(self, "sub_highlight_widget") and hasattr(self, "sub_mode_combo"):

@@ -14,11 +14,11 @@ if not exist ".venv\Scripts\python.exe" (
     )
 )
 
-REM 2. Kiem tra thu vien quan trong
-".venv\Scripts\python.exe" -c "import PySide6, faster_whisper, ctranslate2, googleapiclient, yt_dlp" 2>nul
+REM 2. Kiem tra thu vien quan trong va PyTorch
+".venv\Scripts\python.exe" -c "import PySide6, whisper, torch, googleapiclient, yt_dlp, openpyxl, PIL" 2>nul
 if errorlevel 1 (
-    echo [THONG BAO] Phat hien thieu thu vien, dang tu dong cai dat tu requirements.txt...
-    ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+    echo [THONG BAO] Phat hien thieu thu vien hoac PyTorch, dang tien hanh cai dat chuan hoa qua setup.bat...
+    call setup.bat
     if errorlevel 1 (
         echo [CANH BAO] Cai dat thu vien that bai. Vui long kiem tra ket noi mang.
         pause

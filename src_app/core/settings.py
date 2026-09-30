@@ -110,7 +110,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "enabled": False,
         "auto_transcribe": False,
         "whisper_language": "auto",
-        "whisper_model": "base",
+        "whisper_model": "small",
         "auto_detect_srt": True,
         "custom_sub_file": "",
         "font_name": "Arial",

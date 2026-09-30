@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+os.environ["CUDA_MODULE_LOADING"] = "LAZY"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+os.environ.pop("CT2_CUDA_ALLOCATOR", None)
 
 
 def hex_to_ass_color(hex_color: str, alpha: int = 0) -> str:
@@ -85,17 +92,15 @@ def parse_srt_to_raw_events(srt_text: str, speed: float = 1.0) -> List[Tuple[flo
 
 def generate_rolling_2line_events(
     raw_events: List[Tuple[float, float, str]],
-    max_hold_sec: float = 3.5
+    max_hold_sec: float = 3.0
 ) -> List[Tuple[str, str, str]]:
-    """Tạo event ASS cuộn 2 dòng: câu cũ được đẩy lên trên giữ thêm thời gian, câu mới xuất hiện ở dưới."""
+    """Tạo event ASS cuộn 2 dòng: câu cũ được đẩy lên trên, câu mới xuất hiện ở dưới theo đúng nhịp nói."""
     dialogues: List[Tuple[str, str, str]] = []
     n = len(raw_events)
     for i in range(n):
         s_i, e_i, t_i = raw_events[i]
-        next_s = raw_events[i + 1][0] if i + 1 < n else e_i + max_hold_sec
-        eff_end = min(next_s, max(e_i + 1.5, s_i + 2.0))
-        if next_s - s_i <= max_hold_sec:
-            eff_end = next_s
+        next_s = raw_events[i + 1][0] if i + 1 < n else e_i + 1.5
+        eff_end = min(next_s, max(e_i, s_i + 1.2))
 
         start_ass = seconds_to_ass_time(s_i)
         end_ass = seconds_to_ass_time(eff_end)
@@ -104,16 +109,21 @@ def generate_rolling_2line_events(
             dialogues.append((start_ass, end_ass, t_i))
         else:
             prev_t = raw_events[i - 1][2]
-            dialogues.append((start_ass, end_ass, f"{prev_t}\\N{t_i}"))
+            prev_s = raw_events[i - 1][0]
+            # Chỉ gộp dòng trước nếu khoảng cách ngắn (<= 3.0s)
+            if s_i - prev_s <= 3.0:
+                dialogues.append((start_ass, end_ass, f"{prev_t}\\N{t_i}"))
+            else:
+                dialogues.append((start_ass, end_ass, t_i))
     return dialogues
 
 
 def generate_cinema_hold_events(
     raw_events: List[Tuple[float, float, str]],
-    min_hold_sec: float = 2.5,
-    max_gap_bridge_sec: float = 1.0
+    min_hold_sec: float = 1.2,
+    max_gap_bridge_sec: float = 0.5
 ) -> List[Tuple[str, str, str]]:
-    """Tạo event ASS chuẩn điện ảnh: câu hoàn chỉnh, giữ tối thiểu 2.5s để kịp đọc."""
+    """Tạo event ASS chuẩn điện ảnh: hiển thị từng câu/cụm ngắn chuẩn xác theo nhịp phát âm."""
     dialogues: List[Tuple[str, str, str]] = []
     n = len(raw_events)
     for i in range(n):
@@ -203,8 +213,10 @@ def srt_to_ass(
 
     content = read_subtitle_file(srt_p)
     raw_events = parse_srt_to_raw_events(content, speed=speed)
+    if not raw_events:
+        raise RuntimeError(f"File phụ đề '{srt_p.name}' không chứa bất kỳ đoạn thoại nào hợp lệ.")
 
-    font_name = str(sub_cfg.get("font_family", "Arial") or "Arial")
+    font_name = str(sub_cfg.get("font_name") or sub_cfg.get("font_family") or "Arial")
     font_size = int(sub_cfg.get("font_size", 38) or 38)
     scaled_font_size = max(14, int(font_size * (height / 1080.0))) if height > 0 else font_size
 
@@ -390,9 +402,15 @@ def build_accurate_subtitles(
     return events
 
 
+def ensure_cuda_whisper_libraries() -> bool:
+    """Tự động kiểm tra và cấu hình các thư mục DLL CUDA cần thiết cho PyTorch Whisper trên GPU NVIDIA."""
+    _register_cuda_dll_directories()
+    return check_cuda_whisper_support()
+
+
 def _register_cuda_dll_directories() -> None:
     """Tự động tìm kiếm, nạp và preload các thư mục chứa DLL của CUDA/cuBLAS/cuDNN vào Windows process."""
-    import sys, os, ctypes
+    import sys, os
     if sys.platform != "win32":
         return
 
@@ -403,12 +421,9 @@ def _register_cuda_dll_directories() -> None:
         p_path = Path(p)
         candidates = [
             p_path / "nvidia" / "cublas" / "bin",
-            p_path / "nvidia" / "cublas" / "lib",
             p_path / "nvidia" / "cudnn" / "bin",
-            p_path / "nvidia" / "cudnn" / "lib",
             p_path / "nvidia" / "cuda_nvrtc" / "bin",
-            p_path / "nvidia" / "cuda_nvrtc" / "lib",
-            p_path / "ctranslate2",
+            p_path / "nvidia" / "cuda_runtime" / "bin",
             p_path / "torch" / "lib",
         ]
         for c in candidates:
@@ -421,50 +436,196 @@ def _register_cuda_dll_directories() -> None:
                 except Exception:
                     pass
 
-                # Preload các dll quan trọng nếu có trong thư mục
-                for dll_file in c.glob("*.dll"):
-                    try:
-                        ctypes.CDLL(str(dll_file))
-                    except Exception:
-                        pass
-
 
 def check_cuda_whisper_support() -> bool:
-    """Kiểm tra thực tế xem CUDA và các thư viện DLL cuBLAS / cuDNN có sẵn sàng chạy Whisper AI trên GPU không."""
+    """Kiểm tra thực tế xem CUDA GPU có sẵn sàng chạy PyTorch Whisper AI không."""
     try:
-        import ctranslate2
-        if ctranslate2.get_cuda_device_count() <= 0:
-            return False
+        import torch
+        return bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
     except Exception:
         return False
 
-    _register_cuda_dll_directories()
 
-    import ctypes
-    # Thử nạp cublas DLL trực tiếp
-    for dll_name in ("cublas64_12.dll", "cublasLt64_12.dll", "cublas64_11.dll", "cublasLt64_11.dll"):
+def preflight_whisper_model(model_name: str = "small", log_callback: Any = None) -> Tuple[bool, str]:
+    """Kiểm tra nhanh toàn diện model Whisper và GPU CUDA trước khi render trong Sandbox an toàn."""
+    def _safe_log(msg: str):
+        if log_callback:
+            try:
+                log_callback(msg)
+            except Exception:
+                try:
+                    # Fallback ASCII safe print
+                    log_callback(msg.encode("ascii", errors="replace").decode("ascii"))
+                except Exception:
+                    pass
+
+    try:
+        ensure_cuda_whisper_libraries()
+        has_cuda = check_cuda_whisper_support()
+        if not has_cuda:
+            msg = "CUDA GPU không khả dụng. Sẽ sử dụng CPU đa luồng để bóc tách phụ đề."
+            _safe_log(f"ℹ️ {msg}")
+            return True, msg
+
+        m_id = str(model_name or "small").strip()
+        _safe_log(f"🔍 [Preflight] Đang kiểm tra Whisper AI [{m_id}] trên GPU CUDA...")
+
+        import tempfile
+        import wave
+        import struct
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_wav = Path(tmp_dir) / "test_preflight.wav"
+            tmp_srt = Path(tmp_dir) / "test_preflight.srt"
+            with wave.open(str(tmp_wav), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(struct.pack("<16000h", *([0] * 16000)))
+
+            ok, err_msg, detected = _run_isolated_whisper(
+                audio_path=tmp_wav,
+                out_srt_path=tmp_srt,
+                model_size=m_id,
+                language="en",
+                device="cuda",
+                compute_type="int8_float16",
+                speed=1.0,
+                audio_duration=1.0,
+                cancel_event=None,
+                log_callback=_safe_log,
+                progress_callback=None,
+            )
+
+        if ok:
+            success_msg = f"GPU CUDA & Whisper AI [{m_id}] sẵn sàng 100%!"
+            _safe_log(f"✔ [Preflight] {success_msg}")
+            return True, success_msg
+        else:
+            err_msg_clean = f"Model [{m_id}] gặp sự cố trên GPU CUDA ({err_msg})."
+            _safe_log(f"⚠️ [Preflight] {err_msg_clean}")
+            return False, err_msg_clean
+    except Exception as ex:
+        err_msg = f"Model [{model_name}] gặp cảnh báo trên GPU: {ex}"
+        _safe_log(f"⚠️ [Preflight] {err_msg}")
+        return False, str(ex)
+
+
+
+def _safe_log(cb, msg: str):
+    """Gửi log an toàn, chống lỗi UnicodeEncodeError trên console Windows CP1252."""
+    if not cb or not msg:
+        return
+    try:
+        cb(str(msg))
+    except Exception:
         try:
-            ctypes.CDLL(dll_name)
-            return True
+            clean = str(msg).encode("ascii", errors="replace").decode("ascii")
+            cb(clean)
         except Exception:
+            pass
+
+
+def _run_isolated_whisper(
+    audio_path: Path,
+    out_srt_path: Path,
+    model_size: str,
+    language: str | None,
+    device: str,
+    compute_type: str,
+    speed: float,
+    audio_duration: float,
+    cancel_event: Any,
+    log_callback: Any,
+    progress_callback: Any,
+    cpu_threads: int = 0,
+) -> Tuple[bool, str, str]:
+    """Chạy Whisper AI trong Process Sandbox riêng biệt để cách ly tuyệt đối lỗi driver/C++ khỏi GUI."""
+    import json
+    import subprocess
+    import time
+
+    python_exe = sys.executable
+    if not python_exe or not Path(python_exe).exists():
+        python_exe = "python"
+
+    cmd = [
+        str(python_exe),
+        "-u",
+        "-m",
+        "src_app.core.subtitle_worker",
+        "--audio", str(audio_path),
+        "--output", str(out_srt_path),
+        "--model", str(model_size),
+        "--language", str(language or ""),
+        "--device", str(device),
+        "--compute-type", str(compute_type),
+        "--speed", str(speed),
+        "--duration", str(audio_duration),
+        "--cpu-threads", str(cpu_threads),
+    ]
+
+    creation_flags = 0
+    if sys.platform == "win32":
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=creation_flags,
+            cwd=str(Path(__file__).resolve().parents[2]),
+        )
+    except Exception as spawn_err:
+        return False, f"Không thể khởi động worker: {spawn_err}", "unknown"
+
+    detected_lang = language or "unknown"
+    error_msg = ""
+
+    while True:
+        if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise RenderCancelled("Đã dừng bởi người dùng")
+
+        line = proc.stdout.readline()
+        if not line and proc.poll() is not None:
+            break
+        if not line:
+            time.sleep(0.02)
             continue
 
-    # Thử tìm file DLL trong sys.path
-    import sys
-    for p in sys.path:
-        if not p or not os.path.exists(p):
-            continue
-        p_path = Path(p)
-        for cand in [p_path / "nvidia" / "cublas" / "bin", p_path / "torch" / "lib", p_path / "ctranslate2"]:
-            for dll_name in ("cublas64_12.dll", "cublasLt64_12.dll", "cublas64_11.dll"):
-                target = cand / dll_name
-                if target.exists():
-                    try:
-                        ctypes.CDLL(str(target))
-                        return True
-                    except Exception:
-                        pass
-    return False
+        clean_line = line.strip()
+        if clean_line.startswith("__AVR_MSG__"):
+            try:
+                payload = json.loads(clean_line[len("__AVR_MSG__"):])
+                msg_type = payload.get("type")
+                if msg_type == "log":
+                    _safe_log(log_callback, payload.get("text", ""))
+                elif msg_type == "progress" and progress_callback:
+                    progress_callback(int(payload.get("percent", 0)), str(payload.get("message", "")))
+                elif msg_type == "detected":
+                    detected_lang = payload.get("language", detected_lang)
+                elif msg_type == "error":
+                    error_msg = payload.get("text", "")
+                elif msg_type == "success":
+                    detected_lang = payload.get("language", detected_lang)
+            except Exception:
+                pass
+
+    ret_code = proc.poll()
+    if ret_code == 0 and out_srt_path.exists():
+        return True, "", detected_lang
+    else:
+        err = error_msg or f"Tiến trình kết thúc với mã {ret_code}"
+        return False, err, detected_lang
 
 
 def transcribe_audio_to_srt(
@@ -478,17 +639,13 @@ def transcribe_audio_to_srt(
     cancel_event: Any = None,
     audio_duration: float = 0.0,
 ) -> Tuple[Path, str]:
-    """Tự động nghe audio bằng Whisper AI, nhận diện ngôn ngữ và xuất file .srt chuẩn xác theo từng từ với cơ chế Safe Fallback 100%."""
+    """Tự động nghe audio bằng Whisper AI, nhận diện ngôn ngữ và xuất file .srt chuẩn xác theo từng từ với Process Sandbox 100% an toàn."""
     if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
         raise RenderCancelled("Đã dừng bởi người dùng")
 
-    _register_cuda_dll_directories()
     p_audio = Path(audio_path)
     p_out = Path(out_srt_path)
     p_out.parent.mkdir(parents=True, exist_ok=True)
-
-    import gc
-    from faster_whisper import WhisperModel
 
     model_size = str(model_size or "base").strip()
 
@@ -505,103 +662,65 @@ def transcribe_audio_to_srt(
     # Preflight Check CUDA cuBLAS thực tế
     has_cuda_runtime = check_cuda_whisper_support()
 
-    def _do_transcribe(device: str, compute_type: str) -> Tuple[List[Tuple[float, float, str]], str]:
-        if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
-            raise RenderCancelled("Đã dừng bởi người dùng")
-
-        if log_callback:
-            if device == "cuda":
-                log_callback(f"🚀 Đang khởi tạo Whisper AI [{model_size}] trên GPU (NVIDIA CUDA / {compute_type})...")
-            else:
-                cpu_threads = max(4, (os.cpu_count() or 4))
-                log_callback(f"💻 Đang xử lý Whisper AI model [{model_size}] trên CPU (Đa luồng {cpu_threads} cores / {compute_type})...")
-
-        cpu_threads = max(4, (os.cpu_count() or 4)) if device == "cpu" else 0
-        model = WhisperModel(
-            model_size,
-            device=device,
-            compute_type=compute_type,
-            cpu_threads=cpu_threads if device == "cpu" else 4,
-            num_workers=2,
-        )
-
-        lang_msg = f"ngôn ngữ chỉ định: [{target_lang.upper()}]" if target_lang else "chế độ tự động nhận diện ngôn ngữ"
-        if log_callback:
-            log_callback(f"Đang quét giọng nói trong {p_audio.name} ({lang_msg}) bằng {device.upper()}...")
-
-        segments, info = model.transcribe(
-            str(p_audio),
-            beam_size=5,
-            best_of=5,
-            language=target_lang,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=250),
-            word_timestamps=True,
-            condition_on_previous_text=False,
-        )
-
-        detected = target_lang or getattr(info, "language", "unknown") or "unknown"
-        prob = getattr(info, "language_probability", 1.0) * 100
-        if log_callback:
-            log_callback(f"✔ Nhận diện giọng nói: [{detected.upper()}] (độ tin cậy: {prob:.1f}%) — Đang xử lý bóc tách...")
-
-        try:
-            events_list = build_accurate_subtitles(
-                segments,
-                max_words_per_line=6,
-                max_duration_sec=2.8,
-                speed=speed,
-                cancel_event=cancel_event,
-                progress_callback=progress_callback,
-                total_duration_sec=audio_duration,
-            )
-        finally:
-            # Giải phóng model và bộ nhớ
-            del model
-            gc.collect()
-
-        return events_list, detected
-
-    events: List[Tuple[float, float, str]] = []
+    success = False
     detected_lang = target_lang or "unknown"
     used_device = "cpu"
-    cuda_success = False
 
-    # Giai đoạn 1: Chạy bằng GPU CUDA nếu Preflight Check đạt chuẩn
+    # Giai đoạn 1: Chạy trực tiếp trên GPU CUDA bằng chính xác model người dùng đã chọn
     if has_cuda_runtime:
         try:
-            events, detected_lang = _do_transcribe("cuda", "float16")
-            used_device = "cuda"
-            cuda_success = True
+            ok, err_msg, lang_res = _run_isolated_whisper(
+                audio_path=p_audio,
+                out_srt_path=p_out,
+                model_size=model_size,
+                language=target_lang,
+                device="cuda",
+                compute_type="fp16",
+                speed=speed,
+                audio_duration=audio_duration,
+                cancel_event=cancel_event,
+                log_callback=log_callback,
+                progress_callback=progress_callback,
+            )
+            if ok:
+                success = True
+                used_device = "GPU CUDA (PyTorch Native)"
+                detected_lang = lang_res
+            else:
+                _safe_log(log_callback, f"⚠️ GPU CUDA gặp sự cố khi chạy model [{model_size}] ({err_msg}) -> Thử chuyển sang CPU đa luồng cho chính model [{model_size}]...")
         except RenderCancelled:
             raise
         except Exception as cuda_ex:
-            if log_callback:
-                log_callback(f"⚠️ GPU CUDA float16 gặp sự cố ({cuda_ex}) -> Tự động chuyển sang CPU int8 đa luồng...")
-            events = []
-            cuda_success = False
-    else:
-        if log_callback:
-            log_callback("💡 GPU chưa đủ bộ thư viện CUDA cuBLAS -> Tự động xử lý Whisper AI bằng CPU đa luồng an toàn.")
+            _safe_log(log_callback, f"⚠️ GPU CUDA gặp ngoại lệ ({cuda_ex}) -> Thử chuyển sang CPU đa luồng cho model [{model_size}]...")
 
-    # Giai đoạn 2: Fallback sang CPU 100% an toàn nếu CUDA không khả dụng hoặc bị lỗi
-    if not cuda_success:
+    # Giai đoạn 2: Fallback sang CPU đa luồng nếu GPU hoàn toàn không khả dụng
+    if not success:
         if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
             raise RenderCancelled("Đã dừng bởi người dùng")
-        events, detected_lang = _do_transcribe("cpu", "int8")
-        used_device = "cpu"
+        cpu_threads_count = max(4, (os.cpu_count() or 4))
+        ok, err_msg, lang_cpu = _run_isolated_whisper(
+            audio_path=p_audio,
+            out_srt_path=p_out,
+            model_size=model_size,
+            language=target_lang,
+            device="cpu",
+            compute_type="int8",
+            speed=speed,
+            audio_duration=audio_duration,
+            cancel_event=cancel_event,
+            log_callback=log_callback,
+            progress_callback=progress_callback,
+            cpu_threads=cpu_threads_count,
+        )
+        if not ok:
+            raise RuntimeError(f"Lỗi Whisper AI khi tạo phụ đề: {err_msg}")
+        used_device = f"cpu ({cpu_threads_count} threads)"
+        detected_lang = lang_cpu
 
-    srt_lines: List[str] = []
-    for idx, (start_sec, end_sec, text) in enumerate(events, start=1):
-        if not text:
-            continue
-        start_str = format_timestamp_srt(start_sec)
-        end_str = format_timestamp_srt(end_sec)
-        srt_lines.append(f"{idx}\n{start_str} --> {end_str}\n{text}\n")
+    if not p_out.exists():
+        raise RuntimeError(f"Không thể tạo file phụ đề cho: '{p_audio.name}'.")
 
-    p_out.write_text("\n".join(srt_lines), encoding="utf-8")
-    if log_callback:
-        log_callback(f"✔ Đã tạo file phụ đề .srt chính xác ({used_device.upper()}): {p_out.name} (gồm {len(events)} cụm thoại)")
+    _safe_log(log_callback, f"✔ Đã tạo file phụ đề .srt chính xác ({used_device.upper()}): {p_out.name}")
 
     return p_out, detected_lang
 

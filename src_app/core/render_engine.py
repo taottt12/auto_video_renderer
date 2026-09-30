@@ -20,8 +20,13 @@ from .media_utils import choose_media_sequence, get_duration_seconds, is_image, 
 from .overlay_generator import get_overlay_file, ensure_default_overlays
 from .paths import TEMP_DIR, OUTPUT_DIR, DATA_DIR, APP_ROOT, ensure_dirs, find_binary
 from .process_utils import popen_hidden, run_hidden
-from .subtitle_utils import find_subtitle_file, srt_to_ass, transcribe_audio_to_srt
-
+from .subtitle_utils import (
+    ensure_cuda_whisper_libraries,
+    find_subtitle_file,
+    preflight_whisper_model,
+    srt_to_ass,
+    transcribe_audio_to_srt,
+)
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, str], None]
 
@@ -148,15 +153,14 @@ class RenderEngine:
                 sub_folder = sub_cfg.get("folder", "")
                 raw_sub = find_subtitle_file(original_audio_path, sub_folder)
 
-                # NẾU BẬT TỰ ĐỘNG QUÉT TẠO SUB (auto_transcribe) VÀ CHƯA CÓ FILE SUB:
-                auto_transcribe_on = bool(sub_cfg.get("auto_transcribe", False) or has_studio_sub)
-                if (not raw_sub or not raw_sub.exists()) and auto_transcribe_on:
+                # NẾU CHƯA CÓ FILE SUB: TỰ ĐỘNG CHẠY WHISPER AI ĐỂ BÓC TÁCH SUB
+                if not raw_sub or not raw_sub.exists():
                     self.progress(12, "Whisper AI nhận diện giọng nói & tạo sub")
                     model_size = str(sub_cfg.get("whisper_model", "base") or "base")
                     whisper_lang = str(sub_cfg.get("whisper_language", "auto") or "auto").strip()
                     lang_param = None if whisper_lang in ["auto", "", "None", "none"] else whisper_lang
                     lang_display = whisper_lang.upper() if lang_param else "TỰ ĐỘNG (AUTO)"
-                    self.log(f"⚡ Bật tự động tạo Sub: Đang dùng Whisper AI [{model_size}], ngôn ngữ [{lang_display}] quét audio {original_audio_path.name}...")
+                    self.log(f"⚡ Bật phụ đề: Đang dùng Whisper AI [{model_size}], ngôn ngữ [{lang_display}] quét audio {original_audio_path.name}...")
                     auto_srt_path = original_audio_path.with_suffix(".srt")
                     try:
                         raw_sub, detected_lang = transcribe_audio_to_srt(
@@ -168,48 +172,54 @@ class RenderEngine:
                             progress_callback=self.progress,
                             speed=audio_speed,
                             cancel_event=self.cancel_event,
-                            audio_duration=audio_duration,
+                            audio_duration=original_duration,
                         )
                     except RenderCancelled:
                         raise
                     except Exception as ex:
-                        self.log(f"⚠️ Lỗi khi tự động tạo phụ đề Whisper: {ex}")
-                        raw_sub = None
+                        self.log(f"❌ Lỗi Whisper AI khi tự động tạo phụ đề cho '{original_audio_path.name}': {ex}")
+                        raise RuntimeError(f"Lỗi Whisper AI khi tạo phụ đề: {ex}") from ex
 
-                if raw_sub and raw_sub.exists():
-                    self.log(f"✔ Tìm thấy file phụ đề: {raw_sub.name}")
-                    sub_ass_file = job_temp / "subtitles.ass"
-                    if raw_sub.suffix.lower() == ".ass":
-                        shutil.copy2(raw_sub, sub_ass_file)
-                    else:
-                        # Đồng bộ cấu hình từ Layer Subtitle trong Layout Studio nếu có
-                        for l in ls_layers:
-                            if isinstance(l, dict) and l.get("type") == "subtitle" and l.get("enabled", True):
-                                sub_cfg["box_x"] = float(l.get("box_x", 0.15))
-                                sub_cfg["box_y"] = float(l.get("box_y", 0.70))
-                                sub_cfg["box_w"] = float(l.get("box_w", 0.70))
-                                sub_cfg["box_h"] = float(l.get("box_h", 0.20))
-                                sub_cfg["font_family"] = l.get("font_name", sub_cfg.get("font_family", "Arial"))
-                                sub_cfg["font_size"] = int(l.get("font_size", sub_cfg.get("font_size", 38)))
-                                sub_cfg["font_color"] = l.get("font_color", sub_cfg.get("font_color", "#FFFFFF"))
-                                sub_cfg["highlight_color"] = l.get("highlight_color", sub_cfg.get("highlight_color", "#FFE600"))
-                                sub_cfg["outline_color"] = l.get("outline_color", sub_cfg.get("outline_color", "#000000"))
-                                sub_cfg["outline_width"] = float(l.get("outline_width", sub_cfg.get("outline_width", 2.5)))
-                                sub_cfg["bold"] = bool(l.get("bold", True))
-                                sub_cfg["italic"] = bool(l.get("italic", False))
-                                sub_cfg["align"] = str(l.get("align", sub_cfg.get("align", "center"))).lower()
-                                sub_cfg["sub_mode"] = str(l.get("sub_mode", sub_cfg.get("sub_mode", "rolling_2line"))).lower()
-                                break
-                        sub_cfg["audio_speed"] = audio_speed
-                        sub_mode_display = {
-                            "rolling_2line": "Cuộn 2 dòng (Rolling 2-Line)",
-                            "cinema_hold": "Chuẩn điện ảnh (Cinema Hold)",
-                            "karaoke_highlight": "Karaoke Highlight từng từ"
-                        }.get(sub_cfg.get("sub_mode", "rolling_2line"), sub_cfg.get("sub_mode", "rolling_2line"))
-                        srt_to_ass(raw_sub, sub_ass_file, width, height, sub_cfg)
-                    self.log(f"✔ Đã biên dịch ASS subtitle (Kiểu: {sub_mode_display}, Căn lề: {sub_cfg.get('align', 'center')}) sẵn sàng gắn vào video")
+                if not raw_sub or not raw_sub.exists():
+                    raise RuntimeError(
+                        f"Đã bật phụ đề nhưng không tìm thấy file phụ đề (.srt/.ass) và Whisper AI không thể tạo sub cho: '{original_audio_path.name}'."
+                    )
+
+                self.log(f"✔ Sử dụng file phụ đề: {raw_sub.name}")
+                sub_ass_file = job_temp / "subtitles.ass"
+                if raw_sub.suffix.lower() == ".ass":
+                    shutil.copy2(raw_sub, sub_ass_file)
                 else:
-                    self.log(f"Bỏ qua phụ đề vì không có file sub cho: {original_audio_path.name}")
+                    # Đồng bộ cấu hình từ Layer Subtitle trong Layout Studio nếu có
+                    for l in ls_layers:
+                        if isinstance(l, dict) and l.get("type") == "subtitle" and l.get("enabled", True):
+                            sub_cfg["box_x"] = float(l.get("box_x", 0.15))
+                            sub_cfg["box_y"] = float(l.get("box_y", 0.70))
+                            sub_cfg["box_w"] = float(l.get("box_w", 0.70))
+                            sub_cfg["box_h"] = float(l.get("box_h", 0.20))
+                            sub_cfg["font_family"] = l.get("font_name", sub_cfg.get("font_family", "Arial"))
+                            sub_cfg["font_size"] = int(l.get("font_size", sub_cfg.get("font_size", 38)))
+                            sub_cfg["font_color"] = l.get("font_color", sub_cfg.get("font_color", "#FFFFFF"))
+                            sub_cfg["highlight_color"] = l.get("highlight_color", sub_cfg.get("highlight_color", "#FFE600"))
+                            sub_cfg["outline_color"] = l.get("outline_color", sub_cfg.get("outline_color", "#000000"))
+                            sub_cfg["outline_width"] = float(l.get("outline_width", sub_cfg.get("outline_width", 2.5)))
+                            sub_cfg["bold"] = bool(l.get("bold", True))
+                            sub_cfg["italic"] = bool(l.get("italic", False))
+                            sub_cfg["align"] = str(l.get("align", sub_cfg.get("align", "center"))).lower()
+                            sub_cfg["sub_mode"] = str(l.get("sub_mode", sub_cfg.get("sub_mode", "rolling_2line"))).lower()
+                            break
+                    sub_cfg["audio_speed"] = audio_speed
+                    sub_mode_display = {
+                        "rolling_2line": "Cuộn 2 dòng (Rolling 2-Line)",
+                        "cinema_hold": "Chuẩn điện ảnh (Cinema Hold)",
+                        "karaoke_highlight": "Karaoke Highlight từng từ"
+                    }.get(sub_cfg.get("sub_mode", "rolling_2line"), sub_cfg.get("sub_mode", "rolling_2line"))
+                    srt_to_ass(raw_sub, sub_ass_file, width, height, sub_cfg)
+
+                if not sub_ass_file.exists() or sub_ass_file.stat().st_size == 0:
+                    raise RuntimeError(f"Không thể biên dịch file phụ đề ASS cho: {original_audio_path.name}")
+
+                self.log(f"✔ Đã biên dịch ASS subtitle (Kiểu: {sub_mode_display}, Căn lề: {sub_cfg.get('align', 'center')}) sẵn sàng gắn vào video")
 
             transition_mode = str(self.settings.get("transition_mode", "fade") or "none")
             can_single_pass = (
@@ -1843,12 +1853,26 @@ class RenderEngine:
                         for tag in ["{title}", "{filename}", "{name}", "{audio_name}", "{ten_audio}", "{ten_video}", "{tieu_de}"]:
                             content = content.replace(tag, audio_title).replace(tag.upper(), audio_title)
 
+                    content = self._clean_title_text(content)
                     if not content:
                         continue
+
                     font_size = int(layer.get("font_size", 36) or 36)
                     font_name = str(layer.get("font_name", "Arial") or "Arial")
                     font_bold = bool(layer.get("bold", True))
                     font_italic = bool(layer.get("italic", False))
+
+                    font_file = self._find_font_file_by_name(font_name, font_bold, font_italic)
+
+                    # Tự động ngắt dòng và co kích thước chữ vừa vặn hoàn hảo trong ô
+                    wrapped_content, fitted_font_size = self._wrap_text_for_box(
+                        text=content,
+                        font_file=font_file,
+                        font_size=font_size,
+                        max_w=pw,
+                        max_h=ph,
+                        line_spacing=8,
+                    )
 
                     font_color_raw = str(layer.get("font_color", "#FFFFFF")).strip()
                     font_color = self._normalize_ffmpeg_color(font_color_raw)
@@ -1870,8 +1894,8 @@ class RenderEngine:
                         pos_expr = f"x={px}:y={py}+({ph}-text_h)/2"
 
                     dt_parts = [
-                        f"text='{self._escape_drawtext(content)}'",
-                        f"fontsize={font_size}",
+                        f"text='{self._escape_drawtext(wrapped_content)}'",
+                        f"fontsize={fitted_font_size}",
                         f"fontcolor={font_color}",
                         pos_expr,
                         f"line_spacing=8",
@@ -1883,7 +1907,6 @@ class RenderEngine:
                     else:
                         dt_parts.append("borderw=0")
 
-                    font_file = self._find_font_file_by_name(font_name, font_bold, font_italic)
                     if font_file:
                         dt_parts.append(f"fontfile='{self._escape_drawtext(font_file.as_posix())}'")
 
@@ -2287,7 +2310,6 @@ class RenderEngine:
             .replace('"', '”')
             .replace("`", "‘")
             .replace("\\", "\\\\")
-            .replace("\n", "\\n")
             .replace(":", "\\:")
             .replace("%", "\\%")
         )
@@ -2330,3 +2352,106 @@ class RenderEngine:
             if path.exists():
                 return path
         return None
+
+    @staticmethod
+    def _clean_title_text(text: str) -> str:
+        """Làm sạch các ký tự unicode đặc biệt / ô vuông lỗi thường gặp trong tiêu đề YouTube."""
+        if not text:
+            return ""
+        s = (
+            str(text)
+            .replace("\uff5c", "|")  # ｜
+            .replace("\uff1a", ":")  # ：
+            .replace("\uff0f", "/")  # ／
+            .replace("\u25a1", "")   # ▯
+            .replace("\ufffd", "")   # replacement char
+            .replace("\u200b", "")   # zero-width space
+            .replace("\ufeff", "")   # BOM
+        )
+        return s.strip()
+
+    @classmethod
+    def _wrap_text_for_box(
+        cls,
+        text: str,
+        font_file: Path | None,
+        font_size: int,
+        max_w: int,
+        max_h: int,
+        line_spacing: int = 8,
+        min_font_size: int = 18
+    ) -> tuple[str, int]:
+        """
+        Tự động ngắt dòng thông minh (word-wrap) theo chiều rộng bounding box của layer
+        và tự động co nhỏ font_size nếu chiều cao các dòng vượt quá bounding box.
+        """
+        import textwrap
+        from PIL import ImageFont, ImageDraw, Image
+
+        clean_text = cls._clean_title_text(text)
+        if not clean_text:
+            return "", font_size
+
+        avail_w = max(40, int(max_w * 0.94))
+        avail_h = max(24, int(max_h * 0.92))
+
+        cur_font_size = int(font_size)
+        dummy_img = Image.new("RGB", (1, 1))
+        draw = ImageDraw.Draw(dummy_img)
+
+        best_lines = [clean_text]
+        best_size = cur_font_size
+
+        while cur_font_size >= min_font_size:
+            font = None
+            try:
+                if font_file and font_file.exists():
+                    font = ImageFont.truetype(str(font_file), cur_font_size)
+                else:
+                    font = ImageFont.load_default()
+            except Exception:
+                font = None
+
+            def get_w(s: str) -> int:
+                if font and hasattr(draw, "textbbox"):
+                    bbox = draw.textbbox((0, 0), s, font=font)
+                    return bbox[2] - bbox[0]
+                elif font and hasattr(font, "getlength"):
+                    return int(font.getlength(s))
+                else:
+                    return int(len(s) * cur_font_size * 0.55)
+
+            def get_h(s: str) -> int:
+                if font and hasattr(draw, "textbbox"):
+                    bbox = draw.textbbox((0, 0), s, font=font)
+                    return bbox[3] - bbox[1]
+                return cur_font_size
+
+            avg_char_w = max(1, get_w("M") or int(cur_font_size * 0.55))
+            chars_per_line = max(8, avail_w // avg_char_w)
+
+            lines = []
+            for paragraph in clean_text.splitlines():
+                if not paragraph.strip():
+                    continue
+                wrapped = textwrap.wrap(paragraph, width=chars_per_line, break_long_words=True)
+                lines.extend(wrapped)
+
+            all_fit_w = all(get_w(l) <= avail_w for l in lines)
+            if not all_fit_w and chars_per_line > 8:
+                lines = []
+                for paragraph in clean_text.splitlines():
+                    wrapped = textwrap.wrap(paragraph, width=max(8, chars_per_line - 4), break_long_words=True)
+                    lines.extend(wrapped)
+
+            total_h = sum(get_h(l) for l in lines) + (len(lines) - 1) * line_spacing
+            max_line_w = max((get_w(l) for l in lines), default=0)
+
+            if total_h <= avail_h and max_line_w <= avail_w:
+                return "\n".join(lines), cur_font_size
+
+            best_lines = lines
+            best_size = cur_font_size
+            cur_font_size -= 4
+
+        return "\n".join(best_lines), best_size

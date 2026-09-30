@@ -41,15 +41,16 @@ def check_cuda_support() -> Dict[str, Any]:
     cuda_ok = False
     details = ""
     try:
-        import ctranslate2
-        cuda_devices = ctranslate2.get_cuda_device_count()
-        if cuda_devices > 0:
+        import torch
+        if torch.cuda.is_available():
+            cuda_devices = torch.cuda.device_count()
+            dev_name = torch.cuda.get_device_name(0)
             cuda_ok = True
-            details = f"Sẵn sàng {cuda_devices} thiết bị CUDA (CTranslate2)"
+            details = f"Sẵn sàng {cuda_devices} thiết bị CUDA ({dev_name}, PyTorch CUDA)"
         else:
-            details = "Không phát hiện thiết bị CUDA khả dụng"
+            details = "Không phát hiện thiết bị CUDA khả dụng trong PyTorch"
     except Exception as e:
-        details = f"Không nạp được thư viện CTranslate2: {e}"
+        details = f"Không nạp được thư viện PyTorch CUDA: {e}"
 
     return {
         "cuda_ok": cuda_ok,

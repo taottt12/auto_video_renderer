@@ -19,6 +19,7 @@ tools/*.exe
 temp/
 output/
 scratch/
+scratch_test_download/
 projects/*.json
 projects/*.avr.json
 logs/
@@ -26,6 +27,7 @@ logs/
 *.tmp
 *.mp4
 *.mp3
+*.zip
 !src_app/assets/overlays/*.mp4
 !assets/overlays/*.mp4
 
