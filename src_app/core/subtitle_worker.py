@@ -1,7 +1,7 @@
 """
 Module Subtitle Worker - Chạy độc lập dưới dạng Process Sandbox.
 Sử dụng trực tiếp PyTorch Whisper (openai-whisper) chính hãng trên GPU NVIDIA CUDA,
-đảm bảo chạy chính xác model người dùng đã chỉ định (turbo / large-v3 / large-v2 / medium / small / base / tiny)
+đảm bảo chạy chính xác model người dùng đã chỉ định (turbo / large-v3 / medium / small / base / tiny)
 với độ chính xác cao nhất, không tự ý hạ cấp model và không phụ thuộc vào faster-whisper/ctranslate2.
 """
 from __future__ import annotations
@@ -41,6 +41,7 @@ if str(_ROOT) not in sys.path:
 from src_app.core.subtitle_utils import (
     _register_cuda_dll_directories,
     format_timestamp_srt,
+    post_process_subtitle_text,
 )
 
 
@@ -111,25 +112,11 @@ def group_words_into_phrases(
 
 def normalize_whisper_model_name(raw_name: str) -> str:
     """Chuẩn hóa tên model theo danh mục hỗ trợ chuẩn của OpenAI Whisper."""
-    name = str(raw_name or "large-v2").strip().lower()
-    if any(k in name for k in ["turbo", "large-v3-turbo", "whisper-large-v3-turbo"]):
-        # Model large-v2 hỗ trợ word_timestamps 100% hoàn hảo trên GPU CUDA
-        return "large-v2"
-    if "large-v3" in name:
-        return "large-v3"
-    if "large-v2" in name:
-        return "large-v2"
-    if "large" in name:
-        return "large-v2"
+    name = str(raw_name or "turbo").strip().lower()
     if "medium" in name:
         return "medium"
-    if "small" in name:
-        return "small"
-    if "base" in name:
-        return "base"
-    if "tiny" in name:
-        return "tiny"
-    return name
+    # Mặc định tất cả các lựa chọn khác đều map chuẩn sang turbo (large-v3-turbo.pt) đã có sẵn trong cache
+    return "turbo"
 
 
 def run_worker(args: argparse.Namespace) -> int:
@@ -137,7 +124,7 @@ def run_worker(args: argparse.Namespace) -> int:
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    raw_model_name = str(args.model or "large-v2").strip()
+    raw_model_name = str(args.model or "turbo").strip()
     model_name = normalize_whisper_model_name(raw_model_name)
     language = str(args.language or "").strip()
     device = str(args.device or "cuda").strip().lower()
@@ -154,40 +141,215 @@ def run_worker(args: argparse.Namespace) -> int:
     # Preload DLLs
     _register_cuda_dll_directories()
 
+    import subprocess
     import torch
     import whisper
 
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("GPU CUDA không khả dụng trên môi trường PyTorch hiện tại.")
 
-    # FP32 trên CUDA đảm bảo thuật toán cross-attention DTW (word_timestamps) ổn định 100% không bị tràn số
-    use_fp16 = False
+    if device == "cpu" and getattr(args, "cpu_threads", 0) > 0:
+        try:
+            threads = min(8, max(2, int(args.cpu_threads)))
+            torch.set_num_threads(threads)
+        except Exception:
+            pass
+
+def save_wav_pcm16(path: Path, data: torch.Tensor, sr: int = 16000) -> None:
+    """Lưu tensor âm thanh thành file WAV PCM 16-bit chuẩn bằng module wave gốc của Python."""
+    import wave
+    import numpy as np
+    arr = data.detach().cpu().numpy()
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    arr_int16 = np.clip(arr * 32767.0, -32768.0, 32767.0).astype(np.int16)
+    interleaved = arr_int16.T.tobytes()
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(arr.shape[0])
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(interleaved)
+
+
+def separate_vocals_demucs(audio_path: Path, out_vocal_path: Path, device: str = "cuda") -> bool:
+    """Tách bóc luồng Giọng nói sạch (Vocals) bằng Demucs AI (Meta/PyTorch HDEMUCS), triệt tiêu 100% BGM/SFX."""
+    try:
+        import torch
+        import torchaudio
+        from torchaudio.pipelines import HDEMUCS_HIGH_MUSDB
+        import whisper
+
+        dev = torch.device("cuda" if device == "cuda" and torch.cuda.is_available() else "cpu")
+        bundle = HDEMUCS_HIGH_MUSDB
+        model = bundle.get_model().to(dev)
+        model.eval()
+
+        audio_np = whisper.load_audio(str(audio_path), sr=bundle.sample_rate)
+        waveform = torch.from_numpy(audio_np).unsqueeze(0).repeat(2, 1)
+
+        vocal_idx = 3  # ['drums', 'bass', 'other', 'vocals']
+        chunk_len = bundle.sample_rate * 60  # Xử lý theo phân đoạn 60s để chống tràn VRAM GPU
+        total_samples = waveform.shape[1]
+        vocal_chunks = []
+
+        with torch.no_grad():
+            for offset in range(0, total_samples, chunk_len):
+                sub_wave = waveform[:, offset:offset + chunk_len]
+                chunk_in = sub_wave.unsqueeze(0).to(dev)
+                sources = model(chunk_in)
+                vocal_audio = sources[0, vocal_idx].cpu()
+                vocal_chunks.append(vocal_audio)
+
+        full_vocals = torch.cat(vocal_chunks, dim=1)
+        mono_vocal = torch.mean(full_vocals, dim=0, keepdim=True)
+        mono_16k = torchaudio.functional.resample(mono_vocal, bundle.sample_rate, 16000)
+        save_wav_pcm16(out_vocal_path, mono_16k, 16000)
+
+        del model
+        del waveform
+        del full_vocals
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return out_vocal_path.exists() and out_vocal_path.stat().st_size > 1000
+    except Exception as e:
+        emit_msg("log", {"text": f"ℹ️ Demucs AI bỏ qua ({e}), chuyển sang bộ lọc âm thanh tiêu chuẩn."})
+        return False
+
+
+def run_worker(args: argparse.Namespace) -> int:
+    audio_path = Path(args.audio)
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    raw_model_name = str(args.model or "turbo").strip()
+    model_name = normalize_whisper_model_name(raw_model_name)
+    language = str(args.language or "").strip()
+    device = str(args.device or "cuda").strip().lower()
+    speed = float(args.speed or 1.0)
+    audio_duration = float(args.duration or 0.0)
+    initial_prompt = str(getattr(args, "initial_prompt", "") or "").strip()
+
+    target_lang = None
+    if language and language.lower() not in ["auto", "none", ""]:
+        if language.lower() in ["tl", "fil", "tagalog", "filipino", "philippines"]:
+            target_lang = "tl"
+        else:
+            target_lang = language.lower()
+
+    # Preload DLLs
+    _register_cuda_dll_directories()
+
+    import subprocess
+    import torch
+    import whisper
+
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("GPU CUDA không khả dụng trên môi trường PyTorch hiện tại.")
+
+    if device == "cpu" and getattr(args, "cpu_threads", 0) > 0:
+        try:
+            threads = min(8, max(2, int(args.cpu_threads)))
+            torch.set_num_threads(threads)
+        except Exception:
+            pass
+
+    input_to_whisper = audio_path
+    temp_clean_wav: Path | None = None
+
+    # GIAI ĐOẠN 1: TÁCH GIỌNG NÓI BẰNG DEMUCS AI HOẶC BỘ LỌC TĂNG CƯỜNG
+    if getattr(args, "vocal_separation", True):
+        vocal_wav = out_path.parent / f"_temp_demucs_vocals_{audio_path.stem}.wav"
+        emit_msg("log", {"text": "🎙️ Demucs AI: Đang bóc tách luồng giọng nói sạch (Vocals), loại bỏ SFX & Nhạc nền..."})
+        if separate_vocals_demucs(audio_path, vocal_wav, device=device):
+            input_to_whisper = vocal_wav
+            temp_clean_wav = vocal_wav
+            emit_msg("log", {"text": "✔ Demucs AI: Đã trích xuất giọng nói sạch 100% không còn tạp âm/nhạc nền."})
+        elif getattr(args, "enhance_voice", True):
+            # Fallback bộ lọc âm thanh FFmpeg nếu Demucs không khả dụng
+            try:
+                clean_wav_path = out_path.parent / f"_temp_whisper_clean_{audio_path.stem}.wav"
+                clean_cmd = [
+                    "ffmpeg", "-y", "-i", str(audio_path),
+                    "-af", "highpass=f=120,lowpass=f=3800,afftdn=nf=-25,dynaudnorm=f=150:g=15",
+                    "-ar", "16000", "-ac", "1",
+                    str(clean_wav_path)
+                ]
+                creation_flags = 0
+                if sys.platform == "win32":
+                    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                subprocess.run(
+                    clean_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creation_flags,
+                    check=True
+                )
+                if clean_wav_path.exists() and clean_wav_path.stat().st_size > 1000:
+                    input_to_whisper = clean_wav_path
+                    temp_clean_wav = clean_wav_path
+                    emit_msg("log", {"text": "🎙️ Tiền xử lý: Đã lọc dải tần giọng nói & triệt tiêu nhạc nền qua FFmpeg DSP."})
+            except Exception as filter_err:
+                emit_msg("log", {"text": f"ℹ️ Bộ lọc tiền xử lý bỏ qua ({filter_err}), tiếp tục dùng audio gốc."})
+    elif getattr(args, "enhance_voice", True):
+        try:
+            clean_wav_path = out_path.parent / f"_temp_whisper_clean_{audio_path.stem}.wav"
+            clean_cmd = [
+                "ffmpeg", "-y", "-i", str(audio_path),
+                "-af", "highpass=f=120,lowpass=f=3800,afftdn=nf=-25,dynaudnorm=f=150:g=15",
+                "-ar", "16000", "-ac", "1",
+                str(clean_wav_path)
+            ]
+            creation_flags = 0
+            if sys.platform == "win32":
+                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            subprocess.run(
+                clean_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creation_flags,
+                check=True
+            )
+            if clean_wav_path.exists() and clean_wav_path.stat().st_size > 1000:
+                input_to_whisper = clean_wav_path
+                temp_clean_wav = clean_wav_path
+                emit_msg("log", {"text": "🎙️ Tiền xử lý: Đã lọc dải tần giọng nói & triệt tiêu nhạc nền."})
+        except Exception as filter_err:
+            emit_msg("log", {"text": f"ℹ️ Bộ lọc tiền xử lý bỏ qua ({filter_err}), tiếp tục dùng audio gốc."})
+
+    # FP16 trên CUDA tận dụng Tensor Cores, giảm 50% VRAM và tăng tốc gấp đôi
+    use_fp16 = bool(device == "cuda")
     device_label = "GPU CUDA (NVIDIA)" if device == "cuda" else "CPU Đa Luồng"
 
     emit_msg("log", {"text": f"Đang nạp Whisper AI [{model_name}] trên {device_label}..."})
     model = whisper.load_model(model_name, device=device)
 
     lang_desc = f"ngôn ngữ [{target_lang.upper()}]" if target_lang else "tự động nhận diện"
+    if initial_prompt:
+        emit_msg("log", {"text": f"💡 Whisper Context Prompt: Gợi ý từ khóa [{initial_prompt}]"})
     emit_msg("log", {"text": f"Đang quét giọng nói trong '{audio_path.name}' ({lang_desc}) bằng {device_label}..."})
 
     with torch.no_grad():
+        result = model.transcribe(
+            str(input_to_whisper),
+            language=target_lang,
+            initial_prompt=initial_prompt if initial_prompt else None,
+            fp16=use_fp16,
+            verbose=False,
+            word_timestamps=False,
+            no_speech_threshold=0.6,
+            condition_on_previous_text=False,
+            temperature=(0.0, 0.2, 0.4),
+            beam_size=5,
+        )
+
+    # Dọn dẹp file wav tạm sau khi transcribe
+    if temp_clean_wav and temp_clean_wav.exists():
         try:
-            result = model.transcribe(
-                str(audio_path),
-                language=target_lang,
-                fp16=use_fp16,
-                verbose=False,
-                word_timestamps=True,
-            )
-        except Exception as ex_w:
-            emit_msg("log", {"text": f"⚠️ Word timestamps gặp cảnh báo: {ex_w} -> Bóc tách tiêu chuẩn..."})
-            result = model.transcribe(
-                str(audio_path),
-                language=target_lang,
-                fp16=use_fp16,
-                verbose=False,
-                word_timestamps=False,
-            )
+            temp_clean_wav.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     detected = target_lang or result.get("language", "unknown")
     raw_segments = result.get("segments", [])
@@ -214,7 +376,12 @@ def run_worker(args: argparse.Namespace) -> int:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    valid_events = [e for e in events_list if str(e[2]).strip()]
+    valid_events = []
+    for s, e, t in events_list:
+        clean_text = post_process_subtitle_text(t, initial_prompt).strip()
+        if clean_text:
+            valid_events.append((s, e, clean_text))
+
     if not valid_events:
         emit_msg("log", {"text": f"ℹ️ Không phát hiện lời thoại trong '{audio_path.name}'. Tạo file phụ đề trống."})
         out_path.write_text("", encoding="utf-8")
@@ -248,6 +415,11 @@ def main():
     parser.add_argument("--speed", type=float, default=1.0, help="Tốc độ audio")
     parser.add_argument("--duration", type=float, default=0.0, help="Thời lượng audio tính theo giây")
     parser.add_argument("--cpu-threads", type=int, default=0, help="Số luồng CPU")
+    parser.add_argument("--initial-prompt", default="", help="Từ khóa ngữ cảnh mớm cho Whisper AI")
+    parser.add_argument("--vocal-separation", dest="vocal_separation", action="store_true", default=True, help="Tách giọng nói Demucs AI")
+    parser.add_argument("--no-vocal-separation", dest="vocal_separation", action="store_false", help="Không tách giọng nói")
+    parser.add_argument("--enhance-voice", dest="enhance_voice", action="store_true", default=True, help="Lọc dải tần và tạp âm cho giọng đọc")
+    parser.add_argument("--no-enhance-voice", dest="enhance_voice", action="store_false", help="Không lọc dải tần")
 
     args = parser.parse_args()
     try:

@@ -134,11 +134,11 @@ class LayoutCanvasWidget(QWidget):
         cr = self._canvas_rect
         if cr.width() <= 0 or cr.height() <= 0:
             return 0.0, 0.0, 0.2, 0.2
-        bx = max(0.0, min(0.95, (rx - cr.x()) / cr.width()))
-        by = max(0.0, min(0.95, (ry - cr.y()) / cr.height()))
-        bw = max(0.02, min(1.0 - bx, rw / cr.width()))
-        bh = max(0.02, min(1.0 - by, rh / cr.height()))
-        return bx, by, bw, bh
+        bx = max(-1.0, min(1.5, (rx - cr.x()) / cr.width()))
+        by = max(-1.0, min(1.5, (ry - cr.y()) / cr.height()))
+        bw = max(0.01, min(2.0, rw / cr.width()))
+        bh = max(0.01, min(2.0, rh / cr.height()))
+        return round(bx, 4), round(by, 4), round(bw, 4), round(bh, 4)
 
     def _get_handles(self, rect: QRect) -> Dict[str, QRect]:
         hs = self.HANDLE_SIZE
@@ -183,7 +183,9 @@ class LayoutCanvasWidget(QWidget):
         painter.setPen(QPen(QColor("#4f526b"), 2))
         painter.drawRect(cr)
 
-        # 2. Vẽ các Layer theo đúng thứ tự Z-Index (từ dưới lên trên)
+        # 2. Vẽ các Layer theo đúng thứ tự Z-Index (Cắt gọt mép canvas chuẩn xác như video xuất ra)
+        painter.save()
+        painter.setClipRect(cr)
         for idx, layer in enumerate(self.layers):
             if not layer.get("enabled", True):
                 continue
@@ -197,6 +199,17 @@ class LayoutCanvasWidget(QWidget):
             l_type = str(layer.get("type", "image")).lower()
             opacity = float(layer.get("opacity", 1.0) if layer.get("opacity") is not None else 1.0)
             opacity = max(0.0, min(1.0, opacity))
+
+            # Mô phỏng hiệu ứng chuyển động trực quan (Motion / Floating)
+            motion_mode = str(layer.get("motion_effect", "none")).lower()
+            if motion_mode == "float":
+                y_float = int(round(5.0 * math.sin(self._anim_t * 2.5)))
+                l_rect = QRect(l_rect.x(), l_rect.y() + y_float, l_rect.width(), l_rect.height())
+            elif motion_mode == "pulse":
+                pulse_s = 1.0 + 0.02 * math.sin(self._anim_t * 3.0)
+                pw_p = int(l_rect.width() * pulse_s)
+                ph_p = int(l_rect.height() * pulse_s)
+                l_rect = QRect(l_rect.center().x() - pw_p // 2, l_rect.center().y() - ph_p // 2, pw_p, ph_p)
 
             painter.save()
             painter.setOpacity(opacity)
@@ -284,16 +297,18 @@ class LayoutCanvasWidget(QWidget):
                 box_radius = int(layer.get("box_radius", 8) or 8)
 
                 # 1. Vẽ nền Box nếu có
+                box_radius_scaled = max(1, int(round(box_radius * (cr.height() / 1080.0))))
                 if bg_box_enabled:
                     bg_color = QColor(bg_color_str) if (bg_color_str.startswith("#") or bg_color_str.isalpha()) else QColor("#000000")
                     bg_color.setAlphaF(max(0.0, min(1.0, bg_opacity)))
                     painter.setBrush(QBrush(bg_color))
                     painter.setPen(Qt.NoPen)
-                    painter.drawRoundedRect(l_rect, box_radius, box_radius)
+                    painter.drawRoundedRect(l_rect, box_radius_scaled, box_radius_scaled)
 
-                # 2. Chuẩn bị Font & Căn lề
-                scaled_font_size = max(8, int(font_size * (cr.height() / 1080.0)))
-                font = QFont(font_name, scaled_font_size)
+                # 2. Chuẩn bị Font theo chuẩn Pixel (Khắc phục 100% lệch do DPI Windows Scale)
+                scaled_font_px = max(6, int(round(font_size * (cr.height() / 1080.0))))
+                font = QFont(font_name)
+                font.setPixelSize(scaled_font_px)
                 font.setBold(font_bold)
                 font.setItalic(font_italic)
                 painter.setFont(font)
@@ -304,7 +319,7 @@ class LayoutCanvasWidget(QWidget):
                 elif font_align == "right":
                     qt_align = Qt.AlignRight | Qt.AlignVCenter
                 flags = qt_align | Qt.TextWordWrap
-                text_rect = l_rect.adjusted(6, 4, -6, -4)
+                text_rect = l_rect.adjusted(4, 2, -4, -2)
 
                 # 3. Vẽ Viền chữ (Outline) nếu bật (khác 'none' và width > 0)
                 has_outline = (outline_color_str.lower() not in {"none", "transparent", ""}) and outline_width > 0
@@ -350,21 +365,23 @@ class LayoutCanvasWidget(QWidget):
                 bg_box_enabled = bool(layer.get("bg_box_enabled", False)) and (bg_color_str.lower() not in {"none", "transparent", ""})
                 bg_opacity = float(layer.get("bg_box_opacity", 0.5) if layer.get("bg_box_opacity") is not None else 0.5)
                 box_radius = int(layer.get("box_radius", 6) or 6)
+                box_radius_scaled = max(1, int(round(box_radius * (cr.height() / 1080.0))))
 
                 # Viền nét đứt báo hiệu vùng Subtitle
                 painter.setPen(QPen(QColor(255, 204, 0, 150), 1, Qt.DashLine))
                 painter.setBrush(QBrush(QColor(0, 0, 0, 70)) if not bg_box_enabled else Qt.NoBrush)
-                painter.drawRoundedRect(l_rect, box_radius, box_radius)
+                painter.drawRoundedRect(l_rect, box_radius_scaled, box_radius_scaled)
 
                 if bg_box_enabled:
                     bg_color = QColor(bg_color_str) if (bg_color_str.startswith("#") or bg_color_str.isalpha()) else QColor("#000000")
                     bg_color.setAlphaF(max(0.0, min(1.0, bg_opacity)))
                     painter.setBrush(QBrush(bg_color))
                     painter.setPen(Qt.NoPen)
-                    painter.drawRoundedRect(l_rect, box_radius, box_radius)
+                    painter.drawRoundedRect(l_rect, box_radius_scaled, box_radius_scaled)
 
-                scaled_font_size = max(9, int(font_size * (cr.height() / 1080.0)))
-                font = QFont(font_name, scaled_font_size)
+                scaled_font_px = max(8, int(round(font_size * (cr.height() / 1080.0))))
+                font = QFont(font_name)
+                font.setPixelSize(scaled_font_px)
                 font.setBold(font_bold)
                 font.setItalic(font_italic)
                 painter.setFont(font)
@@ -378,7 +395,7 @@ class LayoutCanvasWidget(QWidget):
                 else:
                     qt_align = Qt.AlignHCenter | Qt.AlignVCenter
                 flags = qt_align | Qt.TextWordWrap
-                text_rect = l_rect.adjusted(6, 4, -6, -4)
+                text_rect = l_rect.adjusted(4, 2, -4, -2)
 
                 has_outline = (outline_color_str.lower() not in {"none", "transparent", ""}) and outline_width > 0
                 if has_outline:
@@ -414,7 +431,9 @@ class LayoutCanvasWidget(QWidget):
 
             painter.restore()
 
-        # 3. Vẽ Khung Bounding Box cho Layer đang được chọn
+        painter.restore()  # Kết thúc clipRect cho layers
+
+        # 3. Vẽ Khung Bounding Box cho Layer đang được chọn (Vẽ ngoài clip để luôn nhìn thấy và nắm kéo được)
         if 0 <= self.selected_idx < len(self.layers):
             s_layer = self.layers[self.selected_idx]
             bx = float(s_layer.get("box_x", 0.0))
@@ -516,23 +535,23 @@ class LayoutCanvasWidget(QWidget):
             cur_layer = self.layers[self.selected_idx]
 
             if self._drag_mode == "move":
-                nbx = max(0.0, min(1.0 - sbw, sbx + dx_norm))
-                nby = max(0.0, min(1.0 - sbh, sby + dy_norm))
+                nbx = max(-1.0, min(1.5, sbx + dx_norm))
+                nby = max(-1.0, min(1.5, sby + dy_norm))
                 cur_layer["box_x"] = round(nbx, 4)
                 cur_layer["box_y"] = round(nby, 4)
             else:
                 # Resize handles
                 nbx, nby, nbw, nbh = sbx, sby, sbw, sbh
                 if "w" in self._drag_mode:
-                    nbx = max(0.0, min(sbx + sbw - 0.02, sbx + dx_norm))
-                    nbw = sbw + (sbx - nbx)
+                    nbx = max(-1.0, min(sbx + sbw - 0.01, sbx + dx_norm))
+                    nbw = max(0.01, min(2.0, sbw + (sbx - nbx)))
                 if "e" in self._drag_mode:
-                    nbw = max(0.02, min(1.0 - sbx, sbw + dx_norm))
+                    nbw = max(0.01, min(2.0, sbw + dx_norm))
                 if "n" in self._drag_mode:
-                    nby = max(0.0, min(sby + sbh - 0.02, sby + dy_norm))
-                    nbh = sbh + (sby - nby)
+                    nby = max(-1.0, min(sby + sbh - 0.01, sby + dy_norm))
+                    nbh = max(0.01, min(2.0, sbh + (sby - nby)))
                 if "s" in self._drag_mode:
-                    nbh = max(0.02, min(1.0 - sby, sbh + dy_norm))
+                    nbh = max(0.01, min(2.0, sbh + dy_norm))
 
                 cur_layer["box_x"] = round(nbx, 4)
                 cur_layer["box_y"] = round(nby, 4)
@@ -1071,19 +1090,80 @@ class LayoutStudioTab(QWidget):
 
         prop_layout.addRow(self.text_props_widget)
 
+        # Nhóm Hiệu ứng & Chuyển động (In / Out / Motion Effect cho Text & Ảnh)
+        self.anim_props_widget = QWidget()
+        ap_layout = QFormLayout(self.anim_props_widget)
+        ap_layout.setContentsMargins(0, 0, 0, 0)
+        ap_layout.setSpacing(6)
+
+        # Hàng Hiệu ứng Vào (In Effect) + Thời lượng (Duration)
+        in_row = QHBoxLayout()
+        self.prop_in_effect_combo = QComboBox()
+        self.prop_in_effect_combo.addItem("Hiện ngay (Không hiệu ứng)", "none")
+        self.prop_in_effect_combo.addItem("✨ Mờ dần vào (Fade In)", "fade_in")
+        self.prop_in_effect_combo.addItem("⬅️ Trượt từ Trái sang (Slide Left)", "slide_left")
+        self.prop_in_effect_combo.addItem("➡️ Trượt từ Phải sang (Slide Right)", "slide_right")
+        self.prop_in_effect_combo.addItem("⬆️ Trượt từ Dưới lên (Slide Up)", "slide_up")
+        self.prop_in_effect_combo.addItem("⬇️ Trượt từ Trên xuống (Slide Down)", "slide_down")
+        self.prop_in_effect_combo.addItem("🔍 Phóng to vào (Zoom In)", "zoom_in")
+        self.prop_in_effect_combo.currentIndexChanged.connect(lambda: self._on_prop_edited())
+
+        self.prop_in_dur_spin = QDoubleSpinBox()
+        self.prop_in_dur_spin.setRange(0.2, 5.0)
+        self.prop_in_dur_spin.setSingleStep(0.1)
+        self.prop_in_dur_spin.setValue(0.8)
+        self.prop_in_dur_spin.setSuffix(" s")
+        self.prop_in_dur_spin.valueChanged.connect(lambda: self._on_prop_edited())
+
+        in_row.addWidget(self.prop_in_effect_combo, 2)
+        in_row.addWidget(QLabel("Thời lượng:"))
+        in_row.addWidget(self.prop_in_dur_spin, 1)
+        ap_layout.addRow("Hiệu ứng Vào (In):", in_row)
+
+        # Hàng Hiệu ứng Ra (Out Effect) + Chuyển động (Motion)
+        out_row = QHBoxLayout()
+        self.prop_out_effect_combo = QComboBox()
+        self.prop_out_effect_combo.addItem("Giữ đến hết (Không hiệu ứng)", "none")
+        self.prop_out_effect_combo.addItem("💨 Mờ dần ở cuối (Fade Out)", "fade_out")
+        self.prop_out_effect_combo.addItem("⬇️ Trượt biến mất xuống (Slide Down)", "slide_down")
+        self.prop_out_effect_combo.addItem("⬅️ Trượt biến mất sang trái", "slide_left")
+        self.prop_out_effect_combo.addItem("➡️ Trượt biến mất sang phải", "slide_right")
+        self.prop_out_effect_combo.currentIndexChanged.connect(lambda: self._on_prop_edited())
+
+        self.prop_motion_combo = QComboBox()
+        self.prop_motion_combo.addItem("Tĩnh (Không chuyển động)", "none")
+        self.prop_motion_combo.addItem("🌊 Bồng bềnh nhẹ (Floating 5px)", "float")
+        self.prop_motion_combo.addItem("💓 Nhịp thở (Pulse nhẹ)", "pulse")
+        self.prop_motion_combo.currentIndexChanged.connect(lambda: self._on_prop_edited())
+
+        out_row.addWidget(self.prop_out_effect_combo, 1)
+        out_row.addWidget(QLabel("Chuyển động:"))
+        out_row.addWidget(self.prop_motion_combo, 1)
+        ap_layout.addRow("Hiệu ứng Ra & Động:", out_row)
+
+        prop_layout.addRow(self.anim_props_widget)
+
         # Coordinates Display (X, Y, W, H %)
         coord_row = QHBoxLayout()
         self.spin_x = QDoubleSpinBox()
-        self.spin_x.setRange(0, 100)
+        self.spin_x.setRange(-100.0, 150.0)
+        self.spin_x.setSingleStep(0.5)
+        self.spin_x.setDecimals(1)
         self.spin_x.setSuffix("%")
         self.spin_y = QDoubleSpinBox()
-        self.spin_y.setRange(0, 100)
+        self.spin_y.setRange(-100.0, 150.0)
+        self.spin_y.setSingleStep(0.5)
+        self.spin_y.setDecimals(1)
         self.spin_y.setSuffix("%")
         self.spin_w = QDoubleSpinBox()
-        self.spin_w.setRange(1, 100)
+        self.spin_w.setRange(0.5, 200.0)
+        self.spin_w.setSingleStep(0.5)
+        self.spin_w.setDecimals(1)
         self.spin_w.setSuffix("%")
         self.spin_h = QDoubleSpinBox()
-        self.spin_h.setRange(1, 100)
+        self.spin_h.setRange(0.5, 200.0)
+        self.spin_h.setSingleStep(0.5)
+        self.spin_h.setDecimals(1)
         self.spin_h.setSuffix("%")
 
         for sp in (self.spin_x, self.spin_y, self.spin_w, self.spin_h):
@@ -1256,6 +1336,33 @@ class LayoutStudioTab(QWidget):
         self.file_row_widget.setVisible(l_type in {"image", "gif", "video_mask", "banner", "logo", "watermark"})
         self.scale_mode_row_widget.setVisible(l_type in {"image", "gif", "video_mask", "banner", "logo", "watermark", "chat_bubble", "reaction"})
         self.text_props_widget.setVisible(l_type in {"text", "subtitle"})
+
+        # Hiển thị nhóm hiệu ứng In/Out/Motion chỉ cho Text và các loại Ảnh
+        can_animate = l_type in {"text", "image", "banner", "logo", "watermark", "chat_bubble"}
+        self.anim_props_widget.setVisible(can_animate)
+
+        if can_animate:
+            in_eff = layer.get("in_effect", "none")
+            in_idx = self.prop_in_effect_combo.findData(in_eff)
+            self.prop_in_effect_combo.blockSignals(True)
+            self.prop_in_effect_combo.setCurrentIndex(max(0, in_idx))
+            self.prop_in_effect_combo.blockSignals(False)
+
+            self.prop_in_dur_spin.blockSignals(True)
+            self.prop_in_dur_spin.setValue(float(layer.get("in_duration", 0.8) or 0.8))
+            self.prop_in_dur_spin.blockSignals(False)
+
+            out_eff = layer.get("out_effect", "none")
+            out_idx = self.prop_out_effect_combo.findData(out_eff)
+            self.prop_out_effect_combo.blockSignals(True)
+            self.prop_out_effect_combo.setCurrentIndex(max(0, out_idx))
+            self.prop_out_effect_combo.blockSignals(False)
+
+            mot_eff = layer.get("motion_effect", "none")
+            mot_idx = self.prop_motion_combo.findData(mot_eff)
+            self.prop_motion_combo.blockSignals(True)
+            self.prop_motion_combo.setCurrentIndex(max(0, mot_idx))
+            self.prop_motion_combo.blockSignals(False)
 
         if l_type in {"text", "subtitle"}:
             self.tag_helper_widget.setVisible(l_type == "text")
@@ -1451,6 +1558,14 @@ class LayoutStudioTab(QWidget):
                     sub_cfg["align"] = layer["align"]
                     sub_cfg["sub_mode"] = layer["sub_mode"]
                     sub_cfg["enabled"] = layer["enabled"]
+
+            # Lưu thuộc tính hiệu ứng In/Out/Motion cho Text & Ảnh
+            can_animate = l_type in {"text", "image", "banner", "logo", "watermark", "chat_bubble"}
+            if can_animate:
+                layer["in_effect"] = self.prop_in_effect_combo.currentData() or "none"
+                layer["in_duration"] = self.prop_in_dur_spin.value()
+                layer["out_effect"] = self.prop_out_effect_combo.currentData() or "none"
+                layer["motion_effect"] = self.prop_motion_combo.currentData() or "none"
 
             item = self.layer_list.item(idx)
             if item:

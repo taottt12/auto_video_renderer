@@ -62,8 +62,50 @@ def srt_time_to_ass(t_str: str, speed: float = 1.0) -> str:
     return seconds_to_ass_time(sec)
 
 
-def parse_srt_to_raw_events(srt_text: str, speed: float = 1.0) -> List[Tuple[float, float, str]]:
-    """Phân tích văn bản SRT thành danh sách (start_sec, end_sec, text) đã bù trừ audio_speed."""
+def post_process_subtitle_text(text: str, keywords: str | List[str] = "") -> str:
+    """Nắn chỉnh và chuẩn hóa các từ nhận diện nhầm của Whisper AI dựa theo danh sách từ khóa ngữ cảnh & tiêu đề."""
+    if not text:
+        return ""
+
+    clean_t = str(text)
+    kw_list: List[str] = []
+    if isinstance(keywords, str):
+        kw_list = [k.strip() for k in keywords.split(",") if k.strip()]
+    elif isinstance(keywords, list):
+        for k in keywords:
+            if isinstance(k, str) and k.strip():
+                kw_list.extend([subk.strip() for subk in k.split(",") if subk.strip()])
+
+    # 1. Các quy tắc nhận diện sai phiên âm phổ biến (Common Misrecognitions)
+    common_rules = [
+        (r"\b(ain\s*awao|ayna\s*waw|ayna\s*waow|ayn\s*awow|ayna\s*vao|ain\s*wow|ayn\s*a\s*wow)\b", "AYNA WOW"),
+        (r"\b(pinoy\s*lugh\s*radio|pinoy\s*lough\s*radio|pinoy\s*lauch\s*radio|pinoy\s*laugh\s*rad)\b", "PINOY LAUGH RADIO"),
+    ]
+    for pat, repl in common_rules:
+        clean_t = re.sub(pat, repl, clean_t, flags=re.IGNORECASE)
+
+    # 2. Quy tắc động từ Keywords người dùng cung cấp
+    for kw in kw_list:
+        kw_clean = kw.strip()
+        if not kw_clean or len(kw_clean) < 3:
+            continue
+        kw_tokens = re.split(r"[\s\-_]+", kw_clean)
+        if len(kw_tokens) >= 2:
+            token_pattern = r"\s+".join(re.escape(tok) for tok in kw_tokens)
+            try:
+                clean_t = re.sub(r"\b" + token_pattern + r"\b", kw_clean, clean_t, flags=re.IGNORECASE)
+            except Exception:
+                pass
+
+    return clean_t
+
+
+def parse_srt_to_raw_events(
+    srt_text: str,
+    speed: float = 1.0,
+    keywords: str | List[str] = "",
+) -> List[Tuple[float, float, str]]:
+    """Phân tích văn bản SRT thành danh sách (start_sec, end_sec, text) đã bù trừ audio_speed và nắn chỉnh từ khóa."""
     blocks = re.split(r"\n\s*\n", srt_text.strip())
     raw_events: List[Tuple[float, float, str]] = []
     time_pat = re.compile(r"(\d+:\d+:\d+[,\.]\d+)\s*-->\s*(\d+:\d+:\d+[,\.]\d+)")
@@ -86,6 +128,7 @@ def parse_srt_to_raw_events(srt_text: str, speed: float = 1.0) -> List[Tuple[flo
             e_sec = srt_time_to_seconds(time_match.group(2)) / eff_speed
             txt = " ".join(text_lines).strip()
             if txt:
+                txt = post_process_subtitle_text(txt, keywords=keywords)
                 raw_events.append((s_sec, e_sec, txt))
     return raw_events
 
@@ -210,9 +253,10 @@ def srt_to_ass(
 
     speed = float(sub_cfg.get("audio_speed", 1.0) or 1.0)
     sub_mode = str(sub_cfg.get("sub_mode", "rolling_2line") or "rolling_2line").strip().lower()
+    sub_keywords = sub_cfg.get("whisper_keywords", "") or sub_cfg.get("initial_prompt", "") or ""
 
     content = read_subtitle_file(srt_p)
-    raw_events = parse_srt_to_raw_events(content, speed=speed)
+    raw_events = parse_srt_to_raw_events(content, speed=speed, keywords=sub_keywords)
     if not raw_events:
         raise RuntimeError(f"File phụ đề '{srt_p.name}' không chứa bất kỳ đoạn thoại nào hợp lệ.")
 
@@ -235,7 +279,12 @@ def srt_to_ass(
 
     margin_l = max(10, int(box_x * width))
     margin_r = max(10, int((1.0 - (box_x + box_w)) * width))
-    margin_v = max(10, int((1.0 - (box_y + box_h)) * height))
+
+    # Tính MarginV căn giữa tâm Bounding Box khớp chính xác 100% với Canvas Preview (Qt.AlignCenter)
+    box_pixel_h = int(box_h * height)
+    text_est_h = int(scaled_font_size * 2.2)
+    center_v_offset = max(0, (box_pixel_h - text_est_h) // 2)
+    margin_v = max(10, int((1.0 - (box_y + box_h)) * height) + center_v_offset)
 
     # Alignment trong ASS: 1 = Bottom-Left, 2 = Bottom-Center, 3 = Bottom-Right
     align_str = str(sub_cfg.get("align", "center")).lower()
@@ -440,15 +489,16 @@ def _register_cuda_dll_directories() -> None:
 def check_cuda_whisper_support() -> bool:
     """Kiểm tra thực tế xem CUDA GPU có sẵn sàng chạy PyTorch Whisper AI không."""
     try:
+        _register_cuda_dll_directories()
         import torch
         return bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
     except Exception:
         return False
 
 
-def preflight_whisper_model(model_name: str = "small", log_callback: Any = None) -> Tuple[bool, str]:
+def preflight_whisper_model(model_name: str = "turbo", log_callback: Any = None) -> Tuple[bool, str]:
     """Kiểm tra nhanh toàn diện model Whisper và GPU CUDA trước khi render trong Sandbox an toàn."""
-    def _safe_log(msg: str):
+    def _safe_log_local(msg: str):
         if log_callback:
             try:
                 log_callback(msg)
@@ -464,11 +514,11 @@ def preflight_whisper_model(model_name: str = "small", log_callback: Any = None)
         has_cuda = check_cuda_whisper_support()
         if not has_cuda:
             msg = "CUDA GPU không khả dụng. Sẽ sử dụng CPU đa luồng để bóc tách phụ đề."
-            _safe_log(f"ℹ️ {msg}")
+            _safe_log_local(f"ℹ️ {msg}")
             return True, msg
 
-        m_id = str(model_name or "small").strip()
-        _safe_log(f"🔍 [Preflight] Đang kiểm tra Whisper AI [{m_id}] trên GPU CUDA...")
+        m_id = str(model_name or "turbo").strip()
+        _safe_log_local(f"🔍 [Preflight] Đang kiểm tra Whisper AI [{m_id}] trên GPU CUDA...")
 
         import tempfile
         import wave
@@ -489,25 +539,25 @@ def preflight_whisper_model(model_name: str = "small", log_callback: Any = None)
                 model_size=m_id,
                 language="en",
                 device="cuda",
-                compute_type="int8_float16",
+                compute_type="fp16",
                 speed=1.0,
                 audio_duration=1.0,
                 cancel_event=None,
-                log_callback=_safe_log,
+                log_callback=_safe_log_local,
                 progress_callback=None,
             )
 
         if ok:
             success_msg = f"GPU CUDA & Whisper AI [{m_id}] sẵn sàng 100%!"
-            _safe_log(f"✔ [Preflight] {success_msg}")
+            _safe_log_local(f"✔ [Preflight] {success_msg}")
             return True, success_msg
         else:
             err_msg_clean = f"Model [{m_id}] gặp sự cố trên GPU CUDA ({err_msg})."
-            _safe_log(f"⚠️ [Preflight] {err_msg_clean}")
+            _safe_log_local(f"⚠️ [Preflight] {err_msg_clean}")
             return False, err_msg_clean
     except Exception as ex:
         err_msg = f"Model [{model_name}] gặp cảnh báo trên GPU: {ex}"
-        _safe_log(f"⚠️ [Preflight] {err_msg}")
+        _safe_log_local(f"⚠️ [Preflight] {err_msg}")
         return False, str(ex)
 
 
@@ -539,10 +589,15 @@ def _run_isolated_whisper(
     log_callback: Any,
     progress_callback: Any,
     cpu_threads: int = 0,
+    enhance_voice: bool = True,
+    vocal_separation: bool = True,
+    initial_prompt: str = "",
 ) -> Tuple[bool, str, str]:
     """Chạy Whisper AI trong Process Sandbox riêng biệt để cách ly tuyệt đối lỗi driver/C++ khỏi GUI."""
     import json
+    import queue
     import subprocess
+    import threading
     import time
 
     python_exe = sys.executable
@@ -564,6 +619,16 @@ def _run_isolated_whisper(
         "--duration", str(audio_duration),
         "--cpu-threads", str(cpu_threads),
     ]
+    if initial_prompt:
+        cmd.extend(["--initial-prompt", str(initial_prompt)])
+    if vocal_separation:
+        cmd.append("--vocal-separation")
+    else:
+        cmd.append("--no-vocal-separation")
+    if enhance_voice:
+        cmd.append("--enhance-voice")
+    else:
+        cmd.append("--no-enhance-voice")
 
     creation_flags = 0
     if sys.platform == "win32":
@@ -586,21 +651,42 @@ def _run_isolated_whisper(
 
     detected_lang = language or "unknown"
     error_msg = ""
+    out_queue: queue.Queue[str | None] = queue.Queue()
+
+    def _reader_thread_target():
+        try:
+            if proc.stdout:
+                for line in iter(proc.stdout.readline, ""):
+                    if line:
+                        out_queue.put(line)
+        except Exception:
+            pass
+        finally:
+            out_queue.put(None)
+
+    t_reader = threading.Thread(target=_reader_thread_target, daemon=True)
+    t_reader.start()
 
     while True:
         if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
             try:
                 proc.kill()
+                proc.wait(timeout=1.5)
             except Exception:
                 pass
             raise RenderCancelled("Đã dừng bởi người dùng")
 
-        line = proc.stdout.readline()
-        if not line and proc.poll() is not None:
-            break
-        if not line:
-            time.sleep(0.02)
+        try:
+            line = out_queue.get(timeout=0.1)
+        except queue.Empty:
+            if proc.poll() is not None:
+                # Tiến trình đã kết thúc và không còn dòng log mới trong queue
+                break
             continue
+
+        if line is None:
+            # Luồng đọc kết thúc stream output
+            break
 
         clean_line = line.strip()
         if clean_line.startswith("__AVR_MSG__"):
@@ -620,6 +706,11 @@ def _run_isolated_whisper(
             except Exception:
                 pass
 
+    try:
+        proc.wait(timeout=2.0)
+    except Exception:
+        pass
+
     ret_code = proc.poll()
     if ret_code == 0 and out_srt_path.exists():
         return True, "", detected_lang
@@ -631,23 +722,33 @@ def _run_isolated_whisper(
 def transcribe_audio_to_srt(
     audio_path: str | Path,
     out_srt_path: str | Path,
-    model_size: str = "base",
+    model_size: str = "turbo",
     language: str | None = None,
     log_callback: Any = None,
     progress_callback: Any = None,
     speed: float = 1.0,
     cancel_event: Any = None,
     audio_duration: float = 0.0,
+    enhance_voice: bool = True,
+    vocal_separation: bool = True,
+    initial_prompt: str = "",
 ) -> Tuple[Path, str]:
     """Tự động nghe audio bằng Whisper AI, nhận diện ngôn ngữ và xuất file .srt chuẩn xác theo từng từ với Process Sandbox 100% an toàn."""
     if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
         raise RenderCancelled("Đã dừng bởi người dùng")
 
+    _register_cuda_dll_directories()
     p_audio = Path(audio_path)
     p_out = Path(out_srt_path)
     p_out.parent.mkdir(parents=True, exist_ok=True)
 
-    model_size = str(model_size or "base").strip()
+    raw_model = str(model_size or "turbo").strip().lower()
+    if raw_model in ["turbo", "large-v3-turbo", "large_v3_turbo", "large-v3", "large"]:
+        model_size = "turbo"
+    elif raw_model in ["medium", "medium.en"]:
+        model_size = "medium"
+    else:
+        model_size = "turbo"
 
     # Chuẩn hóa mã ngôn ngữ (Philippines: tl / fil)
     target_lang = None
@@ -681,39 +782,45 @@ def transcribe_audio_to_srt(
                 cancel_event=cancel_event,
                 log_callback=log_callback,
                 progress_callback=progress_callback,
+                enhance_voice=enhance_voice,
+                vocal_separation=vocal_separation,
+                initial_prompt=initial_prompt,
             )
             if ok:
                 success = True
-                used_device = "GPU CUDA (PyTorch Native)"
+                used_device = "GPU CUDA (PyTorch Native FP16)"
                 detected_lang = lang_res
             else:
-                _safe_log(log_callback, f"⚠️ GPU CUDA gặp sự cố khi chạy model [{model_size}] ({err_msg}) -> Thử chuyển sang CPU đa luồng cho chính model [{model_size}]...")
+                _safe_log(log_callback, f"⚠️ GPU CUDA gặp lỗi [{err_msg}] -> Tự động chuyển sang CPU đa luồng giữ nguyên model [{model_size}]...")
         except RenderCancelled:
             raise
         except Exception as cuda_ex:
-            _safe_log(log_callback, f"⚠️ GPU CUDA gặp ngoại lệ ({cuda_ex}) -> Thử chuyển sang CPU đa luồng cho model [{model_size}]...")
+            _safe_log(log_callback, f"⚠️ GPU CUDA gặp ngoại lệ [{cuda_ex}] -> Tự động chuyển sang CPU đa luồng giữ nguyên model [{model_size}]...")
 
     # Giai đoạn 2: Fallback sang CPU đa luồng nếu GPU hoàn toàn không khả dụng
     if not success:
         if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
             raise RenderCancelled("Đã dừng bởi người dùng")
-        cpu_threads_count = max(4, (os.cpu_count() or 4))
+        cpu_threads_count = min(8, max(2, os.cpu_count() or 4))
         ok, err_msg, lang_cpu = _run_isolated_whisper(
             audio_path=p_audio,
             out_srt_path=p_out,
             model_size=model_size,
             language=target_lang,
             device="cpu",
-            compute_type="int8",
+            compute_type="fp32",
             speed=speed,
             audio_duration=audio_duration,
             cancel_event=cancel_event,
             log_callback=log_callback,
             progress_callback=progress_callback,
             cpu_threads=cpu_threads_count,
+            enhance_voice=enhance_voice,
+            vocal_separation=vocal_separation,
+            initial_prompt=initial_prompt,
         )
         if not ok:
-            raise RuntimeError(f"Lỗi Whisper AI khi tạo phụ đề: {err_msg}")
+            raise RuntimeError(f"Lỗi Whisper AI khi tạo phụ đề trên CPU: {err_msg}")
         used_device = f"cpu ({cpu_threads_count} threads)"
         detected_lang = lang_cpu
 

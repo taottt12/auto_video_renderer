@@ -15,7 +15,7 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QPushButton, QListWidget,
     QFileDialog, QCheckBox, QComboBox, QSpinBox, QDoubleSpinBox,
-    QLineEdit, QFormLayout, QScrollArea, QTextEdit, QColorDialog,
+    QLineEdit, QFormLayout, QScrollArea, QTextEdit, QPlainTextEdit, QColorDialog,
     QToolButton, QLabel, QAbstractItemView, QSplitter, QMessageBox
 )
 
@@ -1062,13 +1062,23 @@ class SettingTab(QWidget):
         group = QGroupBox()
         form = QFormLayout(group)
         self.intro_edit = self._file_row(form, "Intro", "Chọn intro", "Video (*.mp4 *.mov *.mkv)")
+
+        self.intro_mode_combo = QComboBox()
+        self.intro_mode_combo.addItem("Nối tiếp trước MP3 (Phát xong Intro mới tới nội dung chính)", "sequential")
+        self.intro_mode_combo.addItem("Đè lên đầu MP3 (MP3 phát từ 0:00, Intro chỉ đè hình ảnh mở đầu)", "overlay")
+        form.addRow("Chế độ Intro:", self.intro_mode_combo)
+
         self.outro_edit = self._file_row(form, "Outro", "Chọn outro", "Video (*.mp4 *.mov *.mkv)")
+
+        self.filter_bgm_after_30s_cb = QCheckBox("Tự động giảm/lọc bỏ nhạc nền sau 30s đầu (Giữ nguyên giọng đọc & SFX)")
+        self.filter_bgm_after_30s_cb.setToolTip("Khi bật: 30s đầu giữ nguyên 100% âm thanh gốc (bao gồm nhạc dạo / voice intro). Từ giây 30 trở đi sẽ lọc giảm nhạc nền giúp lời đọc rõ nét và giữ SFX.")
+        form.addRow("Lọc nhạc sau 30s:", self.filter_bgm_after_30s_cb)
 
         note_label = QLabel("💡 <i>Logo, Watermark, Huy hiệu & Lớp phủ đồ họa hiện được quản lý trực quan tại tab <b>Studio Layout</b>.</i>")
         note_label.setStyleSheet("color: #88c0d0; font-size: 11px;")
         form.addRow(note_label)
 
-        self._connect_change_widgets(self.intro_edit, self.outro_edit)
+        self._connect_change_widgets(self.intro_edit, self.intro_mode_combo, self.outro_edit, self.filter_bgm_after_30s_cb)
         return group
 
     def _build_text_group(self) -> QGroupBox:
@@ -1174,13 +1184,8 @@ class SettingTab(QWidget):
         self.sub_whisper_lang.setToolTip("Chọn ngôn ngữ của giọng đọc audio để Whisper AI nhận diện chính xác 100%, không bị nhầm lẫn ngôn ngữ.")
 
         self.sub_whisper_model = QComboBox()
-        self.sub_whisper_model.addItem("turbo (⚡ Large-v3-Turbo - Tối ưu GPU RTX)", "turbo")
-        self.sub_whisper_model.addItem("large-v3 (Độ chính xác tối đa - GPU CUDA)", "large-v3")
-        self.sub_whisper_model.addItem("large-v2 (Chất lượng cao - GPU CUDA)", "large-v2")
-        self.sub_whisper_model.addItem("medium (Cân bằng cao - GPU CUDA)", "medium")
-        self.sub_whisper_model.addItem("small (⚡ Siêu tốc GPU RTX 1.2GB VRAM)", "small")
-        self.sub_whisper_model.addItem("base (Nhẹ - GPU/CPU)", "base")
-        self.sub_whisper_model.addItem("tiny (Siêu nhẹ)", "tiny")
+        self.sub_whisper_model.addItem("turbo (⚡ Large-v3-Turbo - Khuyên dùng, Nhanh & Chính xác nhất)", "turbo")
+        self.sub_whisper_model.addItem("medium (Dự phòng - Cân bằng GPU/CPU)", "medium")
         self.sub_whisper_model.setCurrentIndex(0)
 
         self.sub_check_model_btn = QPushButton("🔍 Kiểm tra GPU")
@@ -1220,9 +1225,26 @@ class SettingTab(QWidget):
 
         self.sub_mode_combo.currentIndexChanged.connect(self._on_sub_mode_changed)
 
+        self.sub_enhance_voice_cb = QCheckBox("⚡ Tăng cường dải tần giọng nói cho Whisper AI (Chống nuốt chữ)")
+        self.sub_enhance_voice_cb.setChecked(True)
+        self.sub_enhance_voice_cb.setToolTip("Khi bật, audio sẽ được lọc trước dải tần giọng nói qua FFmpeg để Whisper AI nhận diện phụ đề chuẩn xác 100%, không bị tiếng nhạc nền làm sót câu chữ.")
+
+        self.sub_vocal_sep_cb = QCheckBox("🔥 Tách giọng nói AI (Vocal Isolation - Bóc sạch nhạc nền & SFX trước khi bóc Sub)")
+        self.sub_vocal_sep_cb.setChecked(True)
+        self.sub_vocal_sep_cb.setStyleSheet("color: #00e676; font-weight: bold;")
+        self.sub_vocal_sep_cb.setToolTip("Khi bật, hệ thống tự động bóc tách triệt để luồng giọng nói sạch (Vocals), triệt tiêu hoàn toàn nhạc nền to, tiếng cười và SFX để Whisper AI bóc sub chính xác 100%.")
+
+        self.sub_whisper_keywords = QPlainTextEdit()
+        self.sub_whisper_keywords.setFixedHeight(50)
+        self.sub_whisper_keywords.setPlaceholderText("Nhập các từ khóa, tên riêng, câu cửa miệng... cách nhau bởi dấu phẩy (Ví dụ: AYNA WOW, PINOY LAUGH RADIO, ILOCANO, NALAKA A PAGKWARTAAN)")
+        self.sub_whisper_keywords.setToolTip("Mớm từ khóa ngữ cảnh cho Whisper AI (Initial Prompt) để tránh hiện tượng dịch sai từ riêng thành các âm vô nghĩa.")
+
         form.addRow("Trạng thái", self.sub_enabled)
         form.addRow("Kiểu hiển thị", mode_row)
         form.addRow("Quét Sub tự động", auto_row)
+        form.addRow("Từ khóa AI Prompt", self.sub_whisper_keywords)
+        form.addRow("Tách Voice AI", self.sub_vocal_sep_cb)
+        form.addRow("Tăng cường AI", self.sub_enhance_voice_cb)
         form.addRow("Thư mục Sub (.srt)", folder_row)
 
         note_label = QLabel("💡 <i>Vị trí hiển thị, phông chữ, cỡ chữ, màu sắc, viền, độ dày và căn lề phụ đề hiện được quản lý trực quan tại tab <b>Studio Layout</b>.</i>")
@@ -1231,7 +1253,7 @@ class SettingTab(QWidget):
 
         layout.addLayout(form)
 
-        for w in (self.sub_enabled, self.sub_auto_transcribe, self.sub_whisper_lang, self.sub_whisper_model, self.sub_folder_edit, self.sub_mode_combo, self.sub_highlight_color_edit):
+        for w in (self.sub_enabled, self.sub_auto_transcribe, self.sub_whisper_lang, self.sub_whisper_model, self.sub_vocal_sep_cb, self.sub_enhance_voice_cb, self.sub_whisper_keywords, self.sub_folder_edit, self.sub_mode_combo, self.sub_highlight_color_edit):
             if hasattr(w, "stateChanged"):
                 w.stateChanged.connect(lambda: self._emit())
             elif hasattr(w, "currentIndexChanged"):
@@ -1245,7 +1267,7 @@ class SettingTab(QWidget):
 
     def _check_whisper_gpu_model(self) -> None:
         import threading
-        model_name = self.sub_whisper_model.currentData() if hasattr(self, "sub_whisper_model") else "large-v3-turbo"
+        model_name = self.sub_whisper_model.currentData() if hasattr(self, "sub_whisper_model") else "turbo"
         self.sub_check_model_btn.setEnabled(False)
         self.sub_check_model_btn.setText("⏳ Đang kiểm tra...")
 
@@ -1696,15 +1718,16 @@ class SettingTab(QWidget):
         self.fps_spin.setValue(30)
 
         self.quality_combo = QComboBox()
-        self.quality_combo.addItem("Siêu nhẹ - Audio/Truyện dài (~1.5 Mbps, ~1.2 GB/2h)", "economy")
-        self.quality_combo.addItem("Chuẩn 1080p Audio/Slide (~2.2 Mbps, ~1.8 GB/2h - Khuyên dùng)", "standard")
-        self.quality_combo.addItem("Chất lượng cao (~3.5 Mbps, ~2.8 GB/2h)", "high")
-        self.quality_combo.addItem("Tùy chỉnh Bitrate (Custom Kbps)", "custom")
+        self.quality_combo.addItem("Tiết kiệm dung lượng (~2.5 Mbps - Audio/Truyện dài nhẹ máy)", "economy")
+        self.quality_combo.addItem("Chuẩn YouTube 1080p (~6.0 Mbps - Sắc nét phổ thông, Khuyên dùng)", "standard")
+        self.quality_combo.addItem("Chất lượng cao HD (~10.0 Mbps - Cực nét cho chữ & đồ họa)", "high")
+        self.quality_combo.addItem("Chất lượng Siêu cao (~16.0 Mbps - Master chất lượng gốc)", "ultra")
+        self.quality_combo.addItem("Tùy chỉnh Bitrate (Nhập Kbps mong muốn)", "custom")
 
         self.custom_bitrate_spin = QSpinBox()
-        self.custom_bitrate_spin.setRange(500, 30000)
-        self.custom_bitrate_spin.setSingleStep(100)
-        self.custom_bitrate_spin.setValue(2200)
+        self.custom_bitrate_spin.setRange(500, 50000)
+        self.custom_bitrate_spin.setSingleStep(500)
+        self.custom_bitrate_spin.setValue(6000)
         self.custom_bitrate_spin.setSuffix(" kbps")
 
         self.custom_bitrate_label = QLabel("Bitrate tùy chỉnh:")
@@ -1751,15 +1774,15 @@ class SettingTab(QWidget):
             return
         q = str(self.quality_combo.currentData() or "standard").lower()
         if q in ["economy", "low", "draft"]:
-            base_kbps = 1500
+            base_kbps = 2500
         elif q == "high":
-            base_kbps = 3500
+            base_kbps = 10000
         elif q == "ultra":
-            base_kbps = 5500
+            base_kbps = 16000
         elif q == "custom":
-            base_kbps = self.custom_bitrate_spin.value() if hasattr(self, "custom_bitrate_spin") else 2200
+            base_kbps = self.custom_bitrate_spin.value() if hasattr(self, "custom_bitrate_spin") else 6000
         else:
-            base_kbps = 2200
+            base_kbps = 6000
 
         fps = self.fps_spin.value() if hasattr(self, "fps_spin") else 30
         fps_scale = min(1.30, max(0.70, fps / 30.0))
@@ -1771,7 +1794,7 @@ class SettingTab(QWidget):
         size_2h_gb = size_1h_gb * 2.0
 
         self.estimated_size_label.setText(
-            f"💡 Dự kiến: ~{size_1h_gb:.1f} GB / 1 giờ  (~{size_2h_gb:.1f} GB / 2 giờ) — Tải lên YouTube cực nhanh"
+            f"💡 Dự kiến: ~{size_1h_gb:.1f} GB / 1 giờ  (~{size_2h_gb:.1f} GB / 2 giờ) — Video chuẩn nét YouTube 1080p"
         )
 
     def _build_performance_group(self) -> QGroupBox:
@@ -1941,7 +1964,9 @@ class SettingTab(QWidget):
         settings = dict(self.settings)
         settings.update({
             "intro_file": self.intro_edit.text().strip(),
+            "intro_mode": self.intro_mode_combo.currentData() if hasattr(self, "intro_mode_combo") else "sequential",
             "outro_file": self.outro_edit.text().strip(),
+            "filter_bgm_after_30s": self.filter_bgm_after_30s_cb.isChecked() if hasattr(self, "filter_bgm_after_30s_cb") else False,
             "background_music": {
                 "enabled": self.bgm_enabled.isChecked(),
                 "file": self._list_items(self.bgm_list)[0] if self._list_items(self.bgm_list) else "",
@@ -2003,8 +2028,11 @@ class SettingTab(QWidget):
                 "sub_mode": self.sub_mode_combo.currentData() if hasattr(self, "sub_mode_combo") else "rolling_2line",
                 "highlight_color": self.sub_highlight_color_edit.text().strip() or "#FFE600" if hasattr(self, "sub_highlight_color_edit") else "#FFE600",
                 "auto_transcribe": self.sub_auto_transcribe.isChecked() if hasattr(self, "sub_auto_transcribe") else False,
+                "whisper_vocal_separation": self.sub_vocal_sep_cb.isChecked() if hasattr(self, "sub_vocal_sep_cb") else True,
+                "whisper_enhance_voice": self.sub_enhance_voice_cb.isChecked() if hasattr(self, "sub_enhance_voice_cb") else True,
+                "whisper_keywords": self.sub_whisper_keywords.toPlainText().strip() if hasattr(self, "sub_whisper_keywords") else "",
                 "whisper_language": self.sub_whisper_lang.currentData() if hasattr(self, "sub_whisper_lang") else "auto",
-                "whisper_model": self.sub_whisper_model.currentData() if hasattr(self, "sub_whisper_model") else "base",
+                "whisper_model": self.sub_whisper_model.currentData() if hasattr(self, "sub_whisper_model") else "turbo",
                 "folder": self.sub_folder_edit.text().strip() if hasattr(self, "sub_folder_edit") else "",
                 "font_family": self.sub_font_family.currentText() if hasattr(self, "sub_font_family") else "Arial",
                 "font_size": self.sub_font_size.value() if hasattr(self, "sub_font_size") else 38,
@@ -2036,7 +2064,11 @@ class SettingTab(QWidget):
         self.settings = settings
 
         self.intro_edit.setText(settings.get("intro_file", ""))
+        if hasattr(self, "intro_mode_combo"):
+            self._set_combo_by_data(self.intro_mode_combo, settings.get("intro_mode", "sequential"))
         self.outro_edit.setText(settings.get("outro_file", ""))
+        if hasattr(self, "filter_bgm_after_30s_cb"):
+            self.filter_bgm_after_30s_cb.setChecked(bool(settings.get("filter_bgm_after_30s", False)))
 
         bgm = settings.get("background_music", {}) or {}
         self.bgm_list.clear()
@@ -2125,10 +2157,16 @@ class SettingTab(QWidget):
                 self._update_sub_highlight_btn_style()
             if hasattr(self, "sub_auto_transcribe"):
                 self.sub_auto_transcribe.setChecked(bool(sub_cfg.get("auto_transcribe", False)))
+            if hasattr(self, "sub_vocal_sep_cb"):
+                self.sub_vocal_sep_cb.setChecked(bool(sub_cfg.get("whisper_vocal_separation", True)))
+            if hasattr(self, "sub_enhance_voice_cb"):
+                self.sub_enhance_voice_cb.setChecked(bool(sub_cfg.get("whisper_enhance_voice", True)))
+            if hasattr(self, "sub_whisper_keywords"):
+                self.sub_whisper_keywords.setPlainText(str(sub_cfg.get("whisper_keywords", "") or ""))
             if hasattr(self, "sub_whisper_lang"):
                 self._set_combo_by_data(self.sub_whisper_lang, sub_cfg.get("whisper_language", "auto"))
             if hasattr(self, "sub_whisper_model"):
-                self._set_combo_by_data(self.sub_whisper_model, sub_cfg.get("whisper_model", "base"))
+                self._set_combo_by_data(self.sub_whisper_model, sub_cfg.get("whisper_model", "turbo"))
             self.sub_folder_edit.setText(str(sub_cfg.get("folder", "") or ""))
 
         export = settings.get("export", {})
@@ -2231,8 +2269,12 @@ class SettingTab(QWidget):
 
     @staticmethod
     def _set_combo_by_data(combo: QComboBox, value: Any) -> None:
+        target = str(value or "").strip()
+        if target in ["large-v3-turbo", "whisper-large-v3-turbo", "large-v2", "large"]:
+            target = "turbo"
         for i in range(combo.count()):
-            if combo.itemData(i) == value:
+            item_d = str(combo.itemData(i))
+            if item_d == target or combo.itemData(i) == value:
                 combo.setCurrentIndex(i)
                 return
 

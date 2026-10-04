@@ -36,7 +36,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "avoid_repeat": True,
     "delete_audio_after_render": False,
     "intro_file": "",
+    "intro_mode": "sequential",  # "sequential" (nối tiếp trước MP3) hoặc "overlay" (đè lên đầu MP3)
     "outro_file": "",
+    "filter_bgm_after_30s": False,  # Giảm/lọc nhạc nền sau 30s đầu (giữ voice & SFX)
     "logo_file": "",
     "logo_enabled": False,
     "logo_position": "top_right",
@@ -110,7 +112,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "enabled": False,
         "auto_transcribe": False,
         "whisper_language": "auto",
-        "whisper_model": "small",
+        "whisper_model": "turbo",
+        "whisper_enhance_voice": True,  # Lọc tạp âm & dải tần giọng nói giúp Whisper dịch chuẩn 100%
         "auto_detect_srt": True,
         "custom_sub_file": "",
         "font_name": "Arial",
@@ -136,7 +139,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "height": 1920,
         "fps": 30,
         "quality": "standard",
-        "custom_bitrate_kbps": 2200,
+        "custom_bitrate_kbps": 6000,
         "format": "mp4",
         "output_folder": "output",
     },

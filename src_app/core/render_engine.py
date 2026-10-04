@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 import json
 import random
@@ -65,8 +66,20 @@ class RenderEngine:
     ) -> None:
         ensure_dirs()
         self.settings = settings
-        self.log = log or (lambda msg: None)
-        self.progress = progress or (lambda percent, stage: None)
+        raw_log = log or (lambda msg: None)
+        raw_progress = progress or (lambda percent, stage: None)
+        def _safe_log_cb(msg: str) -> None:
+            try:
+                raw_log(msg)
+            except Exception:
+                pass
+        def _safe_prog_cb(pct: int, stg: str) -> None:
+            try:
+                raw_progress(pct, stg)
+            except Exception:
+                pass
+        self.log = _safe_log_cb
+        self.progress = _safe_prog_cb
         self.cancel_event = cancel_event or threading.Event()
         self.ffmpeg = self._find_binary_pair("ffmpeg")
         self.ffprobe = self._find_binary_pair("ffprobe")
@@ -138,9 +151,6 @@ class RenderEngine:
             )
             self.log(f"Image duration: {image_duration:.2f}s | Video speed: {video_speed:.2f}x")
 
-            self.progress(15, "Tạo clip từ ảnh/video")
-            clips, clip_durations = self._create_media_clips(media_sequence, job_temp, width, height, fps, image_duration, render_duration)
-
             # Xử lý phụ đề Subtitle (nếu được bật trong Cài đặt hoặc trong Studio Layout)
             sub_cfg = copy.deepcopy(self.settings.get("subtitle", {}) or {})
             sub_ass_file: Path | None = None
@@ -153,14 +163,36 @@ class RenderEngine:
                 sub_folder = sub_cfg.get("folder", "")
                 raw_sub = find_subtitle_file(original_audio_path, sub_folder)
 
+                # Tập hợp từ khóa ngữ cảnh (Initial Prompt) mớm cho Whisper AI & bộ lọc nắn chỉnh phụ đề
+                prompt_tokens: List[str] = []
+                raw_keywords = str(sub_cfg.get("whisper_keywords", "") or "").strip()
+                if raw_keywords:
+                    prompt_tokens.extend([k.strip() for k in raw_keywords.split(",") if k.strip()])
+                if title_to_use:
+                    prompt_tokens.append(title_to_use.strip())
+                for l in ls_layers:
+                    if isinstance(l, dict) and l.get("type") == "text":
+                        t_txt = str(l.get("text_content") or l.get("text") or l.get("content") or "").strip()
+                        if t_txt and not t_txt.startswith("{"):
+                            prompt_tokens.append(t_txt)
+                combined_prompt = ", ".join(dict.fromkeys(prompt_tokens))
+                sub_cfg["whisper_keywords"] = combined_prompt
+
                 # NẾU CHƯA CÓ FILE SUB: TỰ ĐỘNG CHẠY WHISPER AI ĐỂ BÓC TÁCH SUB
                 if not raw_sub or not raw_sub.exists():
                     self.progress(12, "Whisper AI nhận diện giọng nói & tạo sub")
-                    model_size = str(sub_cfg.get("whisper_model", "base") or "base")
+                    model_size = str(sub_cfg.get("whisper_model", "turbo") or "turbo")
                     whisper_lang = str(sub_cfg.get("whisper_language", "auto") or "auto").strip()
                     lang_param = None if whisper_lang in ["auto", "", "None", "none"] else whisper_lang
                     lang_display = whisper_lang.upper() if lang_param else "TỰ ĐỘNG (AUTO)"
-                    self.log(f"⚡ Bật phụ đề: Đang dùng Whisper AI [{model_size}], ngôn ngữ [{lang_display}] quét audio {original_audio_path.name}...")
+                    whisper_enhance = bool(sub_cfg.get("whisper_enhance_voice", True))
+                    whisper_vocal_sep = bool(sub_cfg.get("whisper_vocal_separation", True))
+
+                    self.log(
+                        f"⚡ Bật phụ đề: Đang dùng Whisper AI [{model_size}], ngôn ngữ [{lang_display}], "
+                        f"Tách Voice AI (Demucs): [{'Bật' if whisper_vocal_sep else 'Tắt'}], "
+                        f"Từ khóa Context: [{combined_prompt or 'Không'}] quét audio {original_audio_path.name}..."
+                    )
                     auto_srt_path = original_audio_path.with_suffix(".srt")
                     try:
                         raw_sub, detected_lang = transcribe_audio_to_srt(
@@ -173,6 +205,9 @@ class RenderEngine:
                             speed=audio_speed,
                             cancel_event=self.cancel_event,
                             audio_duration=original_duration,
+                            enhance_voice=whisper_enhance,
+                            vocal_separation=whisper_vocal_sep,
+                            initial_prompt=combined_prompt,
                         )
                     except RenderCancelled:
                         raise
@@ -221,21 +256,18 @@ class RenderEngine:
 
                 self.log(f"✔ Đã biên dịch ASS subtitle (Kiểu: {sub_mode_display}, Căn lề: {sub_cfg.get('align', 'center')}) sẵn sàng gắn vào video")
 
-            transition_mode = str(self.settings.get("transition_mode", "fade") or "none")
-            can_single_pass = (
-                transition_mode != "none"
-                and len(clips) > 1
-                and len(clips) <= self._transition_batch_size()
-                and self._has_visual_overlays(sub_ass_file=sub_ass_file)
-            )
+            # LẬP KẾ HOẠCH MEDIA TASKS VÀ KIỂM TRA ĐIỀU KIỆN DIRECT 1-PASS
+            media_tasks = self._plan_media_tasks(media_sequence, render_duration, image_duration, width, height, fps)
+            batch_limit = self._transition_batch_size()
 
-            if can_single_pass:
-                self.progress(50, "Nối transition & gắn overlay (1-pass siêu tốc)")
+            if len(media_tasks) <= batch_limit:
+                self.progress(45, f"Render Direct 1-Pass ({len(media_tasks)} media -> video cuối)")
                 visual_out = job_temp / "visual_video.mp4"
-                self._concat_and_overlay_single_pass(clips, visual_out, clip_durations, width, height, sub_ass_file=sub_ass_file, audio_title=title_to_use)
-                self._delete_temp_files(clips, "clip tạm sau khi nối 1-pass")
+                self._render_direct_single_pass(media_tasks, visual_out, width, height, fps, sub_ass_file=sub_ass_file, audio_title=title_to_use)
                 current_video = visual_out
             else:
+                self.progress(15, "Tạo clip từ ảnh/video (Fallback danh sách nhiều media)")
+                clips, clip_durations = self._create_media_clips(media_sequence, job_temp, width, height, fps, image_duration, render_duration)
                 self.progress(50, "Nối clip thành video nền")
                 base_video = job_temp / "base_video.mp4"
                 self._concat_clips(clips, base_video, clip_durations)
@@ -280,6 +312,9 @@ class RenderEngine:
         except RenderCancelled:
             return RenderResult(audio_file=audio_file, output_file="", success=False, message="Đã dừng bởi người dùng")
         except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.log(f"❌ Render engine error: {exc}")
             return RenderResult(audio_file=audio_file, output_file="", success=False, message=str(exc))
         finally:
             if job_temp is not None:
@@ -373,28 +408,28 @@ class RenderEngine:
         self.log(f"GPU encoder OK: {encoder_name}")
 
     def _target_bitrate_bits(self) -> int:
-        """Bitrate mục tiêu tối ưu cho video Audio/Truyện dài (file nhẹ ~1.2-1.5 GB/2h, render siêu tốc)."""
+        """Bitrate mục tiêu tối ưu cho video chuẩn nét YouTube 1080p và tùy chỉnh người dùng."""
         export = self.settings.get("export", {}) or {}
         quality = str(export.get("quality", "standard") or "standard").lower()
 
         if quality == "custom":
-            custom_kbps = max(500, min(30000, int(export.get("custom_bitrate_kbps", 2200) or 2200)))
+            custom_kbps = max(500, min(50000, int(export.get("custom_bitrate_kbps", 6000) or 6000)))
             return custom_kbps * 1000
 
         base_map = {
-            "economy": 1_500_000,
-            "low": 1_500_000,
-            "draft": 1_500_000,
-            "standard": 2_200_000,
-            "high": 3_500_000,
-            "ultra": 5_500_000,
+            "economy": 2_500_000,
+            "low": 2_500_000,
+            "draft": 2_500_000,
+            "standard": 6_000_000,
+            "high": 10_000_000,
+            "ultra": 16_000_000,
         }
-        base = base_map.get(quality, 2_200_000)
+        base = base_map.get(quality, 6_000_000)
         width = max(1, int(export.get("width", 1080) or 1080))
         height = max(1, int(export.get("height", 1920) or 1920))
         fps = max(1, int(export.get("fps", 30) or 30))
-        # Tối ưu hệ số tỉ lệ theo độ phân giải & FPS (giới hạn trần để tránh phình dung lượng khi FPS cao)
-        res_scale = max(0.35, (width * height) / (1080 * 1920))
+        # Tối ưu hệ số tỉ lệ theo độ phân giải & FPS
+        res_scale = max(0.40, (width * height) / (1080 * 1920))
         fps_scale = min(1.30, max(0.70, fps / 30.0))
         return int(base * res_scale * fps_scale)
 
@@ -405,8 +440,8 @@ class RenderEngine:
     def _video_encode_args(self) -> List[str]:
         encoder = self._encoder()
         quality = str(self.settings.get("export", {}).get("quality", "standard") or "standard").lower()
-        cq_map = {"economy": "30", "low": "30", "draft": "30", "standard": "28", "high": "25", "ultra": "22", "custom": "28"}
-        crf_map = {"economy": "30", "low": "30", "draft": "30", "standard": "27", "high": "24", "ultra": "21", "custom": "27"}
+        cq_map = {"economy": "28", "low": "28", "draft": "28", "standard": "23", "high": "19", "ultra": "16", "custom": "23"}
+        crf_map = {"economy": "28", "low": "28", "draft": "28", "standard": "22", "high": "18", "ultra": "15", "custom": "22"}
         target = self._target_bitrate_bits()
         maxrate = int(target * 1.30)
         bufsize = int(target * 1.60)
@@ -415,25 +450,29 @@ class RenderEngine:
         bs = self._ffmpeg_bitrate(bufsize)
 
         fps = max(1, int(self.settings.get("export", {}).get("fps", 30) or 30))
-        gop = str(fps * 2)  # GOP 2s tối ưu nén khung hình tĩnh / pan-zoom cho truyện audio
+        gop = str(fps * 2)  # GOP 2s tối ưu nén khung hình
 
         if encoder == "nvidia":
             return [
                 "-c:v", "h264_nvenc",
-                "-preset", "p1",
+                "-preset", "p2",
+                "-tune", "hq",
                 "-rc", "vbr",
-                "-cq:v", cq_map.get(quality, "28"),
+                "-cq:v", cq_map.get(quality, "23"),
                 "-b:v", b,
                 "-maxrate", mr,
                 "-bufsize", bs,
                 "-g", gop,
+                "-spatial-aq", "1",
+                "-temporal-aq", "1",
+                "-delay", "0",
                 "-pix_fmt", "yuv420p",
             ]
         if encoder == "intel":
             return [
                 "-c:v", "h264_qsv",
                 "-preset", "veryfast",
-                "-global_quality", cq_map.get(quality, "28"),
+                "-global_quality", cq_map.get(quality, "23"),
                 "-b:v", b,
                 "-maxrate", mr,
                 "-bufsize", bs,
@@ -444,7 +483,7 @@ class RenderEngine:
         if encoder == "amd":
             return [
                 "-c:v", "h264_amf",
-                "-quality", "speed",
+                "-quality", "quality",
                 "-rc", "vbr_peak",
                 "-b:v", b,
                 "-maxrate", mr,
@@ -455,7 +494,7 @@ class RenderEngine:
         args = [
             "-c:v", "libx264",
             "-preset", "veryfast",
-            "-crf", crf_map.get(quality, "27"),
+            "-crf", crf_map.get(quality, "22"),
             "-maxrate", mr,
             "-bufsize", bs,
             "-g", gop,
@@ -468,7 +507,7 @@ class RenderEngine:
 
     def _fallback_cpu_encode_args(self) -> List[str]:
         quality = str(self.settings.get("export", {}).get("quality", "standard") or "standard").lower()
-        crf_map = {"economy": "30", "low": "30", "draft": "30", "standard": "27", "high": "24", "ultra": "21", "custom": "27"}
+        crf_map = {"economy": "28", "low": "28", "draft": "28", "standard": "22", "high": "18", "ultra": "15", "custom": "22"}
         target = self._target_bitrate_bits()
         maxrate = int(target * 1.30)
         bufsize = int(target * 1.60)
@@ -785,8 +824,132 @@ class RenderEngine:
                 f"64 byte đầu: {head}. Chi tiết sửa audio: {exc}"
             ) from exc
 
-    def _create_media_clips(self, media_sequence: List[str], job_temp: Path, width: int, height: int, fps: int, image_duration: float, target_duration: float) -> Tuple[List[Path], List[float]]:
-        tasks: List[Tuple[int, Path, Path, str, float, float]] = []
+    def _probe_video_metadata(self, path: Path) -> Dict[str, Any]:
+        """Đọc metadata chi tiết của video (codec, width, height, fps) bằng ffprobe."""
+        try:
+            cmd = [
+                self.ffprobe,
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name,width,height,r_frame_rate",
+                "-of", "json",
+                str(path),
+            ]
+            res = run_hidden(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore")
+            if res.returncode == 0 and res.stdout:
+                data = json.loads(res.stdout)
+                streams = data.get("streams", [])
+                if streams:
+                    st = streams[0]
+                    codec = str(st.get("codec_name", "")).lower()
+                    w = int(st.get("width", 0) or 0)
+                    h = int(st.get("height", 0) or 0)
+                    fps_str = str(st.get("r_frame_rate", "30/1"))
+                    if "/" in fps_str:
+                        num, den = fps_str.split("/", 1)
+                        fps = float(num) / max(1.0, float(den))
+                    else:
+                        fps = float(fps_str or 30.0)
+                    return {"codec": codec, "width": w, "height": h, "fps": fps}
+        except Exception:
+            pass
+        return {"codec": "", "width": 0, "height": 0, "fps": 30.0}
+
+    def _normalize_source_video_cache(self, src: Path, target_w: int, target_h: int, target_fps: int) -> Path:
+        """Tự động chuẩn hóa video nguồn nặng (AV1 / 60fps / 4K) sang H.264 1080p 30fps đúng 1 lần duy nhất để kích hoạt GPU NVDEC siêu tốc."""
+        meta = self._probe_video_metadata(src)
+        codec = meta.get("codec", "")
+        src_w = meta.get("width", 0)
+        src_h = meta.get("height", 0)
+        src_fps = meta.get("fps", 30.0)
+
+        needs_norm = False
+        reasons = []
+        if codec in {"av1", "libaom-av1", "av01"}:
+            needs_norm = True
+            reasons.append(f"codec {codec} -> H.264")
+        if src_fps > (target_fps + 1.0):
+            needs_norm = True
+            reasons.append(f"fps cao {src_fps:.1f}fps -> {target_fps}fps")
+        if src_w > target_w * 1.5 and src_h > target_h * 1.5 and src_w > 0:
+            needs_norm = True
+            reasons.append(f"độ phân giải {src_w}x{src_h} -> {target_w}x{target_h}")
+
+        if not needs_norm:
+            return src
+
+        perf = self._performance()
+        custom_temp = str(perf.get("temp_folder", "") or "").strip()
+        if custom_temp:
+            root_base = Path(custom_temp)
+            if not root_base.is_absolute():
+                root_base = DATA_DIR / root_base
+            cache_dir = root_base / "_avr_temp" / "_avr_media_cache"
+        else:
+            cache_dir = TEMP_DIR / "_avr_media_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            stat = src.stat()
+            hash_input = f"{src.resolve()}_{stat.st_mtime}_{stat.st_size}_{target_w}_{target_h}_{target_fps}"
+            key = hashlib.md5(hash_input.encode("utf-8")).hexdigest()[:12]
+        except Exception:
+            key = "norm"
+
+        clean_stem = re.sub(r'[^\w\-_\.]', '_', src.stem)[:30]
+        cached_file = cache_dir / f"{clean_stem}_{key}.mp4"
+
+        # Nếu file cache đã tồn tại và hợp lệ, tái sử dụng tức thì 0s
+        if cached_file.exists() and cached_file.stat().st_size > 10240:
+            self.log(f"⚡ Smart Media Cache: Tái sử dụng video nền đã chuẩn hóa H.264 ({cached_file.name})")
+            return cached_file
+
+        self.log(f"⚡ Smart Media Cache: Đang chuẩn hóa video nền '{src.name}' ({', '.join(reasons)}) để kích hoạt GPU NVDEC siêu tốc...")
+        start_t = time.time()
+        temp_out = cache_dir / f"tmp_{uuid.uuid4().hex[:8]}.mp4"
+
+        vf = f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1,fps={target_fps},format=yuv420p"
+        is_nv = self._encoder() == "nvidia"
+        if is_nv:
+            enc_args = ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-rc", "vbr", "-cq:v", "26", "-b:v", "3500k", "-maxrate", "5000k", "-bufsize", "7000k"]
+        else:
+            enc_args = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "22"]
+
+        norm_cmd = [self.ffmpeg, "-y", "-threads", "0", "-i", str(src), "-vf", vf, "-an"] + enc_args + ["-movflags", "+faststart", str(temp_out)]
+
+        try:
+            self._run(
+                norm_cmd,
+                "Chuẩn hóa video nền (Smart Cache)",
+                allow_cpu_fallback=True,
+                fallback_builder=lambda: [self.ffmpeg, "-y", "-threads", "0", "-i", str(src), "-vf", vf, "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-movflags", "+faststart", str(temp_out)],
+            )
+            if temp_out.exists() and temp_out.stat().st_size > 10240:
+                if cached_file.exists():
+                    try:
+                        cached_file.unlink()
+                    except Exception:
+                        pass
+                temp_out.replace(cached_file)
+                elapsed = time.time() - start_t
+                self.log(f"⚡ Smart Media Cache: Chuẩn hóa hoàn tất trong {elapsed:.1f}s -> Các video tiếp theo trong hàng đợi sẽ render với tốc độ GPU NVDEC tối đa!")
+                return cached_file
+            else:
+                if temp_out.exists():
+                    temp_out.unlink()
+                return src
+        except Exception as ex:
+            self.log(f"⚠️ Chuẩn hóa video nền gặp lỗi: {ex}, tiếp tục dùng video gốc.")
+            if temp_out.exists():
+                try:
+                    temp_out.unlink()
+                except Exception:
+                    pass
+            return src
+
+    def _plan_media_tasks(self, media_sequence: List[str], target_duration: float, image_duration: float, width: int = 1080, height: int = 1920, fps: int = 30) -> List[Tuple[int, Path, str, float, float]]:
+        """Lập kế hoạch media clips (idx, src, media_type, duration, speed) mà không ghi file đĩa."""
+        tasks: List[Tuple[int, Path, str, float, float]] = []
         total_seq = len(media_sequence)
         video_speed = self._video_speed()
         transition_mode = str(self.settings.get("transition_mode", "fade") or "none")
@@ -795,20 +958,30 @@ class RenderEngine:
         timeline_duration = 0.0
         target_with_buffer = max(0.5, float(target_duration)) + 0.35
 
+        # Tối ưu siêu tốc: Nếu sequence chỉ dùng 1 file video duy nhất lặp lại,
+        # chỉ cần 1 task duy nhất với duration = target_with_buffer, FFmpeg sẽ stream_loop tự động cực nhẹ!
+        unique_media = list(dict.fromkeys(media_sequence))
+        if len(unique_media) == 1 and is_video(Path(unique_media[0])):
+            src = Path(unique_media[0])
+            src = self._normalize_source_video_cache(src, width, height, fps)
+            tasks.append((1, src, "video", target_with_buffer, video_speed))
+            self.log(f"⚡ Single Video Loop Optimizer: Phát hiện 1 video duy nhất ('{src.name}'), kích hoạt stream loop trực tiếp {target_with_buffer:.2f}s.")
+            return tasks
+
         for idx, media in enumerate(media_sequence, start=1):
             if timeline_duration >= target_with_buffer and tasks:
                 self.log(f"Đã đủ nền theo audio ({timeline_duration:.2f}s/{target_duration:.2f}s), bỏ qua media dư còn lại.")
                 break
 
             src = Path(media)
-            out = job_temp / f"clip_{idx:05d}.mp4"
             if is_image(src):
                 duration = image_duration
                 remaining = target_with_buffer - timeline_duration
                 if remaining > 0 and remaining < duration:
                     duration = max(0.5, remaining + (transition_duration_cfg if transition_enabled else 0.0))
-                tasks.append((idx, src, out, "image", duration, 1.0))
+                tasks.append((idx, src, "image", duration, 1.0))
             elif is_video(src):
+                src = self._normalize_source_video_cache(src, width, height, fps)
                 original_video_duration = get_duration_seconds(src)
                 full_duration = max(0.1, original_video_duration / video_speed)
                 remaining = target_with_buffer - timeline_duration
@@ -817,22 +990,29 @@ class RenderEngine:
                     duration = min(full_duration, duration)
                 else:
                     duration = full_duration
-                tasks.append((idx, src, out, "video", duration, video_speed))
+                tasks.append((idx, src, "video", duration, video_speed))
             else:
                 continue
 
             if len(tasks) == 1:
                 timeline_duration = duration
             else:
-                prev_duration = tasks[-2][4]
+                prev_duration = tasks[-2][3]
                 overlap = self._transition_duration(min(duration, prev_duration)) if transition_enabled else 0.0
                 timeline_duration += max(0.1, duration) - overlap
 
         if not tasks:
-            raise ValueError("Không tạo được clip nào từ danh sách media.")
+            raise ValueError("Không tạo được task media nào từ danh sách file nền.")
+        return tasks
+
+    def _create_media_clips(self, media_sequence: List[str], job_temp: Path, width: int, height: int, fps: int, image_duration: float, target_duration: float) -> Tuple[List[Path], List[float]]:
+        plan_tasks = self._plan_media_tasks(media_sequence, target_duration, image_duration, width, height, fps)
+        tasks: List[Tuple[int, Path, Path, str, float, float]] = [
+            (idx, src, job_temp / f"clip_{idx:05d}.mp4", mtype, dur, spd)
+            for idx, src, mtype, dur, spd in plan_tasks
+        ]
 
         total = len(tasks)
-        # Tối ưu tốc độ: render song song nhiều clip để tận dụng đa nhân CPU + NVENC GPU
         is_gpu = self._encoder() in {"nvidia", "intel", "amd"}
         max_workers = min(3 if is_gpu else max(1, min(2, (os.cpu_count() or 4) // 4)), total)
         self.log(f"Tạo {total} media clips với {max_workers} luồng xử lý song song.")
@@ -1178,6 +1358,30 @@ class RenderEngine:
             else:
                 self.log("Đã bật audio quảng bá nhưng chưa có file hoặc chưa có vị trí chèn hợp lệ.")
 
+        # Lọc tạp âm / triệt tiêu nhạc nền sau 30s đầu (30s đầu giữ nguyên cho Voice Intro / Nhạc mở màn)
+        if self.settings.get("filter_bgm_after_30s", False) and duration > 30.0:
+            self.log("🎙️ Lọc tạp âm/nhạc nền sau 30s: Giữ nguyên 30s đầu (Voice/BGM Intro), lọc dải tần giọng nói từ giây thứ 30 trở đi.")
+            filter_audio_out = job_temp / "audio_filtered_30s.m4a"
+            af_filter_complex = (
+                "[0:a]asplit=2[a_full][a_to_filter];"
+                "[a_to_filter]highpass=f=120,lowpass=f=3800,afftdn=nf=-25,dynaudnorm=f=150:g=15[a_clean];"
+                "[a_full]atrim=0:30,asetpts=PTS-STARTPTS[a_intro];"
+                "[a_clean]atrim=30,asetpts=PTS-STARTPTS[a_body];"
+                "[a_intro][a_body]concat=n=2:v=0:a=1,aresample=48000,aformat=channel_layouts=stereo[a]"
+            )
+            filter_cmd = [
+                self.ffmpeg, "-y", "-i", str(current),
+                "-filter_complex", af_filter_complex,
+                "-map", "[a]", "-t", f"{duration:.6f}",
+                "-c:a", "aac", "-b:a", "192k", str(filter_audio_out),
+            ]
+            try:
+                self._run(filter_cmd, "Lọc nhạc nền sau 30s đầu")
+                self._delete_temp_file(current, "audio trước khi lọc nhạc sau 30s")
+                current = filter_audio_out
+            except Exception as ex:
+                self.log(f"⚠️ Bộ lọc nhạc sau 30s gặp cảnh báo: {ex}, tiếp tục dùng audio hiện tại.")
+
         return current
 
     def _mix_background_music_audio(self, main_audio: Path, music: Path, out: Path, duration: float) -> None:
@@ -1468,20 +1672,62 @@ class RenderEngine:
         ]
         self._run(cmd, "Mix promo audio")
 
-    def _add_intro_outro(self, main_video: Path, intro_file: str, outro_file: str, out: Path, job_temp: Path, width: int, height: int, fps: int) -> None:
-        """Ghép intro/outro theo fast path.
+    def _apply_intro_overlay(self, main_video: Path, intro_file: str, out: Path, job_temp: Path, width: int, height: int, fps: int) -> None:
+        """Đè hình ảnh video Intro lên các giây đầu của video chính với hiệu ứng Fade Out chuyển cảnh mượt mà (Tăng tốc qua GPU NVENC)."""
+        intro_path = Path(intro_file)
+        if not intro_path.exists():
+            if main_video != out:
+                shutil.copyfile(main_video, out)
+            return
 
-        V5.0 cũ chuẩn hóa cả main video rồi concat bằng filter, khiến video chính 40-50 phút
-        bị encode thêm một lần nữa. V5.1 chỉ chuẩn hóa intro/outro nếu cần, giữ nguyên main,
-        sau đó nối bằng stream copy. Nếu copy concat không hợp với file nguồn, mới fallback an toàn.
-        """
+        intro_dur = get_duration_seconds(intro_path)
+        if intro_dur <= 0.1:
+            if main_video != out:
+                shutil.copyfile(main_video, out)
+            return
+
+        fade_dur = min(0.8, max(0.2, intro_dur * 0.2))
+        fade_st = max(0.0, intro_dur - fade_dur)
+        self.log(f"🎬 Chế độ Intro Đè lên đầu MP3: Hiển thị hình ảnh Intro trong {intro_dur:.2f}s đầu (Fade Out {fade_dur:.2f}s), audio MP3 phát từ 0:00...")
+
+        fade_filter = (
+            f"[1:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps={fps},format=rgba,fade=t=out:st={fade_st:.3f}:d={fade_dur:.3f}:alpha=1[fade_intro];"
+            f"[0:v][fade_intro]overlay=0:0:enable='between(t,0,{intro_dur:.3f})':format=auto[vout]"
+        )
+
+        enc_args = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "19", "-b:v", "0"] if self._encoder() == "nvidia" else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]
+        cmd = [
+            self.ffmpeg, "-y",
+            "-i", str(main_video),
+            "-i", str(intro_path),
+            "-filter_complex", fade_filter,
+            "-map", "[vout]",
+            "-map", "0:a?",
+            *enc_args,
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            str(out)
+        ]
+        self._run(cmd, "Hòa trộn Intro Overlay mượt mà lên đầu video")
+
+    def _add_intro_outro(self, main_video: Path, intro_file: str, outro_file: str, out: Path, job_temp: Path, width: int, height: int, fps: int) -> None:
+        """Ghép intro/outro theo fast path hỗ trợ cả 2 chế độ Nối tiếp và Đè lên đầu MP3."""
+        intro_mode = str(self.settings.get("intro_mode", "sequential") or "sequential").lower()
+        current_main = main_video
+
+        # Nếu chọn chế độ Intro Đè lên đầu MP3:
+        # Nếu đã render qua Direct 1-Pass Filtergraph thì bỏ qua không re-encode lại lần 2
+        if intro_file and Path(intro_file).exists() and intro_mode == "overlay":
+            # Đã được tích hợp trực tiếp trong 1-Pass Filtergraph qua GPU NVENC
+            intro_file = ""
+
         segments: List[Path] = []
         prepared_side_segments: List[Path] = []
 
         if intro_file and Path(intro_file).exists():
             intro_ready = self._prepare_intro_outro_segment(
                 src=Path(intro_file),
-                main_video=main_video,
+                main_video=current_main,
                 out=job_temp / "intro_ready.mp4",
                 width=width,
                 height=height,
@@ -1494,13 +1740,12 @@ class RenderEngine:
         elif intro_file:
             self.log(f"Bỏ qua intro vì không tìm thấy file: {intro_file}")
 
-        # Điểm tối ưu quan trọng: main_video KHÔNG bị normalize/encode lại ở fast path.
-        segments.append(main_video)
+        segments.append(current_main)
 
         if outro_file and Path(outro_file).exists():
             outro_ready = self._prepare_intro_outro_segment(
                 src=Path(outro_file),
-                main_video=main_video,
+                main_video=current_main,
                 out=job_temp / "outro_ready.mp4",
                 width=width,
                 height=height,
@@ -1514,7 +1759,10 @@ class RenderEngine:
             self.log(f"Bỏ qua outro vì không tìm thấy file: {outro_file}")
 
         if len(segments) == 1:
-            os.replace(segments[0], out)
+            if segments[0] != out:
+                if out.exists():
+                    out.unlink()
+                shutil.copyfile(segments[0], out)
             return
 
         try:
@@ -1765,6 +2013,233 @@ class RenderEngine:
             return filters["auto_cinematic"]
         return ""
 
+    def _bake_static_layout_canvas(
+        self,
+        layers: List[Dict[str, Any]],
+        width: int,
+        height: int,
+        out_png: Path,
+    ) -> Tuple[List[Dict[str, Any]], Path | None]:
+        """Gộp các layer ảnh tĩnh (PNG/JPG/Watermark/Logo) thành 1 canvas RGBA duy nhất để tối ưu cực hạn tốc độ encode."""
+        from PIL import Image
+
+        static_layers = []
+        for l in layers:
+            l_type = str(l.get("type", "image")).lower()
+            blend = str(l.get("blend_mode", "alpha")).lower()
+            in_eff = str(l.get("in_effect", "none")).lower()
+            out_eff = str(l.get("out_effect", "none")).lower()
+            mot_eff = str(l.get("motion_effect", "none")).lower()
+            has_anim = (in_eff != "none" or out_eff != "none" or mot_eff != "none")
+
+            if l_type in {"image", "banner", "logo", "watermark", "chat_bubble"} and blend in {"alpha", ""} and not has_anim:
+                f_path = str(l.get("file_path", "")).strip()
+                if f_path:
+                    res = self._resolve_asset_path(f_path)
+                    if res and res.exists():
+                        static_layers.append((l, res))
+
+        if len(static_layers) >= 1:
+            try:
+                canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                remaining = []
+                static_ids = {id(l) for l, _ in static_layers}
+
+                for l in layers:
+                    if id(l) in static_ids:
+                        f_path = str(l.get("file_path", "")).strip()
+                        res = self._resolve_asset_path(f_path)
+                        if not res:
+                            continue
+                        with Image.open(res) as src_img:
+                            img = src_img.convert("RGBA")
+                            bx = float(l.get("box_x", 0.0))
+                            by = float(l.get("box_y", 0.0))
+                            bw = float(l.get("box_w", 0.3))
+                            bh = float(l.get("box_h", 0.2))
+
+                            px = int(width * bx)
+                            py = int(height * by)
+                            pw = max(16, int(width * bw))
+                            ph = max(16, int(height * bh))
+                            opacity = float(l.get("opacity", 1.0) if l.get("opacity") is not None else 1.0)
+                            opacity = max(0.0, min(1.0, opacity))
+
+                            scale_mode = str(l.get("scale_mode", "stretch")).lower()
+                            if scale_mode == "fit":
+                                img.thumbnail((pw, ph), Image.Resampling.LANCZOS)
+                                offset_x = px + (pw - img.width) // 2
+                                offset_y = py + (ph - img.height) // 2
+                            elif scale_mode == "crop":
+                                src_ratio = img.width / max(1, img.height)
+                                target_ratio = pw / max(1, ph)
+                                if src_ratio > target_ratio:
+                                    new_w = int(img.height * target_ratio)
+                                    left = (img.width - new_w) // 2
+                                    img = img.crop((left, 0, left + new_w, img.height))
+                                else:
+                                    new_h = int(img.width / target_ratio)
+                                    top = (img.height - new_h) // 2
+                                    img = img.crop((0, top, img.width, top + new_h))
+                                img = img.resize((pw, ph), Image.Resampling.LANCZOS)
+                                offset_x = px
+                                offset_y = py
+                            else:
+                                img = img.resize((pw, ph), Image.Resampling.LANCZOS)
+                                offset_x = px
+                                offset_y = py
+
+                            if opacity < 0.999:
+                                r, g, b, a = img.split()
+                                a = a.point(lambda p: int(p * opacity))
+                                img = Image.merge("RGBA", (r, g, b, a))
+
+                            # Hỗ trợ dán ảnh với tọa độ âm / tràn viền bằng paste(img, pos, mask)
+                            canvas.paste(img, (offset_x, offset_y), img)
+                    else:
+                        remaining.append(l)
+
+                canvas.save(out_png, "PNG")
+                self.log(f"⚡ Canvas Optimizer: Đã gộp {len(static_layers)} layer tĩnh thành 1 ảnh overlay duy nhất.")
+                return remaining, out_png
+            except Exception as ex:
+                self.log(f"⚠️ Canvas Optimizer gặp lỗi: {ex}, tiếp tục xử lý qua FFmpeg từng layer.")
+                return layers, None
+
+        return layers, None
+
+    def _bake_animated_layout_canvas(
+        self,
+        layers: List[Dict[str, Any]],
+        width: int,
+        height: int,
+        temp_dir: Path,
+        fps: int = 30,
+    ) -> Tuple[List[Dict[str, Any]], Path | None]:
+        """Gộp toàn bộ các layer ảnh tĩnh và hoạt họa động (GIF / Reaction / Video Mask / Image)
+        thành 1 luồng video trong suốt ngắn (6.0s, QTRLE RGBA) bảo toàn 100% thứ tự Z-Index và nền trong suốt tuyệt đối."""
+        visual_layers: List[Tuple[Dict[str, Any], Path, str]] = []
+        remaining_layers: List[Dict[str, Any]] = []
+        has_animated = False
+
+        for l in layers:
+            l_type = str(l.get("type", "image")).lower()
+            f_path_raw = str(l.get("file_path", "")).strip()
+            if not f_path_raw:
+                remaining_layers.append(l)
+                continue
+
+            resolved = self._resolve_asset_path(f_path_raw)
+            if not resolved or not resolved.exists():
+                remaining_layers.append(l)
+                continue
+
+            in_eff = str(l.get("in_effect", "none")).lower()
+            out_eff = str(l.get("out_effect", "none")).lower()
+            mot_eff = str(l.get("motion_effect", "none")).lower()
+            has_anim = (in_eff != "none" or out_eff != "none" or mot_eff != "none")
+
+            if l_type in {"gif", "reaction", "video_mask"}:
+                visual_layers.append((l, resolved, l_type))
+                has_animated = True
+            elif l_type in {"image", "banner", "logo", "watermark", "chat_bubble"}:
+                if has_anim:
+                    # Layer có hiệu ứng In/Out/Motion -> Render động trực tiếp qua FFmpeg Filtergraph
+                    remaining_layers.append(l)
+                else:
+                    visual_layers.append((l, resolved, l_type))
+            else:
+                remaining_layers.append(l)
+
+        # Nếu không có layer thị giác nào: giữ nguyên danh sách
+        if not visual_layers:
+            return layers, None
+
+        canvas_png = temp_dir / "static_layout_canvas.png"
+
+        # Nếu không có layer động nào (chỉ toàn ảnh tĩnh): dùng Pillow gộp siêu tốc 0.03s
+        if not has_animated:
+            return self._bake_static_layout_canvas(layers, width, height, canvas_png)
+
+        # Nếu CÓ layer động (GIF / Reaction / Video Mask):
+        # Tạo file video trong suốt ngắn (6.0s) bảo toàn 100% thứ tự Z-Index của tất cả layer
+        anim_mov = temp_dir / "animated_layout_canvas.mov"
+        anim_dur = 6.0  # 6 giây là chu kỳ lặp hoàn hảo cho GIF hoạt họa
+
+        # Khởi tạo nền hoàn toàn trong suốt tuyệt đối bằng RGBA 0x00000000
+        cmd = [
+            self.ffmpeg, "-y", "-threads", "0",
+            "-f", "lavfi", "-i", f"color=c=0x00000000:s={width}x{height}:d={anim_dur}:r={fps},format=rgba"
+        ]
+        filters: List[str] = [f"[0:v]format=rgba[c_base]"]
+        last_lbl = "[c_base]"
+        in_idx = 1
+
+        for layer, resolved, l_type in visual_layers:
+            if l_type in {"gif", "reaction"}:
+                cmd += ["-ignore_loop", "0", "-t", str(anim_dur), "-i", str(resolved)]
+            elif l_type == "video_mask":
+                cmd += ["-stream_loop", "-1", "-t", str(anim_dur), "-i", str(resolved)]
+            else:  # image, logo, banner, watermark...
+                cmd += ["-loop", "1", "-t", str(anim_dur), "-i", str(resolved)]
+
+            bx = float(layer.get("box_x", 0.0))
+            by = float(layer.get("box_y", 0.0))
+            bw = float(layer.get("box_w", 0.3))
+            bh = float(layer.get("box_h", 0.2))
+            px = int(width * bx)
+            py = int(height * by)
+            pw = max(16, int(width * bw))
+            ph = max(16, int(height * bh))
+            opacity = max(0.0, min(1.0, float(layer.get("opacity", 1.0) if layer.get("opacity") is not None else 1.0)))
+            blend_mode = str(layer.get("blend_mode", "alpha")).lower()
+
+            scale_mode = str(layer.get("scale_mode", "stretch")).lower()
+            if scale_mode == "fit":
+                fchain = [f"scale={pw}:{ph}:force_original_aspect_ratio=decrease,pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black@0,fps={fps},format=rgba"]
+            elif scale_mode == "crop":
+                fchain = [f"scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph},fps={fps},format=rgba"]
+            else:
+                fchain = [f"scale={pw}:{ph},fps={fps},format=rgba"]
+
+            if blend_mode in {"colorkey_black", "screen"}:
+                fchain.append("colorkey=0x000000:0.15:0.1")
+            if opacity < 0.999:
+                fchain.append(f"colorchannelmixer=aa={opacity:.2f}")
+
+            in_lbl = f"[a_in_{in_idx}]"
+            out_lbl = f"[a_v_{in_idx}]"
+            filters.append(f"[{in_idx}:v]{','.join(fchain)}{in_lbl}")
+            filters.append(f"{last_lbl}{in_lbl}overlay={px}:{py}:format=auto{out_lbl}")
+            last_lbl = out_lbl
+            in_idx += 1
+
+        cmd += [
+            "-filter_complex", ";".join(filters),
+            "-map", last_lbl,
+            "-t", str(anim_dur),
+            "-c:v", "qtrle",
+            "-pix_fmt", "argb",
+            str(anim_mov),
+        ]
+
+        try:
+            start_bake = time.time()
+            self._run(
+                cmd,
+                "Pre-bake Animated Layout Canvas",
+                allow_cpu_fallback=True,
+            )
+            if anim_mov.exists() and anim_mov.stat().st_size > 10240:
+                elapsed = time.time() - start_bake
+                self.log(f"⚡ Layout Animation Optimizer: Đã nén trước {len(visual_layers)} layer theo đúng Z-Index thành 1 luồng video trong suốt ({anim_dur:.1f}s) trong {elapsed:.1f}s!")
+                return remaining_layers, anim_mov
+        except Exception as ex:
+            self.log(f"⚠️ Layout Animation Optimizer gặp lỗi: {ex}, tiếp tục xử lý qua FFmpeg từng layer.")
+
+        # Fallback về static canvas nếu anim mov thất bại
+        return self._bake_static_layout_canvas(layers, width, height, canvas_png)
+
     def _build_visual_layers_filtergraph(
         self,
         cmd: List[str],
@@ -1775,6 +2250,8 @@ class RenderEngine:
         height: int,
         sub_ass_file: Path | None = None,
         audio_title: str = "",
+        temp_dir: Path | None = None,
+        fps: int = 30,
     ) -> Tuple[str, int]:
         """Tạo chuỗi filtergraph cho toàn bộ các layer (Layout Studio multi-layer) hoặc fallback cũ."""
         last = base_label
@@ -1783,11 +2260,25 @@ class RenderEngine:
 
         layout_studio = self.settings.get("layout_studio", {}) or {}
         studio_enabled = bool(layout_studio.get("enabled", True))
-        layers = [l for l in (layout_studio.get("layers", []) or []) if isinstance(l, dict) and l.get("enabled", True)]
+        raw_layers = [l for l in (layout_studio.get("layers", []) or []) if isinstance(l, dict) and l.get("enabled", True)]
         sub_rendered = False
 
         # Nếu có danh sách layers được cấu hình trong Studio Layout:
-        if studio_enabled and len(layers) > 0:
+        if studio_enabled and len(raw_layers) > 0:
+            if temp_dir:
+                layers, baked_asset = self._bake_static_layout_canvas(raw_layers, width, height, temp_dir / "static_layout_canvas.png")
+                if baked_asset and baked_asset.exists():
+                    cmd += ["-i", str(baked_asset)]
+                    in_lbl = f"[layer_in_{stage}]"
+                    out_lbl = f"[layer_v_{stage}]"
+                    filters.append(f"[{input_index}:v]format=rgba{in_lbl}")
+                    filters.append(f"{last}{in_lbl}overlay=0:0:format=auto{out_lbl}")
+                    last = out_lbl
+                    input_index += 1
+                    stage += 1
+            else:
+                layers = raw_layers
+
             for layer in layers:
                 l_type = str(layer.get("type", "image")).lower()
                 l_name = str(layer.get("name", "Layer"))
@@ -1795,14 +2286,14 @@ class RenderEngine:
                 opacity = max(0.0, min(1.0, opacity))
                 blend_mode = str(layer.get("blend_mode", "alpha"))
 
-                # Tọa độ chuẩn hóa 0.0 -> 1.0
+                # Tọa độ chuẩn hóa (hỗ trợ âm / tràn viền)
                 bx = float(layer.get("box_x", 0.0))
                 by = float(layer.get("box_y", 0.0))
                 bw = float(layer.get("box_w", 0.3))
                 bh = float(layer.get("box_h", 0.2))
 
-                px = max(0, int(width * bx))
-                py = max(0, int(height * by))
+                px = int(width * bx)
+                py = int(height * by)
                 pw = max(16, int(width * bw))
                 ph = max(16, int(height * bh))
 
@@ -1826,19 +2317,53 @@ class RenderEngine:
 
                     scale_mode = str(layer.get("scale_mode", "stretch")).lower()
                     if scale_mode == "fit":
-                        filter_chain = [f"scale={pw}:{ph}:force_original_aspect_ratio=decrease,pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black@0,format=rgba"]
+                        filter_chain = [f"scale={pw}:{ph}:force_original_aspect_ratio=decrease,pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black@0,fps={fps},format=rgba"]
                     elif scale_mode == "crop":
-                        filter_chain = [f"scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph},format=rgba"]
+                        filter_chain = [f"scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph},fps={fps},format=rgba"]
                     else:  # stretch (mặc định khớp khung kéo)
-                        filter_chain = [f"scale={pw}:{ph},format=rgba"]
+                        filter_chain = [f"scale={pw}:{ph},fps={fps},format=rgba"]
 
                     if blend_mode in {"colorkey_black", "screen"}:
                         filter_chain.append("colorkey=0x000000:0.15:0.1")
                     if opacity < 0.999:
                         filter_chain.append(f"colorchannelmixer=aa={opacity:.2f}")
 
+                    in_eff = str(layer.get("in_effect", "none")).lower()
+                    in_dur = max(0.2, min(5.0, float(layer.get("in_duration", 0.8) or 0.8)))
+                    mot_eff = str(layer.get("motion_effect", "none")).lower()
+
+                    if in_eff == "fade_in":
+                        filter_chain.append(f"fade=t=in:st=0:d={in_dur:.2f}:alpha=1")
+
+                    x_expr = str(px)
+                    y_expr = str(py)
+                    has_spatial_anim = False
+
+                    if in_eff == "slide_left":
+                        x_expr = f"if(lte(t,{in_dur:.2f}), {px}-({pw}*(1-t/{in_dur:.2f})), {px})"
+                        has_spatial_anim = True
+                    elif in_eff == "slide_right":
+                        x_expr = f"if(lte(t,{in_dur:.2f}), {px}+({pw}*(1-t/{in_dur:.2f})), {px})"
+                        has_spatial_anim = True
+                    elif in_eff == "slide_up":
+                        y_expr = f"if(lte(t,{in_dur:.2f}), {py}+({ph}*(1-t/{in_dur:.2f})), {py})"
+                        has_spatial_anim = True
+                    elif in_eff == "slide_down":
+                        y_expr = f"if(lte(t,{in_dur:.2f}), {py}-({ph}*(1-t/{in_dur:.2f})), {py})"
+                        has_spatial_anim = True
+
+                    if mot_eff == "float":
+                        y_expr = f"({y_expr})+5*sin(2*PI*t/3)"
+                        has_spatial_anim = True
+                    elif mot_eff == "pulse":
+                        y_expr = f"({y_expr})+2*sin(2*PI*t/2)"
+                        has_spatial_anim = True
+
                     filters.append(f"[{input_index}:v]{','.join(filter_chain)}{in_lbl}")
-                    filters.append(f"{last}{in_lbl}overlay={px}:{py}:format=auto{out_lbl}")
+                    if has_spatial_anim:
+                        filters.append(f"{last}{in_lbl}overlay=x='{x_expr}':y='{y_expr}':eval=frame:format=auto{out_lbl}")
+                    else:
+                        filters.append(f"{last}{in_lbl}overlay={px}:{py}:format=auto{out_lbl}")
                     last = out_lbl
                     input_index += 1
                     stage += 1
@@ -1865,13 +2390,15 @@ class RenderEngine:
                     font_file = self._find_font_file_by_name(font_name, font_bold, font_italic)
 
                     # Tự động ngắt dòng và co kích thước chữ vừa vặn hoàn hảo trong ô
+                    layer_spacing = int(layer.get("line_spacing", 4) or 4)
                     wrapped_content, fitted_font_size = self._wrap_text_for_box(
                         text=content,
                         font_file=font_file,
                         font_size=font_size,
                         max_w=pw,
                         max_h=ph,
-                        line_spacing=8,
+                        line_spacing=layer_spacing,
+                        max_lines=2,
                     )
 
                     font_color_raw = str(layer.get("font_color", "#FFFFFF")).strip()
@@ -1885,21 +2412,67 @@ class RenderEngine:
                     bg_box_enabled = bool(layer.get("bg_box_enabled", False)) and (bg_color_raw.lower() not in {"none", "transparent", ""})
                     bg_opacity = float(layer.get("bg_box_opacity", 0.5) if layer.get("bg_box_opacity") is not None else 0.5)
 
+                    in_eff = str(layer.get("in_effect", "none")).lower()
+                    in_dur = max(0.2, min(5.0, float(layer.get("in_duration", 0.8) or 0.8)))
+                    mot_eff = str(layer.get("motion_effect", "none")).lower()
+
                     font_align = str(layer.get("align", "center")).lower()
                     if font_align == "center":
-                        pos_expr = f"x={px}+({pw}-text_w)/2:y={py}+({ph}-text_h)/2"
+                        base_x = f"{px}+({pw}-text_w)/2"
+                        base_y = f"{py}+({ph}-text_h)/2"
                     elif font_align == "right":
-                        pos_expr = f"x={px}+{pw}-text_w:y={py}+({ph}-text_h)/2"
+                        base_x = f"{px}+{pw}-text_w"
+                        base_y = f"{py}+({ph}-text_h)/2"
                     else:  # left
-                        pos_expr = f"x={px}:y={py}+({ph}-text_h)/2"
+                        base_x = f"{px}"
+                        base_y = f"{py}+({ph}-text_h)/2"
+
+                    x_pos = base_x
+                    y_pos = base_y
+                    has_anim_pos = False
+
+                    if in_eff == "slide_up":
+                        y_pos = f"if(lte(t,{in_dur:.2f}), ({base_y})+({ph}*(1-t/{in_dur:.2f})), ({base_y}))"
+                        has_anim_pos = True
+                    elif in_eff == "slide_down":
+                        y_pos = f"if(lte(t,{in_dur:.2f}), ({base_y})-({ph}*(1-t/{in_dur:.2f})), ({base_y}))"
+                        has_anim_pos = True
+                    elif in_eff == "slide_left":
+                        x_pos = f"if(lte(t,{in_dur:.2f}), ({base_x})-({pw}*(1-t/{in_dur:.2f})), ({base_x}))"
+                        has_anim_pos = True
+                    elif in_eff == "slide_right":
+                        x_pos = f"if(lte(t,{in_dur:.2f}), ({base_x})+({pw}*(1-t/{in_dur:.2f})), ({base_x}))"
+                        has_anim_pos = True
+
+                    if mot_eff == "float":
+                        y_pos = f"({y_pos})+4*sin(2*PI*t/3)"
+                        has_anim_pos = True
+                    elif mot_eff == "pulse":
+                        y_pos = f"({y_pos})+2*sin(2*PI*t/2)"
+                        has_anim_pos = True
+
+                    if has_anim_pos:
+                        pos_expr = f"x='{x_pos}':y='{y_pos}'"
+                    else:
+                        pos_expr = f"x={base_x}:y={base_y}"
+
+                    eff_spacing = layer_spacing
+                    if fitted_font_size >= 60:
+                        eff_spacing = max(-35, layer_spacing - int(fitted_font_size * 0.20))
+                    elif fitted_font_size >= 35:
+                        eff_spacing = max(-20, layer_spacing - int(fitted_font_size * 0.10))
 
                     dt_parts = [
                         f"text='{self._escape_drawtext(wrapped_content)}'",
                         f"fontsize={fitted_font_size}",
                         f"fontcolor={font_color}",
                         pos_expr,
-                        f"line_spacing=8",
+                        f"line_spacing={eff_spacing}",
                     ]
+
+                    if in_eff == "fade_in":
+                        dt_parts.append(f"alpha='if(lte(t,{in_dur:.2f}), t/{in_dur:.2f}, 1)'")
+
                     if has_outline:
                         border_color = self._normalize_ffmpeg_color(outline_color_raw)
                         dt_parts.append(f"borderw={int(round(outline_width))}")
@@ -2049,11 +2622,34 @@ class RenderEngine:
             last = out_label
             stage += 1
 
+        # TÍCH HỢP INTRO OVERLAY VÀO 1-PASS FILTERGRAPH Ở LỚP CAO NHẤT (PHỦ TOÀN BỘ LAYOUT & SUBTITLE CHO ĐẾN KHI FADE OUT)
+        intro_file = self.settings.get("intro_file") or ""
+        intro_mode = str(self.settings.get("intro_mode", "sequential") or "sequential").lower()
+        if intro_file and Path(intro_file).exists() and intro_mode == "overlay":
+            intro_path = Path(intro_file)
+            intro_dur = get_duration_seconds(intro_path)
+            if intro_dur > 0.1:
+                cmd += ["-i", str(intro_path)]
+                out_intro = f"[intro_fade_{stage}]"
+                out_lbl = f"[intro_v_{stage}]"
+                fade_dur = min(0.8, max(0.2, intro_dur * 0.2))
+                fade_st = max(0.0, intro_dur - fade_dur)
+                filters.append(
+                    f"[{input_index}:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps={fps},format=rgba,fade=t=out:st={fade_st:.3f}:d={fade_dur:.3f}:alpha=1{out_intro}"
+                )
+                filters.append(
+                    f"{last}{out_intro}overlay=0:0:enable='between(t,0,{intro_dur:.3f})':format=auto{out_lbl}"
+                )
+                last = out_lbl
+                input_index += 1
+                stage += 1
+
         return last, input_index
 
     def _apply_visual_overlays(self, video: Path, out: Path, width: int, height: int, sub_ass_file: Path | None = None, audio_title: str = "") -> None:
         """Gộp visual overlays (Layout Studio đa tầng / Watermark / Logo / Text / Mask) vào một lần encode video."""
-        cmd = [self.ffmpeg, "-y", "-i", str(video)]
+        fps = int(self.settings.get("export", {}).get("fps", 30) or 30)
+        cmd = [self.ffmpeg, "-y", "-threads", "0", "-i", str(video)]
         filters: List[str] = []
 
         last, _ = self._build_visual_layers_filtergraph(
@@ -2065,6 +2661,8 @@ class RenderEngine:
             height=height,
             sub_ass_file=sub_ass_file,
             audio_title=audio_title,
+            temp_dir=out.parent,
+            fps=fps,
         )
 
         filters.append(f"{last}format=yuv420p[v]")
@@ -2075,6 +2673,114 @@ class RenderEngine:
 
         self._run(build(self._video_encode_args()), "Visual overlay 1 pass", True, lambda: build(self._fallback_cpu_encode_args()))
 
+    def _render_direct_single_pass(
+        self,
+        tasks: List[Tuple[int, Path, str, float, float]],
+        out: Path,
+        width: int,
+        height: int,
+        fps: int,
+        sub_ass_file: Path | None = None,
+        audio_title: str = "",
+    ) -> None:
+        """Render trực tiếp từ ảnh/video nguồn + transitions + visual overlays + phụ đề ASS chỉ trong 1 pass duy nhất."""
+        cmd = [self.ffmpeg, "-y", "-threads", "0"]
+        filters: List[str] = []
+        is_cuda_hwaccel = self._encoder() == "nvidia"
+
+        if len(tasks) == 1:
+            idx, src, media_type, duration, speed = tasks[0]
+            if media_type == "image":
+                cmd += ["-framerate", str(fps), "-loop", "1", "-i", str(src)]
+                vf = self._image_effect_filter(width, height, fps, duration, 1)
+                filters.append(f"[0:v]{vf},trim=duration={duration:.6f},setpts=PTS-STARTPTS[base_bg]")
+            else:
+                if is_cuda_hwaccel:
+                    cmd += ["-hwaccel", "cuda", "-stream_loop", "-1", "-i", str(src)]
+                else:
+                    cmd += ["-stream_loop", "-1", "-i", str(src)]
+                base_vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps={fps}"
+                if abs(speed - 1.0) > 0.001:
+                    base_vf = f"setpts=PTS/{speed:.6f},{base_vf}"
+                fx_enabled = bool(self.settings.get("video_effect_enabled", False))
+                extra_fx = self._video_effect_filter(width, height, fps, duration, 1) if fx_enabled else ""
+                if extra_fx:
+                    base_vf = f"{base_vf},{extra_fx}"
+                filters.append(f"[0:v]{base_vf},trim=duration={duration:.6f},setpts=PTS-STARTPTS[base_bg]")
+
+            total_duration = duration
+            input_index_start = 1
+        else:
+            for i, (idx, src, media_type, duration, speed) in enumerate(tasks):
+                if media_type == "image":
+                    cmd += ["-framerate", str(fps), "-loop", "1", "-t", f"{duration:.6f}", "-i", str(src)]
+                    vf = self._image_effect_filter(width, height, fps, duration, idx)
+                    filters.append(f"[{i}:v]{vf},trim=duration={duration:.6f},setpts=PTS-STARTPTS[v_clip_{i}]")
+                else:
+                    if is_cuda_hwaccel:
+                        cmd += ["-hwaccel", "cuda", "-i", str(src)]
+                    else:
+                        cmd += ["-i", str(src)]
+                    base_vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps={fps}"
+                    if abs(speed - 1.0) > 0.001:
+                        base_vf = f"setpts=PTS/{speed:.6f},{base_vf}"
+                    fx_enabled = bool(self.settings.get("video_effect_enabled", False))
+                    extra_fx = self._video_effect_filter(width, height, fps, duration, idx) if fx_enabled else ""
+                    if extra_fx:
+                        base_vf = f"{base_vf},{extra_fx}"
+                    filters.append(f"[{i}:v]{base_vf},trim=duration={duration:.6f},setpts=PTS-STARTPTS[v_clip_{i}]")
+
+            transition_mode = str(self.settings.get("transition_mode", "fade") or "none")
+            durations = [t[3] for t in tasks]
+            if transition_mode != "none":
+                transition_duration = self._transition_duration(min(durations) if durations else 0.0)
+                selected_transitions = self._transition_sequence(transition_mode, max(1, len(tasks) - 1))
+                prev = "[v_clip_0]"
+                timeline_duration = max(0.1, durations[0])
+                for idx_trans in range(1, len(tasks)):
+                    trans = selected_transitions[idx_trans - 1]
+                    offset = max(0.05, timeline_duration - transition_duration)
+                    out_label = f"[v_xf_{idx_trans}]" if idx_trans < len(tasks) - 1 else "[base_bg]"
+                    filters.append(
+                        f"{prev}[v_clip_{idx_trans}]xfade=transition={trans}:duration={transition_duration:.2f}:offset={offset:.2f}{out_label}"
+                    )
+                    timeline_duration = timeline_duration + max(0.1, durations[idx_trans]) - transition_duration
+                    prev = out_label
+                total_duration = timeline_duration
+            else:
+                concat_inputs = "".join(f"[v_clip_{i}]" for i in range(len(tasks)))
+                filters.append(f"{concat_inputs}concat=n={len(tasks)}:v=1:a=0[base_bg]")
+                total_duration = sum(durations)
+
+            input_index_start = len(tasks)
+
+        last, _ = self._build_visual_layers_filtergraph(
+            cmd=cmd,
+            filters=filters,
+            base_label="[base_bg]",
+            input_index_start=input_index_start,
+            width=width,
+            height=height,
+            sub_ass_file=sub_ass_file,
+            audio_title=audio_title,
+            temp_dir=out.parent,
+            fps=fps,
+        )
+        filters.append(f"{last}format=yuv420p[v]")
+
+        script_file = out.parent / f"{out.stem}_direct_1pass_filter.txt"
+        script_file.write_text(";".join(filters), encoding="utf-8")
+
+        def build(args: List[str]) -> List[str]:
+            return cmd + ["-filter_complex_script", str(script_file), "-map", "[v]", "-an", "-t", f"{total_duration:.6f}"] + args + ["-movflags", "+faststart", str(out)]
+
+        def build_cpu() -> List[str]:
+            cpu_cmd = [part for part in cmd if part not in {"-hwaccel", "cuda"}]
+            return cpu_cmd + ["-filter_complex_script", str(script_file), "-map", "[v]", "-an", "-t", f"{total_duration:.6f}"] + self._fallback_cpu_encode_args() + ["-movflags", "+faststart", str(out)]
+
+        stage_name = f"Render Direct 1-Pass ({len(tasks)} media -> video cuối)"
+        self._run(build(self._video_encode_args()), stage_name, True, build_cpu)
+
     def _concat_and_overlay_single_pass(
         self,
         clips: List[Path],
@@ -2084,6 +2790,7 @@ class RenderEngine:
         height: int,
         sub_ass_file: Path | None = None,
         audio_title: str = "",
+        fps: int = 30,
     ) -> None:
         """Gộp XFade transitions và toàn bộ visual overlays (Layout Studio đa tầng) thành 1 pass duy nhất."""
         transition_mode = str(self.settings.get("transition_mode", "fade") or "none")
@@ -2103,7 +2810,7 @@ class RenderEngine:
             timeline_duration = timeline_duration + max(0.1, clip_durations[idx]) - transition_duration
             prev = out_label
 
-        cmd = [self.ffmpeg, "-y"]
+        cmd = [self.ffmpeg, "-y", "-threads", "0"]
         for clip in clips:
             cmd += ["-i", str(clip)]
 
@@ -2116,6 +2823,8 @@ class RenderEngine:
             height=height,
             sub_ass_file=sub_ass_file,
             audio_title=audio_title,
+            temp_dir=out.parent,
+            fps=fps,
         )
 
         filters.append(f"{last}format=yuv420p[v]")
@@ -2317,14 +3026,81 @@ class RenderEngine:
 
     @staticmethod
     def _find_font_file_by_name(font_name: str, bold: bool = False, italic: bool = False) -> Path | None:
-        font_clean = font_name.lower().strip()
+        if not font_name:
+            return RenderEngine._default_font_file()
+
+        font_clean = font_name.strip()
+        font_clean_lower = font_clean.lower()
         win_fonts = Path("C:/Windows/Fonts")
+
+        # 1. Tra cứu tự động từ Windows Font Registry (Chuẩn xác 100% cho mọi font chữ hệ thống & font cài thêm)
+        try:
+            import winreg
+
+            reg_roots = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+            ]
+            font_candidates: List[Tuple[str, Path]] = []
+            for hkey, subkey in reg_roots:
+                try:
+                    with winreg.OpenKey(hkey, subkey) as key:
+                        num_values = winreg.QueryInfoKey(key)[1]
+                        for i in range(num_values):
+                            val_name, val_data, _ = winreg.EnumValue(key, i)
+                            clean_val = re.sub(r"\s*\((TrueType|OpenType|All type)\)", "", str(val_name), flags=re.IGNORECASE).strip().lower()
+                            file_p = Path(str(val_data))
+                            if not file_p.is_absolute():
+                                file_p = win_fonts / val_data
+                            if file_p.exists():
+                                font_candidates.append((clean_val, file_p))
+                except Exception:
+                    pass
+
+            target_style = font_clean_lower
+            if bold and italic:
+                target_style += " bold italic"
+            elif bold:
+                target_style += " bold"
+            elif italic:
+                target_style += " italic"
+
+            # Tìm khớp chính xác tên + style
+            for name, fpath in font_candidates:
+                if name == target_style:
+                    return fpath
+
+            # Tìm khớp chính xác tên font
+            for name, fpath in font_candidates:
+                if name == font_clean_lower:
+                    return fpath
+
+            # Tìm chứa chuỗi tên font (khớp style)
+            for name, fpath in font_candidates:
+                if font_clean_lower in name:
+                    if bold and "bold" in name:
+                        return fpath
+                    elif italic and "italic" in name:
+                        return fpath
+                    elif not bold and not italic and "bold" not in name and "italic" not in name:
+                        return fpath
+
+            for name, fpath in font_candidates:
+                if font_clean_lower in name:
+                    return fpath
+        except Exception:
+            pass
+
+        # 2. Bảng mapping mở rộng cho các font phổ biến
         if win_fonts.exists():
             mapping = {
                 "arial": "arialbd.ttf" if bold else ("ariali.ttf" if italic else "arial.ttf"),
                 "times new roman": "timesbd.ttf" if bold else ("timesi.ttf" if italic else "times.ttf"),
                 "tahoma": "tahomabd.ttf" if bold else "tahoma.ttf",
                 "segoe ui": "segoeuib.ttf" if bold else ("segoeuii.ttf" if italic else "segoeui.ttf"),
+                "segoe script": "segoescb.ttf" if bold else "segoesc.ttf",
+                "brush script mt": "BRUSHSCI.TTF",
+                "brush script": "BRUSHSCI.TTF",
                 "calibri": "calibrib.ttf" if bold else ("calibrii.ttf" if italic else "calibri.ttf"),
                 "consolas": "consolab.ttf" if bold else ("consolai.ttf" if italic else "consola.ttf"),
                 "comic sans ms": "comicbd.ttf" if bold else "comic.ttf",
@@ -2332,17 +3108,38 @@ class RenderEngine:
                 "georgia": "georgiab.ttf" if bold else ("georgiai.ttf" if italic else "georgia.ttf"),
                 "impact": "impact.ttf",
                 "trebuchet ms": "trebucbd.ttf" if bold else "trebuc.ttf",
+                "monotype corsiva": "MTCORSVA.TTF",
+                "lucida handwriting": "LHANDW.TTF",
+                "chiller": "CHILLER.TTF",
+                "freestyle script": "FREESCPT.TTF",
+                "kristen itc": "ITCKRIST.TTF",
+                "mistral": "MISTRAL.TTF",
+                "papyrus": "PAPYRUS.TTF",
             }
-            if font_clean in mapping:
-                f_path = win_fonts / mapping[font_clean]
+            if font_clean_lower in mapping:
+                f_path = win_fonts / mapping[font_clean_lower]
                 if f_path.exists():
                     return f_path
+
+            # 3. Quét trực tiếp file stem trong C:/Windows/Fonts
             for f in win_fonts.glob("*.ttf"):
-                if font_clean in f.stem.lower():
+                if font_clean_lower in f.stem.lower():
                     return f
             for f in win_fonts.glob("*.otf"):
-                if font_clean in f.stem.lower():
+                if font_clean_lower in f.stem.lower():
                     return f
+
+        # 4. Quét thư mục assets/fonts của ứng dụng nếu có
+        try:
+            from .paths import APP_ROOT
+            app_fonts = APP_ROOT / "assets" / "fonts"
+            if app_fonts.exists():
+                for f in app_fonts.glob("*.*"):
+                    if f.suffix.lower() in {".ttf", ".otf"} and font_clean_lower in f.stem.lower():
+                        return f
+        except Exception:
+            pass
+
         return RenderEngine._default_font_file()
 
     @staticmethod
@@ -2378,14 +3175,15 @@ class RenderEngine:
         font_size: int,
         max_w: int,
         max_h: int,
-        line_spacing: int = 8,
-        min_font_size: int = 18
+        line_spacing: int = 4,
+        min_font_size: int = 16,
+        max_lines: int = 2,
     ) -> tuple[str, int]:
         """
-        Tự động ngắt dòng thông minh (word-wrap) theo chiều rộng bounding box của layer
-        và tự động co nhỏ font_size nếu chiều cao các dòng vượt quá bounding box.
+        Tự động ngắt dòng theo ranh giới từ (không xé đôi từ, không ngắt ở dấu gạch nối)
+        và tự động co nhỏ font_size sao cho tiêu đề nằm vừa vặn hoàn hảo trong tối đa `max_lines` dòng (mặc định 2 dòng)
+        và không vượt quá chiều rộng/chiều cao của Bounding Box (tính chính xác Line Height, Ascent, Descent, Line Spacing).
         """
-        import textwrap
         from PIL import ImageFont, ImageDraw, Image
 
         clean_text = cls._clean_title_text(text)
@@ -2393,7 +3191,7 @@ class RenderEngine:
             return "", font_size
 
         avail_w = max(40, int(max_w * 0.94))
-        avail_h = max(24, int(max_h * 0.92))
+        avail_h = max(24, int(max_h * 0.90))
 
         cur_font_size = int(font_size)
         dummy_img = Image.new("RGB", (1, 1))
@@ -2413,6 +3211,8 @@ class RenderEngine:
                 font = None
 
             def get_w(s: str) -> int:
+                if not s:
+                    return 0
                 if font and hasattr(draw, "textbbox"):
                     bbox = draw.textbbox((0, 0), s, font=font)
                     return bbox[2] - bbox[0]
@@ -2421,37 +3221,58 @@ class RenderEngine:
                 else:
                     return int(len(s) * cur_font_size * 0.55)
 
-            def get_h(s: str) -> int:
+            def get_line_h() -> int:
+                if font and hasattr(font, "getmetrics"):
+                    ascent, descent = font.getmetrics()
+                    return ascent + descent
                 if font and hasattr(draw, "textbbox"):
-                    bbox = draw.textbbox((0, 0), s, font=font)
+                    bbox = draw.textbbox((0, 0), "ÁyTgjpqQ|", font=font)
                     return bbox[3] - bbox[1]
-                return cur_font_size
+                return int(cur_font_size * 1.25)
 
-            avg_char_w = max(1, get_w("M") or int(cur_font_size * 0.55))
-            chars_per_line = max(8, avail_w // avg_char_w)
+            # Ngắt dòng theo từ ngữ nguyên vẹn (Word Wrapping chuẩn xác từng pixel)
+            words = clean_text.split()
+            raw_lines: List[str] = []
+            cur_line = ""
 
-            lines = []
-            for paragraph in clean_text.splitlines():
-                if not paragraph.strip():
-                    continue
-                wrapped = textwrap.wrap(paragraph, width=chars_per_line, break_long_words=True)
-                lines.extend(wrapped)
+            for w in words:
+                test_line = f"{cur_line} {w}".strip() if cur_line else w
+                if get_w(test_line) <= avail_w:
+                    cur_line = test_line
+                else:
+                    if cur_line:
+                        raw_lines.append(cur_line)
+                    cur_line = w
+            if cur_line:
+                raw_lines.append(cur_line)
 
-            all_fit_w = all(get_w(l) <= avail_w for l in lines)
-            if not all_fit_w and chars_per_line > 8:
-                lines = []
-                for paragraph in clean_text.splitlines():
-                    wrapped = textwrap.wrap(paragraph, width=max(8, chars_per_line - 4), break_long_words=True)
-                    lines.extend(wrapped)
+            # Dọn dẹp ký tự ngăn cách ở đầu/cuối dòng (chống rớt dấu |, -, :, ;, /, \ xuống đầu dòng mới)
+            lines: List[str] = []
+            for idx, l in enumerate(raw_lines):
+                l_clean = l.strip()
+                if idx > 0:
+                    l_clean = re.sub(r"^[\|\-:\;/\\]+\s*", "", l_clean).strip()
+                l_clean = re.sub(r"\s*[\|\-:\;/\\]+$", "", l_clean).strip()
+                if l_clean:
+                    lines.append(l_clean)
 
-            total_h = sum(get_h(l) for l in lines) + (len(lines) - 1) * line_spacing
+            line_h = get_line_h()
+            # Bù trừ line_spacing cho font lớn để 2 dòng ôm sát nhau chuẩn poster
+            eff_spacing = line_spacing
+            if cur_font_size >= 60:
+                eff_spacing = line_spacing - int(cur_font_size * 0.20)
+            elif cur_font_size >= 35:
+                eff_spacing = line_spacing - int(cur_font_size * 0.10)
+
+            total_h = len(lines) * line_h + (len(lines) - 1) * eff_spacing
             max_line_w = max((get_w(l) for l in lines), default=0)
 
-            if total_h <= avail_h and max_line_w <= avail_w:
+            # Điều kiện đạt chuẩn: Không vượt quá max_lines (2 dòng), không tràn chiều rộng, không tràn chiều cao
+            if len(lines) <= max_lines and max_line_w <= avail_w and total_h <= avail_h:
                 return "\n".join(lines), cur_font_size
 
-            best_lines = lines
+            best_lines = lines if lines else raw_lines
             best_size = cur_font_size
-            cur_font_size -= 4
+            cur_font_size -= 2
 
         return "\n".join(best_lines), best_size
