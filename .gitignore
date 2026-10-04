@@ -35,6 +35,7 @@ logs/
 
 # src_app data & tools
 src_app/data/temp/
+src_app/data/cache/
 src_app/data/output/
 src_app/data/logs/
 src_app/data/tokens/

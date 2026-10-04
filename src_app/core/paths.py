@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -11,6 +12,7 @@ APP_ROOT = Path(__file__).resolve().parents[2]
 # Thư mục dữ liệu người dùng (nằm trong src_app/data)
 DATA_DIR = SRC_APP_DIR / "data"
 TEMP_DIR = DATA_DIR / "temp"
+CACHE_DIR = DATA_DIR / "cache"
 OUTPUT_DIR = DATA_DIR / "output"
 LOG_DIR = DATA_DIR / "logs"
 PROJECTS_DIR = DATA_DIR / "projects"
@@ -27,23 +29,29 @@ CONFIG_PATH = APP_ROOT / "config.json"
 
 
 def ensure_dirs() -> None:
-    for folder in (DATA_DIR, TEMP_DIR, OUTPUT_DIR, LOG_DIR, PROJECTS_DIR, PRESETS_DIR, LAYOUTS_DIR, TOKENS_DIR):
+    for folder in (DATA_DIR, TEMP_DIR, CACHE_DIR, OUTPUT_DIR, LOG_DIR, PROJECTS_DIR, PRESETS_DIR, LAYOUTS_DIR, TOKENS_DIR):
         folder.mkdir(parents=True, exist_ok=True)
 
 
 def find_binary(name: str) -> str:
-    # 1. Ưu tiên tìm trong tools/ffmpeg/bin ở thư mục gốc
-    local = TOOLS_DIR / "ffmpeg" / "bin" / name
-    if local.exists():
-        return str(local)
-    # 2. Tìm trong src_app/tools nếu có
-    local_src = SRC_APP_DIR / "tools" / "ffmpeg" / "bin" / name
-    if local_src.exists():
-        return str(local_src)
-    # 3. Tìm trong PATH hệ thống
-    found = shutil.which(name)
-    if found:
-        return found
+    candidates = [name]
+    if os.name == "nt" and not name.lower().endswith(".exe"):
+        candidates.append(f"{name}.exe")
+
+    for cand in candidates:
+        # 1. Ưu tiên tìm trong tools/ffmpeg/bin ở thư mục gốc
+        local = TOOLS_DIR / "ffmpeg" / "bin" / cand
+        if local.exists():
+            return str(local)
+        # 2. Tìm trong src_app/tools nếu có
+        local_src = SRC_APP_DIR / "tools" / "ffmpeg" / "bin" / cand
+        if local_src.exists():
+            return str(local_src)
+        # 3. Tìm trong PATH hệ thống
+        found = shutil.which(cand)
+        if found:
+            return found
+
     raise FileNotFoundError(
         f"Không tìm thấy {name}. Hãy đặt {name} vào tools/ffmpeg/bin hoặc thêm FFmpeg vào PATH."
     )

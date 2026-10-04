@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
+from .layout_renderer import LayoutRenderer
 from .media_utils import choose_media_sequence, get_duration_seconds, is_image, is_video
 from .overlay_generator import get_overlay_file, ensure_default_overlays
 from .paths import TEMP_DIR, OUTPUT_DIR, DATA_DIR, APP_ROOT, ensure_dirs, find_binary
@@ -260,11 +261,45 @@ class RenderEngine:
             media_tasks = self._plan_media_tasks(media_sequence, render_duration, image_duration, width, height, fps)
             batch_limit = self._transition_batch_size()
 
+            self.progress(35, "Chuẩn bị và mix audio")
+            final_audio = self._build_final_audio(audio_path, job_temp, render_duration, audio_speed)
+
+            intro_file = self.settings.get("intro_file") or ""
+            outro_file = self.settings.get("outro_file") or ""
+            intro_mode = str(self.settings.get("intro_mode", "overlay")).lower()
+            has_concat_intro_outro = bool(outro_file or (intro_file and intro_mode == "concat"))
+
             if len(media_tasks) <= batch_limit:
-                self.progress(45, f"Render Direct 1-Pass ({len(media_tasks)} media -> video cuối)")
-                visual_out = job_temp / "visual_video.mp4"
-                self._render_direct_single_pass(media_tasks, visual_out, width, height, fps, sub_ass_file=sub_ass_file, audio_title=title_to_use)
-                current_video = visual_out
+                if not has_concat_intro_outro:
+                    self.progress(45, f"Render Direct 1-Pass Tuyệt Đối (GPU NVENC -> MP4 cuối cùng)")
+                    self._render_direct_single_pass(
+                        media_tasks,
+                        output_file,
+                        width,
+                        height,
+                        fps,
+                        sub_ass_file=sub_ass_file,
+                        audio_title=title_to_use,
+                        audio_file=final_audio,
+                    )
+                    current_video = output_file
+                else:
+                    self.progress(45, f"Render Direct 1-Pass (GPU NVENC)")
+                    main_video = job_temp / "direct_main.mp4"
+                    self._render_direct_single_pass(
+                        media_tasks,
+                        main_video,
+                        width,
+                        height,
+                        fps,
+                        sub_ass_file=sub_ass_file,
+                        audio_title=title_to_use,
+                        audio_file=final_audio,
+                    )
+                    self.progress(90, "Ghép intro/outro concat")
+                    self._add_intro_outro(main_video, intro_file, outro_file, output_file, job_temp, width, height, fps)
+                    self._delete_temp_file(main_video, "video tạm trước intro/outro concat")
+                    current_video = output_file
             else:
                 self.progress(15, "Tạo clip từ ảnh/video (Fallback danh sách nhiều media)")
                 clips, clip_durations = self._create_media_clips(media_sequence, job_temp, width, height, fps, image_duration, render_duration)
@@ -283,28 +318,24 @@ class RenderEngine:
                 else:
                     self.log("Không bật logo/watermark/text/sub: bỏ qua pass overlay để tiết kiệm thời gian.")
 
-            self.progress(80, "Chuẩn bị/mix audio")
-            final_audio = self._build_final_audio(audio_path, job_temp, render_duration, audio_speed)
+                self.progress(86, "Ghép audio cuối")
+                with_audio = job_temp / "with_audio.mp4"
+                self._attach_audio(current_video, final_audio, with_audio, render_duration, 1.0)
+                self._delete_temp_file(current_video, "video tạm sau khi ghép audio")
+                current_video = with_audio
 
-            self.progress(86, "Ghép audio cuối")
-            with_audio = job_temp / "with_audio.mp4"
-            self._attach_audio(current_video, final_audio, with_audio, render_duration, 1.0)
-            self._delete_temp_file(current_video, "video tạm sau khi ghép audio")
-            self._delete_temp_file(final_audio, "audio tạm sau khi ghép vào video")
+                if has_concat_intro_outro:
+                    self.progress(92, "Ghép intro/outro concat")
+                    intro_out = job_temp / "with_intro_outro.mp4"
+                    prev_video = current_video
+                    self._add_intro_outro(current_video, intro_file, outro_file, intro_out, job_temp, width, height, fps)
+                    current_video = intro_out
+                    self._delete_temp_file(prev_video, "video tạm trước intro/outro")
 
-            current_video = with_audio
-            intro_file = self.settings.get("intro_file") or ""
-            outro_file = self.settings.get("outro_file") or ""
-            if intro_file or outro_file:
-                self.progress(92, "Ghép intro/outro")
-                intro_out = job_temp / "with_intro_outro.mp4"
-                prev_video = current_video
-                self._add_intro_outro(current_video, intro_file, outro_file, intro_out, job_temp, width, height, fps)
-                current_video = intro_out
-                self._delete_temp_file(prev_video, "video tạm trước intro/outro")
+                self.progress(98, "Xuất file cuối")
+                self._finalize_output(current_video, output_file)
 
-            self.progress(98, "Xuất file cuối")
-            self._finalize_output(current_video, output_file)
+            self._delete_temp_file(final_audio, "audio tạm sau khi hoàn tất render")
             success = True
             self.progress(100, "Hoàn thành")
             return RenderResult(audio_file=audio_file, output_file=str(output_file), success=True)
@@ -2265,10 +2296,16 @@ class RenderEngine:
 
         # Nếu có danh sách layers được cấu hình trong Studio Layout:
         if studio_enabled and len(raw_layers) > 0:
-            if temp_dir:
-                layers, baked_asset = self._bake_static_layout_canvas(raw_layers, width, height, temp_dir / "static_layout_canvas.png")
-                if baked_asset and baked_asset.exists():
-                    cmd += ["-i", str(baked_asset)]
+            try:
+                cached_png, dynamic_layers = LayoutRenderer.get_or_render_cached_canvas(
+                    layers=raw_layers,
+                    width=width,
+                    height=height,
+                    audio_title=audio_title,
+                    log_fn=self.log,
+                )
+                if cached_png and cached_png.exists():
+                    cmd += ["-i", str(cached_png)]
                     in_lbl = f"[layer_in_{stage}]"
                     out_lbl = f"[layer_v_{stage}]"
                     filters.append(f"[{input_index}:v]format=rgba{in_lbl}")
@@ -2276,7 +2313,9 @@ class RenderEngine:
                     last = out_lbl
                     input_index += 1
                     stage += 1
-            else:
+                layers = dynamic_layers
+            except Exception as ex:
+                self.log(f"⚠️ LayoutRenderer fallback ({ex}), tiếp tục xử lý qua FFmpeg.")
                 layers = raw_layers
 
             for layer in layers:
@@ -2682,8 +2721,9 @@ class RenderEngine:
         fps: int,
         sub_ass_file: Path | None = None,
         audio_title: str = "",
+        audio_file: Path | None = None,
     ) -> None:
-        """Render trực tiếp từ ảnh/video nguồn + transitions + visual overlays + phụ đề ASS chỉ trong 1 pass duy nhất."""
+        """Render trực tiếp từ ảnh/video nguồn + transitions + visual overlays + phụ đề ASS + Audio chỉ trong 1 pass duy nhất."""
         cmd = [self.ffmpeg, "-y", "-threads", "0"]
         filters: List[str] = []
         is_cuda_hwaccel = self._encoder() == "nvidia"
@@ -2754,7 +2794,7 @@ class RenderEngine:
 
             input_index_start = len(tasks)
 
-        last, _ = self._build_visual_layers_filtergraph(
+        last, input_index_after_visual = self._build_visual_layers_filtergraph(
             cmd=cmd,
             filters=filters,
             base_label="[base_bg]",
@@ -2768,15 +2808,43 @@ class RenderEngine:
         )
         filters.append(f"{last}format=yuv420p[v]")
 
+        # Xử lý Audio gộp trực tiếp vào 1-Pass
+        audio_map_args: List[str] = []
+        audio_enc_args: List[str] = []
+        if audio_file and audio_file.exists():
+            audio_in_idx = input_index_after_visual
+            cmd += ["-i", str(audio_file)]
+            audio_map_args = ["-map", f"{audio_in_idx}:a:0?"]
+            audio_enc_args = ["-c:a", "aac", "-b:a", "192k"]
+        else:
+            audio_map_args = ["-an"]
+            audio_enc_args = []
+
         script_file = out.parent / f"{out.stem}_direct_1pass_filter.txt"
         script_file.write_text(";".join(filters), encoding="utf-8")
 
         def build(args: List[str]) -> List[str]:
-            return cmd + ["-filter_complex_script", str(script_file), "-map", "[v]", "-an", "-t", f"{total_duration:.6f}"] + args + ["-movflags", "+faststart", str(out)]
+            return (
+                cmd
+                + ["-filter_complex_script", str(script_file), "-map", "[v]"]
+                + audio_map_args
+                + ["-t", f"{total_duration:.6f}"]
+                + args
+                + audio_enc_args
+                + ["-shortest", "-movflags", "+faststart", str(out)]
+            )
 
         def build_cpu() -> List[str]:
             cpu_cmd = [part for part in cmd if part not in {"-hwaccel", "cuda"}]
-            return cpu_cmd + ["-filter_complex_script", str(script_file), "-map", "[v]", "-an", "-t", f"{total_duration:.6f}"] + self._fallback_cpu_encode_args() + ["-movflags", "+faststart", str(out)]
+            return (
+                cpu_cmd
+                + ["-filter_complex_script", str(script_file), "-map", "[v]"]
+                + audio_map_args
+                + ["-t", f"{total_duration:.6f}"]
+                + self._fallback_cpu_encode_args()
+                + audio_enc_args
+                + ["-shortest", "-movflags", "+faststart", str(out)]
+            )
 
         stage_name = f"Render Direct 1-Pass ({len(tasks)} media -> video cuối)"
         self._run(build(self._video_encode_args()), stage_name, True, build_cpu)

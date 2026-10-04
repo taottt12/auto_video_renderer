@@ -338,7 +338,8 @@ def run_worker(args: argparse.Namespace) -> int:
             fp16=use_fp16,
             verbose=False,
             word_timestamps=False,
-            no_speech_threshold=0.6,
+            no_speech_threshold=0.3,
+            logprob_threshold=-1.0,
             condition_on_previous_text=False,
             temperature=(0.0, 0.2, 0.4),
             beam_size=5,
@@ -362,8 +363,11 @@ def run_worker(args: argparse.Namespace) -> int:
             s_start = float(seg.get("start", 0.0))
             s_end = float(seg.get("end", 0.0))
             s_text = str(seg.get("text", "")).strip()
+            no_speech = float(seg.get("no_speech_prob", 0.0))
             if s_text:
                 raw_events.append((s_start, s_end, s_text))
+                if s_start < 30.0:
+                    emit_msg("log", {"text": f"🎙️ [0-30s Segment] {s_start:.2f}s -> {s_end:.2f}s (no_speech: {no_speech:.2f}): '{s_text}'"})
 
     emit_msg("log", {"text": f"✔ Nhận diện giọng nói: [{detected.upper()}] — Bóc tách {len(raw_events)} cụm phụ đề chuẩn nhịp giọng đọc..."})
 
