@@ -176,20 +176,24 @@ class LayoutRenderer:
             in_eff = str(layer.get("in_effect", "none")).lower()
             out_eff = str(layer.get("out_effect", "none")).lower()
             mot_eff = str(layer.get("motion_effect", "none")).lower()
+            f_path_raw = str(layer.get("file_path", "")).strip()
+            is_gif = (l_type in {"gif", "reaction", "animated_image"}) or f_path_raw.lower().endswith(".gif")
 
             # Kiểm tra xem layer có hiệu ứng hoạt họa theo thời gian hay không
             has_time_anim = (in_eff != "none" or out_eff != "none" or mot_eff != "none")
+            is_dynamic = is_gif or (l_type in {"video_mask"}) or has_time_anim
 
-            # Nếu là GIF động hoặc video mask hoặc layer có hiệu ứng chuyển động theo thời gian (khi render video thật)
-            if not preview_mode and has_time_anim:
+            # Nếu là GIF động hoặc video mask hoặc layer có hiệu ứng chuyển động theo thời gian:
+            # - Khi Render Video: Chuyển sang dynamic_layers để FFmpeg xử lý hoạt họa đa khung hình
+            # - Khi Preview Mode: Vẽ khung hình đầu tiên lên Canvas để người dùng nhìn thấy trực quan
+            if not preview_mode and is_dynamic:
                 dynamic_layers.append(layer)
                 continue
 
             # -------------------------------------------------------------
-            # 1. LAYER HÌNH ẢNH (Image / Logo / Watermark / Banner / Chat Bubble)
+            # 1. LAYER HÌNH ẢNH (Image / Logo / Watermark / Banner / GIF / Chat Bubble / Badge / Frame / Sticker)
             # -------------------------------------------------------------
-            if l_type in {"image", "banner", "logo", "watermark", "chat_bubble"}:
-                f_path_raw = str(layer.get("file_path", "")).strip()
+            if l_type in {"image", "banner", "logo", "watermark", "chat_bubble", "badge", "frame", "sticker", "reaction", "gif"}:
                 if not f_path_raw:
                     continue
 
@@ -200,6 +204,9 @@ class LayoutRenderer:
 
                 try:
                     with Image.open(res_path) as src_img:
+                        # Với GIF ở chế độ Preview, lấy khung hình đầu tiên
+                        if is_gif:
+                            src_img.seek(0)
                         img = src_img.convert("RGBA")
                         bx = float(layer.get("box_x", 0.0))
                         by = float(layer.get("box_y", 0.0))
@@ -248,23 +255,42 @@ class LayoutRenderer:
                     _log(f"⚠️ Lỗi vẽ layer ảnh '{layer.get('name')}': {ex}")
 
             # -------------------------------------------------------------
-            # 2. LAYER CHỮ / TIÊU ĐỀ (Text Typography Chuẩn WYSIWYG)
+            # 2. LAYER CHỮ / TIÊU ĐỀ & PHỤ ĐỀ XEM TRƯỚC (Text / Subtitle Live Preview)
             # -------------------------------------------------------------
-            elif l_type == "text":
+            elif l_type in {"text", "subtitle"}:
+                if l_type == "subtitle" and not preview_mode:
+                    # Khi render video thật, subtitle được vẽ động bằng FFmpeg filter ASS/SRT theo từng mili-giây
+                    continue
+
                 raw_content = str(layer.get("text_content", "") or layer.get("content", "")).strip()
                 l_name_lower = str(layer.get("name", "")).lower()
 
-                # Thay thế biến động {title}, {filename}
-                content = raw_content
-                if not content and (l_name_lower in ["tiêu-đề", "tieu de", "title", "tiêu đề", "tieude"]):
-                    content = "[Tên Video]" if preview_mode else (audio_title or "[Tiêu Đề]")
-                elif preview_mode:
-                    for tag in ["{title}", "{filename}", "{name}", "{audio_name}", "{ten_audio}", "{ten_video}", "{tieu_de}"]:
-                        content = content.replace(tag, "[Tên Video]").replace(tag.upper(), "[Tên Video]")
-                elif audio_title:
-                    for tag in ["{title}", "{filename}", "{name}", "{audio_name}", "{ten_audio}", "{ten_video}", "{tieu_de}"]:
-                        content = content.replace(tag, audio_title).replace(tag.upper(), audio_title)
+                if l_type == "subtitle":
+                    content = raw_content
+                    if not content:
+                        sub_mode = str(layer.get("sub_mode", "rolling_2line")).lower()
+                        if sub_mode == "rolling_2line":
+                            content = "Dòng 1: Câu vừa đọc xong (giữ để đọc kịp)...\nDòng 2: Câu đang đọc (Mới nhất theo audio)"
+                        elif sub_mode == "cinema_hold":
+                            content = "Cụm câu hoàn chỉnh chuẩn điện ảnh\n(Giữ đệm tối thiểu 2.5s không bị mất vội)"
+                        elif sub_mode == "karaoke_highlight":
+                            content = "Phụ đề Karaoke Highlight:\nSáng từng từ theo nhịp giọng đọc AI"
+                        else:
+                            content = "Đây là phụ đề mẫu xem trước (Subtitle Live Preview)"
+                else:
+                    # Thay thế biến động {title}, {filename}
+                    content = raw_content
+                    if not content and (l_name_lower in ["tiêu-đề", "tieu de", "title", "tiêu đề", "tieude"]):
+                        content = audio_title if audio_title else ("[Tên Video]" if preview_mode else "[Tiêu Đề]")
+                    elif audio_title:
+                        for tag in ["{title}", "{filename}", "{name}", "{audio_name}", "{ten_audio}", "{ten_video}", "{tieu_de}"]:
+                            content = content.replace(tag, audio_title).replace(tag.upper(), audio_title)
+                    elif preview_mode:
+                        for tag in ["{title}", "{filename}", "{name}", "{audio_name}", "{ten_audio}", "{ten_video}", "{tieu_de}"]:
+                            content = content.replace(tag, "[Tên Video]").replace(tag.upper(), "[Tên Video]")
 
+                # Loại bỏ emoji Unicode ngoài BMP tránh vẽ ô vuông đứt nét
+                content = re.sub(r"[\U00010000-\U0010ffff]", "", content).strip()
                 if not content:
                     continue
 
@@ -290,7 +316,7 @@ class LayoutRenderer:
                         font = ImageFont.load_default()
 
                 bx = float(layer.get("box_x", 0.1))
-                by = float(layer.get("box_y", 0.1))
+                by = float(layer.get("box_y", 0.1 if l_type != "subtitle" else 0.7))
                 bw = float(layer.get("box_w", 0.8))
                 bh = float(layer.get("box_h", 0.2))
 
@@ -308,28 +334,30 @@ class LayoutRenderer:
                     box_radius = int(round(int(layer.get("box_radius", 8) or 8) * (height / 1080.0)))
                     draw.rounded_rectangle([px, py, px + pw, py + ph], radius=box_radius, fill=bg_rgba)
 
-                # 2.2 Thuật toán Word Wrapping chuẩn xác từng pixel
+                # 2.2 Thuật toán Word Wrapping chuẩn xác từng pixel hỗ trợ cả \n và tự động bẻ dòng
                 def get_text_w(s: str) -> int:
                     if hasattr(font, "getlength"):
                         return int(round(font.getlength(s)))
                     bbox = draw.textbbox((0, 0), s, font=font)
                     return bbox[2] - bbox[0]
 
-                # Tách từ và gom dòng
-                clean_words = content.split()
                 raw_lines: List[str] = []
-                cur_line = ""
-
-                for w in clean_words:
-                    test_l = f"{cur_line} {w}".strip() if cur_line else w
-                    if get_text_w(test_l) <= pw:
-                        cur_line = test_l
-                    else:
-                        if cur_line:
-                            raw_lines.append(cur_line)
-                        cur_line = w
-                if cur_line:
-                    raw_lines.append(cur_line)
+                paragraphs = content.splitlines() if ("\n" in content or "\r" in content) else [content]
+                for paragraph in paragraphs:
+                    clean_words = paragraph.strip().split()
+                    if not clean_words:
+                        continue
+                    cur_line = ""
+                    for w in clean_words:
+                        test_l = f"{cur_line} {w}".strip() if cur_line else w
+                        if get_text_w(test_l) <= pw:
+                            cur_line = test_l
+                        else:
+                            if cur_line:
+                                raw_lines.append(cur_line)
+                            cur_line = w
+                    if cur_line:
+                        raw_lines.append(cur_line)
 
                 # Làm sạch dấu phân cách | - : ; / \ ở đầu và cuối dòng
                 lines: List[str] = []
@@ -377,7 +405,7 @@ class LayoutRenderer:
                         cur_x = px
                     elif font_align == "right":
                         cur_x = px + pw - line_w
-                    else: # center
+                    else:  # center
                         cur_x = px + (pw - line_w) // 2
 
                     cur_y = start_y + i * line_step_h
@@ -442,7 +470,8 @@ class LayoutRenderer:
                     str(l.get("in_effect", "none")).lower() != "none"
                     or str(l.get("out_effect", "none")).lower() != "none"
                     or str(l.get("motion_effect", "none")).lower() != "none"
-                    or str(l.get("type", "")).lower() in {"video_mask"}
+                    or str(l.get("type", "")).lower() in {"video_mask", "gif", "reaction", "animated_image"}
+                    or str(l.get("file_path", "")).lower().endswith(".gif")
                 )
             ]
             return cached_png, dynamic_layers

@@ -203,6 +203,18 @@ def separate_vocals_demucs(audio_path: Path, out_vocal_path: Path, device: str =
         full_vocals = torch.cat(vocal_chunks, dim=1)
         mono_vocal = torch.mean(full_vocals, dim=0, keepdim=True)
         mono_16k = torchaudio.functional.resample(mono_vocal, bundle.sample_rate, 16000)
+
+        # Chống nuốt giọng mở đầu (0-30s Intro Jingle / Vocals Protection):
+        # Nếu đoạn 30s đầu của Demucs bị triệt tiêu quá mức (RMS quá nhỏ) trong khi audio gốc có tín hiệu,
+        # chúng ta tự động bù đoạn 30s đầu từ audio gốc để Whisper AI nhận diện trọn vẹn từng từ mở đầu!
+        intro_samples = min(mono_16k.shape[1], 16000 * 30)
+        if intro_samples > 0:
+            demucs_intro_rms = torch.sqrt(torch.mean(mono_16k[:, :intro_samples] ** 2)).item()
+            orig_16k = torchaudio.functional.resample(torch.mean(waveform, dim=0, keepdim=True), bundle.sample_rate, 16000)
+            orig_intro_rms = torch.sqrt(torch.mean(orig_16k[:, :intro_samples] ** 2)).item()
+            if demucs_intro_rms < 0.015 and orig_intro_rms > 0.03:
+                mono_16k[:, :intro_samples] = orig_16k[:, :intro_samples] * 0.95
+
         save_wav_pcm16(out_vocal_path, mono_16k, 16000)
 
         del model

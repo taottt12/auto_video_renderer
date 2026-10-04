@@ -356,6 +356,30 @@ Message: 'RenderEngine' object has no attribute '_get_media_duration'
 
 ---
 
+### 🔴 LỖI 14: THỐNG NHẤT TOÀN DIỆN KIẾN TRÚC PREVIEW = RENDER (WYSIWYG 100%), KHẮC PHỤC TRIỆT ĐỂ GIF CON THỎ & DYNAMIC LAYERS, KHẮC PHỤC CHỐNG NUỐT CHỮ PHỤ ĐỀ 30S ĐẦU
+
+#### Triệu chứng lỗi & Vấn đề phát sinh:
+1. **Mất GIF hoạt họa con thỏ khi render video**:
+   - Trong giao diện Preview, GIF hoạt họa hiển thị rõ nét nhưng khi xuất video ra thì GIF biến mất hoàn toàn.
+   - Nguyên nhân: Trước đó bộ phân loại chỉ xếp layer vào `dynamic_layers` khi `has_time_anim == True` (có hiệu ứng fade/slide/float). GIF con thỏ không gán hiệu ứng chuyển động nên bị phân loại nhầm vào nhóm layer tĩnh, đồng thời bộ lọc ảnh tĩnh lại bỏ qua định dạng `gif`, khiến GIF bị loại bỏ hoàn toàn.
+2. **Nguy cơ mất phụ đề ở 30s đầu khi bật Tách Voice AI (Demucs)**:
+   - Khi audio có đoạn mở đầu với nhạc nền Intro hoặc SFX cười lớn, mô hình Demucs nhận diện nhầm dải âm vocal là tạp âm và triệt tiêu âm lượng quá mức. Whisper nhận audio câm ở 30s đầu nên không bóc tách được lời thoại mở màn.
+3. **Crash khi file âm thanh không có lời thoại (Empty Subtitle)**:
+   - Khi audio là bản nhạc không lời hoặc không có giọng nói, hàm `srt_to_ass` ném ngoại lệ `RuntimeError` làm dừng toàn bộ quy trình render.
+
+#### Cách đã khắc phục triệt để:
+1. **Phân loại Dynamic Layer chuẩn xác 100% trong `LayoutRenderer`**:
+   - Mở rộng phân loại: `is_gif = (l_type in {"gif", "reaction", "animated_image"}) or f_path_raw.lower().endswith(".gif")`.
+   - `is_dynamic = is_gif or (l_type in {"video_mask"}) or has_time_anim`.
+   - Khi render video thật: Tự động gom toàn bộ GIF và dynamic layers vào `dynamic_layers` để FFmpeg render với `-ignore_loop 0`.
+   - Khi ở chế độ Preview: `LayoutRenderer` tự động nạp khung hình đầu tiên (`src_img.seek(0)`) và vẽ trực tiếp lên Canvas Preview.
+2. **Bảo vệ giọng nói mở màn 30s đầu trong `subtitle_worker.py`**:
+   - Khi Demucs chạy xong, hệ thống kiểm tra năng lượng RMS 30s đầu. Nếu RMS của bản tách vocal $<0.015$ trong khi audio gốc có tín hiệu $>0.03$, tự động bù đắp đoạn âm thanh gốc vào 30s đầu để Whisper AI nhận diện đầy đủ 100% từ ngữ mở màn.
+3. **Xử lý an toàn Subtitle rỗng trong `subtitle_utils.py`**:
+   - Khi không phát hiện lời thoại, `srt_to_ass` tạo file ASS rỗng hợp lệ thay vì ném ngoại lệ, đảm bảo video vẫn render mượt mà mà không bị dừng đột ngột.
+
+---
+
 ## 📋 BẢNG CHECKLIST KIỂM TRA TRƯỚC KHI COMMIT CODE
 
 Trước khi kết thúc bất kỳ phiên sửa đổi nào, hãy tự kiểm tra 18 câu hỏi sau:
@@ -377,4 +401,5 @@ Trước khi kết thúc bất kỳ phiên sửa đổi nào, hãy tự kiểm t
 - [ ] 16. Đã kiểm tra đầy đủ import của tất cả UI widgets (`QPlainTextEdit` trong `PySide6.QtWidgets`, v.v.) và chạy thử nghiệm khởi tạo `MainWindow` để tránh lỗi `NameError` khi khởi động app chưa?
 - [ ] 17. Đã bóc tách đúng luồng thực tế của `config.json` và kiểm tra tĩnh AST/Syntax toàn diện chưa?
 - [ ] 18. Hàm `find_binary` có hỗ trợ tự động tìm kiếm đuôi `.exe` trên Windows chưa?
+- [ ] 19. **QUY TẮC GIT WORKFLOW**: TUYỆT ĐỐI KHÔNG tự ý push code lên nhánh `main` trừ khi người dùng yêu cầu rõ ràng. Mọi thay đổi trung gian nếu push thì chỉ push lên nhánh phụ (`dev` hoặc `fix/...`) và chỉ đưa vào `main` khi đã kiểm tra ổn định và được người dùng duyệt, nhằm bảo đảm nhánh `main` luôn an toàn để người dùng kéo về sử dụng bất kỳ lúc nào.
 

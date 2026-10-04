@@ -2344,7 +2344,7 @@ class RenderEngine:
                     if not resolved or not resolved.exists():
                         raise FileNotFoundError(f"Không tìm thấy file của layer '{l_name}': {f_path_raw}")
 
-                    if l_type in {"gif", "reaction"}:
+                    if (l_type in {"gif", "reaction", "animated_image"}) or f_path_raw.lower().endswith(".gif"):
                         cmd += ["-ignore_loop", "0", "-i", str(resolved)]
                     elif l_type == "video_mask":
                         cmd += ["-stream_loop", "-1", "-i", str(resolved)]

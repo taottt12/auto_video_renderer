@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from PySide6.QtCore import Qt, QRect, QRectF, QPoint, QPointF, Signal, QTimer
 from PySide6.QtGui import (
     QBrush, QColor, QCursor, QFont, QFontMetrics,
-    QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QMovie
+    QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QMovie, QImage
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QPushButton,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.paths import LAYOUTS_DIR, PRESETS_DIR
+from ..core.layout_renderer import LayoutRenderer
 LAYOUT_PRESETS_DIR = LAYOUTS_DIR
 
 
@@ -44,6 +45,7 @@ class LayoutCanvasWidget(QWidget):
 
         self.layers: List[Dict[str, Any]] = []
         self.selected_idx: int = -1
+        self.preview_title: str = "NALAKA A PAGKWARTAAN"
 
         self.pixmap_cache: Dict[str, QPixmap] = {}
         self.movie_cache: Dict[str, QMovie] = {}
@@ -174,7 +176,25 @@ class LayoutCanvasWidget(QWidget):
         painter.fillRect(self.rect(), QColor("#121218"))
         painter.fillRect(cr, QColor("#1e1e28"))
 
-        # Đường lưới trung tâm snap
+        # 2. Render Canvas thông qua LayoutRenderer (Single Source of Truth - Chuẩn xác 100% WYSIWYG)
+        try:
+            canvas_pil, _ = LayoutRenderer.render_canvas(
+                self.layers,
+                width=1920,
+                height=1080,
+                audio_title=self.preview_title,
+                preview_mode=True
+            )
+            if canvas_pil:
+                data = canvas_pil.tobytes("raw", "RGBA")
+                qimg = QImage(data, 1920, 1080, QImage.Format_RGBA8888)
+                pixmap = QPixmap.fromImage(qimg)
+                painter.drawPixmap(cr, pixmap)
+        except Exception as e:
+            painter.setPen(QColor("#ff5555"))
+            painter.drawText(cr, Qt.AlignCenter, f"Lỗi hiển thị Preview: {e}")
+
+        # 3. Đường lưới trung tâm snap
         painter.setPen(QPen(QColor(255, 255, 255, 30), 1, Qt.DashLine))
         painter.drawLine(cr.x() + cr.width() // 2, cr.y(), cr.x() + cr.width() // 2, cr.y() + cr.height())
         painter.drawLine(cr.x(), cr.y() + cr.height() // 2, cr.x() + cr.width(), cr.y() + cr.height() // 2)
@@ -182,256 +202,6 @@ class LayoutCanvasWidget(QWidget):
         # Viền canvas
         painter.setPen(QPen(QColor("#4f526b"), 2))
         painter.drawRect(cr)
-
-        # 2. Vẽ các Layer theo đúng thứ tự Z-Index (Cắt gọt mép canvas chuẩn xác như video xuất ra)
-        painter.save()
-        painter.setClipRect(cr)
-        for idx, layer in enumerate(self.layers):
-            if not layer.get("enabled", True):
-                continue
-
-            bx = float(layer.get("box_x", 0.0))
-            by = float(layer.get("box_y", 0.0))
-            bw = float(layer.get("box_w", 0.3))
-            bh = float(layer.get("box_h", 0.2))
-            l_rect = self._norm_to_canvas(bx, by, bw, bh)
-
-            l_type = str(layer.get("type", "image")).lower()
-            opacity = float(layer.get("opacity", 1.0) if layer.get("opacity") is not None else 1.0)
-            opacity = max(0.0, min(1.0, opacity))
-
-            # Mô phỏng hiệu ứng chuyển động trực quan (Motion / Floating)
-            motion_mode = str(layer.get("motion_effect", "none")).lower()
-            if motion_mode == "float":
-                y_float = int(round(5.0 * math.sin(self._anim_t * 2.5)))
-                l_rect = QRect(l_rect.x(), l_rect.y() + y_float, l_rect.width(), l_rect.height())
-            elif motion_mode == "pulse":
-                pulse_s = 1.0 + 0.02 * math.sin(self._anim_t * 3.0)
-                pw_p = int(l_rect.width() * pulse_s)
-                ph_p = int(l_rect.height() * pulse_s)
-                l_rect = QRect(l_rect.center().x() - pw_p // 2, l_rect.center().y() - ph_p // 2, pw_p, ph_p)
-
-            painter.save()
-            painter.setOpacity(opacity)
-
-            if l_type in {"image", "gif", "video_mask", "banner", "logo", "watermark", "chat_bubble", "reaction"}:
-                is_gif = (l_type in {"gif", "reaction"}) or str(layer.get("file_path", "")).lower().endswith(".gif")
-                pm = self._get_pixmap(str(layer.get("file_path", "")).strip(), is_gif=is_gif)
-                scale_mode = str(layer.get("scale_mode", "stretch")).lower()
-                if pm:
-                    if scale_mode == "fit":
-                        scaled_pm = pm.scaled(l_rect.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                        target_x = l_rect.x() + (l_rect.width() - scaled_pm.width()) // 2
-                        target_y = l_rect.y() + (l_rect.height() - scaled_pm.height()) // 2
-                        painter.drawPixmap(target_x, target_y, scaled_pm)
-                    elif scale_mode == "crop":
-                        scaled_pm = pm.scaled(l_rect.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-                        cx = (scaled_pm.width() - l_rect.width()) // 2
-                        cy = (scaled_pm.height() - l_rect.height()) // 2
-                        clip_rect = QRect(max(0, cx), max(0, cy), l_rect.width(), l_rect.height())
-                        cropped = scaled_pm.copy(clip_rect)
-                        painter.drawPixmap(l_rect.topLeft(), cropped)
-                    else:  # stretch (mặc định khớp khung kéo)
-                        scaled_pm = pm.scaled(l_rect.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-                        painter.drawPixmap(l_rect.topLeft(), scaled_pm)
-                else:
-                    # Placeholder
-                    if is_gif:
-                        # Animated pulsing & jumping GIF placeholder
-                        pulse = (math.sin(self._anim_t * 5.0) + 1.0) * 0.5
-                        painter.setBrush(QBrush(QColor(100, 25, 75, int(150 + 60 * pulse))))
-                        painter.setPen(QPen(QColor(255, 105, 180), 1, Qt.DashLine))
-                        painter.drawRoundedRect(l_rect, 6, 6)
-
-                        # Mini jumping hearts/dots
-                        colors = [QColor("#ff4081"), QColor("#e040fb"), QColor("#ff5252")]
-                        cx = l_rect.center().x()
-                        cy = l_rect.center().y() - 6
-                        for i, col in enumerate(colors):
-                            jx = cx + (i - 1) * 18
-                            jy = cy + int(6 * math.sin(self._anim_t * 6.0 + i * 1.5))
-                            painter.setBrush(QBrush(col))
-                            painter.setPen(Qt.NoPen)
-                            painter.drawEllipse(QPoint(jx, jy), 4, 4)
-
-                        painter.setPen(QPen(QColor("#ff80ab")))
-                        font = QFont("Arial", max(7, min(10, l_rect.height() // 4)), QFont.Bold)
-                        painter.setFont(font)
-                        name = layer.get("name", "GIF Động")
-                        painter.drawText(QRect(l_rect.left(), l_rect.bottom() - 20, l_rect.width(), 18), Qt.AlignCenter, f"💖 {name}")
-                    else:
-                        painter.setBrush(QBrush(QColor(60, 70, 90, 180)))
-                        painter.setPen(QPen(QColor(120, 140, 180), 1, Qt.DashLine))
-                        painter.drawRoundedRect(l_rect, 6, 6)
-                        painter.setPen(QPen(Qt.white))
-                        name = layer.get("name", "Image Layer")
-                        painter.drawText(l_rect, Qt.AlignCenter, f"🖼️ {name}")
-
-            elif l_type == "text":
-                raw_content = str(layer.get("text_content", "") or layer.get("content", "")).strip()
-                l_name_lower = str(layer.get("name", "")).lower()
-
-                # Xử lý hiển thị trực quan cho thẻ biến số {title} trên Canvas Preview
-                content = raw_content
-                if not content and (l_name_lower in ["tiêu-đề", "tieu de", "title", "tiêu đề", "tieude"]):
-                    content = "[Tên Video / Audio Tự Động]"
-                elif content:
-                    for tag in ["{title}", "{filename}", "{name}", "{audio_name}", "{ten_audio}", "{ten_video}", "{tieu_de}"]:
-                        content = content.replace(tag, "[Tên Video]").replace(tag.upper(), "[Tên Video]")
-                if not content:
-                    content = "Tiêu đề truyện / bài hát"
-
-                font_name = str(layer.get("font_name", "Arial") or "Arial")
-                font_size = int(layer.get("font_size", 32) or 32)
-                font_bold = bool(layer.get("bold", True))
-                font_italic = bool(layer.get("italic", False))
-                font_align = str(layer.get("align", "center")).lower()
-
-                font_color_str = str(layer.get("font_color", "#FFFFFF")).strip()
-                outline_color_str = str(layer.get("outline_color", "#000000")).strip()
-                outline_width = float(layer.get("outline_width", 2.0) or 2.0)
-
-                bg_color_str = str(layer.get("bg_box_color", "#000000")).strip()
-                bg_box_enabled = bool(layer.get("bg_box_enabled", True)) and (bg_color_str.lower() not in {"none", "transparent", ""})
-                bg_opacity = float(layer.get("bg_box_opacity", 0.5) if layer.get("bg_box_opacity") is not None else 0.5)
-                box_radius = int(layer.get("box_radius", 8) or 8)
-
-                # 1. Vẽ nền Box nếu có
-                box_radius_scaled = max(1, int(round(box_radius * (cr.height() / 1080.0))))
-                if bg_box_enabled:
-                    bg_color = QColor(bg_color_str) if (bg_color_str.startswith("#") or bg_color_str.isalpha()) else QColor("#000000")
-                    bg_color.setAlphaF(max(0.0, min(1.0, bg_opacity)))
-                    painter.setBrush(QBrush(bg_color))
-                    painter.setPen(Qt.NoPen)
-                    painter.drawRoundedRect(l_rect, box_radius_scaled, box_radius_scaled)
-
-                # 2. Chuẩn bị Font theo chuẩn Pixel (Khắc phục 100% lệch do DPI Windows Scale)
-                scaled_font_px = max(6, int(round(font_size * (cr.height() / 1080.0))))
-                font = QFont(font_name)
-                font.setPixelSize(scaled_font_px)
-                font.setBold(font_bold)
-                font.setItalic(font_italic)
-                painter.setFont(font)
-
-                qt_align = Qt.AlignCenter
-                if font_align == "left":
-                    qt_align = Qt.AlignLeft | Qt.AlignVCenter
-                elif font_align == "right":
-                    qt_align = Qt.AlignRight | Qt.AlignVCenter
-                flags = qt_align | Qt.TextWordWrap
-                text_rect = l_rect.adjusted(4, 2, -4, -2)
-
-                # 3. Vẽ Viền chữ (Outline) nếu bật (khác 'none' và width > 0)
-                has_outline = (outline_color_str.lower() not in {"none", "transparent", ""}) and outline_width > 0
-                if has_outline:
-                    outline_color = QColor(outline_color_str) if (outline_color_str.startswith("#") or outline_color_str.isalpha()) else QColor("#000000")
-                    painter.setPen(outline_color)
-                    ow = max(1, int(round(outline_width * (cr.height() / 1080.0))))
-                    for ox in range(-ow, ow + 1):
-                        for oy in range(-ow, ow + 1):
-                            if ox != 0 or oy != 0:
-                                painter.drawText(text_rect.adjusted(ox, oy, ox, oy), flags, content)
-
-                # 4. Vẽ Chữ chính
-                font_color = QColor(font_color_str) if (font_color_str.startswith("#") or font_color_str.isalpha()) else QColor("#FFFFFF")
-                painter.setPen(font_color)
-                painter.drawText(text_rect, flags, content)
-
-            elif l_type == "subtitle":
-                sub_mode = str(layer.get("sub_mode", "rolling_2line")).lower()
-                custom_content = str(layer.get("text_content", "") or "").strip()
-                if custom_content:
-                    content = custom_content
-                else:
-                    if sub_mode == "rolling_2line":
-                        content = "💬 Dòng 1: Câu vừa đọc xong (giữ để đọc kịp)...\n💬 Dòng 2: Câu đang đọc (Mới nhất theo audio)"
-                    elif sub_mode == "cinema_hold":
-                        content = "🎬 Cụm câu hoàn chỉnh chuẩn điện ảnh\n(Giữ đệm tối thiểu 2.5s không bị mất vội)"
-                    elif sub_mode == "karaoke_highlight":
-                        content = "✨ Phụ đề Karaoke Highlight:\nSáng từng từ theo nhịp giọng đọc AI"
-                    else:
-                        content = "💬 Đây là phụ đề mẫu xem trước (Subtitle Live Preview)"
-
-                font_name = str(layer.get("font_name", "Arial") or "Arial")
-                font_size = int(layer.get("font_size", 38) or 38)
-                font_bold = bool(layer.get("bold", True))
-                font_italic = bool(layer.get("italic", False))
-
-                font_color_str = str(layer.get("font_color", "#FFFFFF")).strip()
-                outline_color_str = str(layer.get("outline_color", "#000000")).strip()
-                outline_width = float(layer.get("outline_width", 2.5) or 2.5)
-
-                bg_color_str = str(layer.get("bg_box_color", "none")).strip()
-                bg_box_enabled = bool(layer.get("bg_box_enabled", False)) and (bg_color_str.lower() not in {"none", "transparent", ""})
-                bg_opacity = float(layer.get("bg_box_opacity", 0.5) if layer.get("bg_box_opacity") is not None else 0.5)
-                box_radius = int(layer.get("box_radius", 6) or 6)
-                box_radius_scaled = max(1, int(round(box_radius * (cr.height() / 1080.0))))
-
-                # Viền nét đứt báo hiệu vùng Subtitle
-                painter.setPen(QPen(QColor(255, 204, 0, 150), 1, Qt.DashLine))
-                painter.setBrush(QBrush(QColor(0, 0, 0, 70)) if not bg_box_enabled else Qt.NoBrush)
-                painter.drawRoundedRect(l_rect, box_radius_scaled, box_radius_scaled)
-
-                if bg_box_enabled:
-                    bg_color = QColor(bg_color_str) if (bg_color_str.startswith("#") or bg_color_str.isalpha()) else QColor("#000000")
-                    bg_color.setAlphaF(max(0.0, min(1.0, bg_opacity)))
-                    painter.setBrush(QBrush(bg_color))
-                    painter.setPen(Qt.NoPen)
-                    painter.drawRoundedRect(l_rect, box_radius_scaled, box_radius_scaled)
-
-                scaled_font_px = max(8, int(round(font_size * (cr.height() / 1080.0))))
-                font = QFont(font_name)
-                font.setPixelSize(scaled_font_px)
-                font.setBold(font_bold)
-                font.setItalic(font_italic)
-                painter.setFont(font)
-
-                font_align = str(layer.get("align", "center")).lower()
-                qt_align = Qt.AlignCenter
-                if font_align == "left":
-                    qt_align = Qt.AlignLeft | Qt.AlignVCenter
-                elif font_align == "right":
-                    qt_align = Qt.AlignRight | Qt.AlignVCenter
-                else:
-                    qt_align = Qt.AlignHCenter | Qt.AlignVCenter
-                flags = qt_align | Qt.TextWordWrap
-                text_rect = l_rect.adjusted(4, 2, -4, -2)
-
-                has_outline = (outline_color_str.lower() not in {"none", "transparent", ""}) and outline_width > 0
-                if has_outline:
-                    outline_color = QColor(outline_color_str) if (outline_color_str.startswith("#") or outline_color_str.isalpha()) else QColor("#000000")
-                    painter.setPen(outline_color)
-                    ow = max(1, int(round(outline_width * (cr.height() / 1080.0))))
-                    for ox in range(-ow, ow + 1):
-                        for oy in range(-ow, ow + 1):
-                            if ox != 0 or oy != 0:
-                                painter.drawText(text_rect.adjusted(ox, oy, ox, oy), flags, content)
-
-                font_color = QColor(font_color_str) if (font_color_str.startswith("#") or font_color_str.isalpha()) else QColor("#FFFFFF")
-                painter.setPen(font_color)
-                painter.drawText(text_rect, flags, content)
-
-            elif l_type == "live_badge":
-                # Huy hiệu LIVE nhấp nháy
-                badge_rect = l_rect
-                pulse = (math.sin(self._anim_t * 4) + 1.0) * 0.5
-                painter.setBrush(QBrush(QColor(220, 20, 40, int(200 + 55 * pulse))))
-                painter.setPen(Qt.NoPen)
-                painter.drawRoundedRect(badge_rect, 6, 6)
-                # Chấm tròn trắng nhấp nháy
-                dot_r = max(3, badge_rect.height() // 6)
-                painter.setBrush(QBrush(Qt.white))
-                painter.drawEllipse(QPoint(badge_rect.x() + dot_r * 3, badge_rect.center().y()), dot_r, dot_r)
-                # Text LIVE
-                font = QFont("Arial", max(7, badge_rect.height() // 3), QFont.Bold)
-                painter.setFont(font)
-                painter.setPen(Qt.white)
-                text_rect = badge_rect.adjusted(dot_r * 5, 0, -4, 0)
-                painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, "LIVE 15.6k")
-
-            painter.restore()
-
-        painter.restore()  # Kết thúc clipRect cho layers
 
         # 3. Vẽ Khung Bounding Box cho Layer đang được chọn (Vẽ ngoài clip để luôn nhìn thấy và nắm kéo được)
         if 0 <= self.selected_idx < len(self.layers):
@@ -455,11 +225,13 @@ class LayoutCanvasWidget(QWidget):
                 painter.drawRect(h_rect)
 
             # Nhãn tên Layer
-            name = s_layer.get("name", "Layer")
-            tag_rect = QRect(s_rect.x(), max(cr.y(), s_rect.y() - 20), max(80, len(name) * 9), 18)
+            name = re.sub(r"[\U00010000-\U0010ffff]", "", str(s_layer.get("name", "Layer"))).strip() or "Layer"
+            font = QFont("Segoe UI", 8, QFont.Bold)
+            fm = QFontMetrics(font)
+            text_w = fm.horizontalAdvance(name)
+            tag_rect = QRect(s_rect.x(), max(cr.y(), s_rect.y() - 20), max(60, text_w + 14), 18)
             painter.fillRect(tag_rect, QColor(0, 255, 204, 220))
             painter.setPen(QPen(QColor("#000000")))
-            font = QFont("Arial", 8, QFont.Bold)
             painter.setFont(font)
             painter.drawText(tag_rect, Qt.AlignCenter, name)
 
@@ -791,6 +563,27 @@ class LayoutStudioTab(QWidget):
         top_bar.addWidget(self.delete_preset_btn)
 
         left_layout.addLayout(top_bar)
+
+        # Preview Title Bar: Nhập tiêu đề mẫu xem trước chuẩn xác
+        preview_title_bar = QHBoxLayout()
+        preview_title_bar.addWidget(QLabel("<b>📝 Tiêu Đề Mẫu:</b>"))
+        self.preview_title_edit = QLineEdit()
+        self.preview_title_edit.setPlaceholderText("Nhập tiêu đề mẫu để xem trước bẻ dòng và cỡ chữ thực tế...")
+        self.preview_title_edit.setText("NALAKA A PAGKWARTAAN")
+        self.preview_title_edit.textChanged.connect(self._on_preview_title_changed)
+        preview_title_bar.addWidget(self.preview_title_edit, 1)
+
+        self.btn_sample_long = QPushButton("📜 Mẫu Dài")
+        self.btn_sample_long.setToolTip("Xem thử với tiêu đề dài 2 dòng")
+        self.btn_sample_long.clicked.connect(lambda: self.preview_title_edit.setText("NALAKA A PAGKWARTAAN"))
+        preview_title_bar.addWidget(self.btn_sample_long)
+
+        self.btn_sample_short = QPushButton("🔤 Mẫu Ngắn")
+        self.btn_sample_short.setToolTip("Xem thử với tiêu đề ngắn 1 dòng")
+        self.btn_sample_short.clicked.connect(lambda: self.preview_title_edit.setText("TẬP 1: MỞ ĐẦU"))
+        preview_title_bar.addWidget(self.btn_sample_short)
+
+        left_layout.addLayout(preview_title_bar)
 
         # Canvas tương tác kéo thả
         self.canvas = LayoutCanvasWidget()
@@ -1500,6 +1293,10 @@ class LayoutStudioTab(QWidget):
                 sub_cfg["box_h"] = layers[idx]["box_h"]
             self.canvas.set_layers(layers, idx)
             self.settings_changed.emit(self.settings)
+
+    def _on_preview_title_changed(self, text: str) -> None:
+        self.canvas.preview_title = text.strip()
+        self.canvas.update()
 
     def _on_opacity_changed(self, val: int) -> None:
         self.prop_opacity_label.setText(f"{val}%")

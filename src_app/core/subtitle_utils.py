@@ -257,8 +257,7 @@ def srt_to_ass(
 
     content = read_subtitle_file(srt_p)
     raw_events = parse_srt_to_raw_events(content, speed=speed, keywords=sub_keywords)
-    if not raw_events:
-        raise RuntimeError(f"File phụ đề '{srt_p.name}' không chứa bất kỳ đoạn thoại nào hợp lệ.")
+    dialogues: List[Tuple[str, str, str]] = []
 
     font_name = str(sub_cfg.get("font_name") or sub_cfg.get("font_family") or "Arial")
     font_size = int(sub_cfg.get("font_size", 38) or 38)
@@ -296,7 +295,12 @@ def srt_to_ass(
         ass_align = 2
 
     # Thiết lập màu sắc và sự kiện theo chế độ phụ đề
-    if sub_mode == "karaoke_highlight":
+    if not raw_events:
+        primary_color_ass = hex_to_ass_color(font_color)
+        secondary_color_ass = "&H000000FF"
+        outline_color_ass = hex_to_ass_color(outline_color)
+        dialogues = []
+    elif sub_mode == "karaoke_highlight":
         primary_color_ass = hex_to_ass_color(highlight_color)
         secondary_color_ass = hex_to_ass_color(font_color)
         outline_color_ass = hex_to_ass_color(outline_color)
