@@ -17,7 +17,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
-from .layout_renderer import LayoutRenderer
+from .layout_renderer import (
+    LayoutRenderer,
+    find_font_file,
+    clean_text_content,
+    measure_text_and_fit_box,
+)
 from .media_utils import choose_media_sequence, get_duration_seconds, is_image, is_video
 from .overlay_generator import get_overlay_file, ensure_default_overlays
 from .paths import TEMP_DIR, OUTPUT_DIR, DATA_DIR, APP_ROOT, ensure_dirs, find_binary
@@ -164,19 +169,9 @@ class RenderEngine:
                 sub_folder = sub_cfg.get("folder", "")
                 raw_sub = find_subtitle_file(original_audio_path, sub_folder)
 
-                # Tập hợp từ khóa ngữ cảnh (Initial Prompt) mớm cho Whisper AI & bộ lọc nắn chỉnh phụ đề
-                prompt_tokens: List[str] = []
+                # Từ khóa ngữ cảnh (Initial Prompt) mớm cho Whisper AI: chỉ dùng whisper_keywords nếu người dùng tự nhập thủ công
                 raw_keywords = str(sub_cfg.get("whisper_keywords", "") or "").strip()
-                if raw_keywords:
-                    prompt_tokens.extend([k.strip() for k in raw_keywords.split(",") if k.strip()])
-                if title_to_use:
-                    prompt_tokens.append(title_to_use.strip())
-                for l in ls_layers:
-                    if isinstance(l, dict) and l.get("type") == "text":
-                        t_txt = str(l.get("text_content") or l.get("text") or l.get("content") or "").strip()
-                        if t_txt and not t_txt.startswith("{"):
-                            prompt_tokens.append(t_txt)
-                combined_prompt = ", ".join(dict.fromkeys(prompt_tokens))
+                combined_prompt = raw_keywords
                 sub_cfg["whisper_keywords"] = combined_prompt
 
                 # NẾU CHƯA CÓ FILE SUB: TỰ ĐỘNG CHẠY WHISPER AI ĐỂ BÓC TÁCH SUB
@@ -187,11 +182,10 @@ class RenderEngine:
                     lang_param = None if whisper_lang in ["auto", "", "None", "none"] else whisper_lang
                     lang_display = whisper_lang.upper() if lang_param else "TỰ ĐỘNG (AUTO)"
                     whisper_enhance = bool(sub_cfg.get("whisper_enhance_voice", True))
-                    whisper_vocal_sep = bool(sub_cfg.get("whisper_vocal_separation", True))
 
                     self.log(
                         f"⚡ Bật phụ đề: Đang dùng Whisper AI [{model_size}], ngôn ngữ [{lang_display}], "
-                        f"Tách Voice AI (Demucs): [{'Bật' if whisper_vocal_sep else 'Tắt'}], "
+                        f"Lọc âm nâng cao DSP: [{'Bật' if whisper_enhance else 'Tắt'}], "
                         f"Từ khóa Context: [{combined_prompt or 'Không'}] quét audio {original_audio_path.name}..."
                     )
                     auto_srt_path = original_audio_path.with_suffix(".srt")
@@ -207,7 +201,6 @@ class RenderEngine:
                             cancel_event=self.cancel_event,
                             audio_duration=original_duration,
                             enhance_voice=whisper_enhance,
-                            vocal_separation=whisper_vocal_sep,
                             initial_prompt=combined_prompt,
                         )
                     except RenderCancelled:
@@ -3094,146 +3087,17 @@ class RenderEngine:
 
     @staticmethod
     def _find_font_file_by_name(font_name: str, bold: bool = False, italic: bool = False) -> Path | None:
-        if not font_name:
-            return RenderEngine._default_font_file()
-
-        font_clean = font_name.strip()
-        font_clean_lower = font_clean.lower()
-        win_fonts = Path("C:/Windows/Fonts")
-
-        # 1. Tra cứu tự động từ Windows Font Registry (Chuẩn xác 100% cho mọi font chữ hệ thống & font cài thêm)
-        try:
-            import winreg
-
-            reg_roots = [
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
-                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
-            ]
-            font_candidates: List[Tuple[str, Path]] = []
-            for hkey, subkey in reg_roots:
-                try:
-                    with winreg.OpenKey(hkey, subkey) as key:
-                        num_values = winreg.QueryInfoKey(key)[1]
-                        for i in range(num_values):
-                            val_name, val_data, _ = winreg.EnumValue(key, i)
-                            clean_val = re.sub(r"\s*\((TrueType|OpenType|All type)\)", "", str(val_name), flags=re.IGNORECASE).strip().lower()
-                            file_p = Path(str(val_data))
-                            if not file_p.is_absolute():
-                                file_p = win_fonts / val_data
-                            if file_p.exists():
-                                font_candidates.append((clean_val, file_p))
-                except Exception:
-                    pass
-
-            target_style = font_clean_lower
-            if bold and italic:
-                target_style += " bold italic"
-            elif bold:
-                target_style += " bold"
-            elif italic:
-                target_style += " italic"
-
-            # Tìm khớp chính xác tên + style
-            for name, fpath in font_candidates:
-                if name == target_style:
-                    return fpath
-
-            # Tìm khớp chính xác tên font
-            for name, fpath in font_candidates:
-                if name == font_clean_lower:
-                    return fpath
-
-            # Tìm chứa chuỗi tên font (khớp style)
-            for name, fpath in font_candidates:
-                if font_clean_lower in name:
-                    if bold and "bold" in name:
-                        return fpath
-                    elif italic and "italic" in name:
-                        return fpath
-                    elif not bold and not italic and "bold" not in name and "italic" not in name:
-                        return fpath
-
-            for name, fpath in font_candidates:
-                if font_clean_lower in name:
-                    return fpath
-        except Exception:
-            pass
-
-        # 2. Bảng mapping mở rộng cho các font phổ biến
-        if win_fonts.exists():
-            mapping = {
-                "arial": "arialbd.ttf" if bold else ("ariali.ttf" if italic else "arial.ttf"),
-                "times new roman": "timesbd.ttf" if bold else ("timesi.ttf" if italic else "times.ttf"),
-                "tahoma": "tahomabd.ttf" if bold else "tahoma.ttf",
-                "segoe ui": "segoeuib.ttf" if bold else ("segoeuii.ttf" if italic else "segoeui.ttf"),
-                "segoe script": "segoescb.ttf" if bold else "segoesc.ttf",
-                "brush script mt": "BRUSHSCI.TTF",
-                "brush script": "BRUSHSCI.TTF",
-                "calibri": "calibrib.ttf" if bold else ("calibrii.ttf" if italic else "calibri.ttf"),
-                "consolas": "consolab.ttf" if bold else ("consolai.ttf" if italic else "consola.ttf"),
-                "comic sans ms": "comicbd.ttf" if bold else "comic.ttf",
-                "verdana": "verdanab.ttf" if bold else ("verdanai.ttf" if italic else "verdana.ttf"),
-                "georgia": "georgiab.ttf" if bold else ("georgiai.ttf" if italic else "georgia.ttf"),
-                "impact": "impact.ttf",
-                "trebuchet ms": "trebucbd.ttf" if bold else "trebuc.ttf",
-                "monotype corsiva": "MTCORSVA.TTF",
-                "lucida handwriting": "LHANDW.TTF",
-                "chiller": "CHILLER.TTF",
-                "freestyle script": "FREESCPT.TTF",
-                "kristen itc": "ITCKRIST.TTF",
-                "mistral": "MISTRAL.TTF",
-                "papyrus": "PAPYRUS.TTF",
-            }
-            if font_clean_lower in mapping:
-                f_path = win_fonts / mapping[font_clean_lower]
-                if f_path.exists():
-                    return f_path
-
-            # 3. Quét trực tiếp file stem trong C:/Windows/Fonts
-            for f in win_fonts.glob("*.ttf"):
-                if font_clean_lower in f.stem.lower():
-                    return f
-            for f in win_fonts.glob("*.otf"):
-                if font_clean_lower in f.stem.lower():
-                    return f
-
-        # 4. Quét thư mục assets/fonts của ứng dụng nếu có
-        try:
-            from .paths import APP_ROOT
-            app_fonts = APP_ROOT / "assets" / "fonts"
-            if app_fonts.exists():
-                for f in app_fonts.glob("*.*"):
-                    if f.suffix.lower() in {".ttf", ".otf"} and font_clean_lower in f.stem.lower():
-                        return f
-        except Exception:
-            pass
-
-        return RenderEngine._default_font_file()
+        """Ủy quyền tìm font sang engine thống nhất trong layout_renderer."""
+        return find_font_file(font_name=font_name, bold=bold, italic=italic)
 
     @staticmethod
     def _default_font_file() -> Path | None:
-        candidates = [Path("C:/Windows/Fonts/arial.ttf"), Path("C:/Windows/Fonts/Arial.ttf"), Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")]
-        for path in candidates:
-            if path.exists():
-                return path
-        return None
+        return find_font_file("Arial", bold=True)
 
     @staticmethod
     def _clean_title_text(text: str) -> str:
-        """Làm sạch các ký tự unicode đặc biệt / ô vuông lỗi thường gặp trong tiêu đề YouTube."""
-        if not text:
-            return ""
-        s = (
-            str(text)
-            .replace("\uff5c", "|")  # ｜
-            .replace("\uff1a", ":")  # ：
-            .replace("\uff0f", "/")  # ／
-            .replace("\u25a1", "")   # ▯
-            .replace("\ufffd", "")   # replacement char
-            .replace("\u200b", "")   # zero-width space
-            .replace("\ufeff", "")   # BOM
-        )
-        return s.strip()
+        """Làm sạch các ký tự unicode đặc biệt / ô vuông lỗi (Ủy quyền sang layout_renderer)."""
+        return clean_text_content(text)
 
     @classmethod
     def _wrap_text_for_box(
@@ -3244,103 +3108,22 @@ class RenderEngine:
         max_w: int,
         max_h: int,
         line_spacing: int = 4,
-        min_font_size: int = 16,
+        min_font_size: int = 14,
         max_lines: int = 2,
     ) -> tuple[str, int]:
         """
-        Tự động ngắt dòng theo ranh giới từ (không xé đôi từ, không ngắt ở dấu gạch nối)
-        và tự động co nhỏ font_size sao cho tiêu đề nằm vừa vặn hoàn hảo trong tối đa `max_lines` dòng (mặc định 2 dòng)
-        và không vượt quá chiều rộng/chiều cao của Bounding Box (tính chính xác Line Height, Ascent, Descent, Line Spacing).
+        Ủy quyền tính toán ngắt dòng và fit text box sang engine dùng chung measure_text_and_fit_box
+        trong layout_renderer (Single Source of Truth).
         """
-        from PIL import ImageFont, ImageDraw, Image
+        lines, fitted_size, _, _, _ = measure_text_and_fit_box(
+            text=text,
+            font_file=font_file,
+            font_size=font_size,
+            box_w=max_w,
+            box_h=max_h,
+            line_spacing=line_spacing,
+            min_font_size=min_font_size,
+            max_lines=max_lines,
+        )
+        return "\n".join(lines), fitted_size
 
-        clean_text = cls._clean_title_text(text)
-        if not clean_text:
-            return "", font_size
-
-        avail_w = max(40, int(max_w * 0.94))
-        avail_h = max(24, int(max_h * 0.90))
-
-        cur_font_size = int(font_size)
-        dummy_img = Image.new("RGB", (1, 1))
-        draw = ImageDraw.Draw(dummy_img)
-
-        best_lines = [clean_text]
-        best_size = cur_font_size
-
-        while cur_font_size >= min_font_size:
-            font = None
-            try:
-                if font_file and font_file.exists():
-                    font = ImageFont.truetype(str(font_file), cur_font_size)
-                else:
-                    font = ImageFont.load_default()
-            except Exception:
-                font = None
-
-            def get_w(s: str) -> int:
-                if not s:
-                    return 0
-                if font and hasattr(draw, "textbbox"):
-                    bbox = draw.textbbox((0, 0), s, font=font)
-                    return bbox[2] - bbox[0]
-                elif font and hasattr(font, "getlength"):
-                    return int(font.getlength(s))
-                else:
-                    return int(len(s) * cur_font_size * 0.55)
-
-            def get_line_h() -> int:
-                if font and hasattr(font, "getmetrics"):
-                    ascent, descent = font.getmetrics()
-                    return ascent + descent
-                if font and hasattr(draw, "textbbox"):
-                    bbox = draw.textbbox((0, 0), "ÁyTgjpqQ|", font=font)
-                    return bbox[3] - bbox[1]
-                return int(cur_font_size * 1.25)
-
-            # Ngắt dòng theo từ ngữ nguyên vẹn (Word Wrapping chuẩn xác từng pixel)
-            words = clean_text.split()
-            raw_lines: List[str] = []
-            cur_line = ""
-
-            for w in words:
-                test_line = f"{cur_line} {w}".strip() if cur_line else w
-                if get_w(test_line) <= avail_w:
-                    cur_line = test_line
-                else:
-                    if cur_line:
-                        raw_lines.append(cur_line)
-                    cur_line = w
-            if cur_line:
-                raw_lines.append(cur_line)
-
-            # Dọn dẹp ký tự ngăn cách ở đầu/cuối dòng (chống rớt dấu |, -, :, ;, /, \ xuống đầu dòng mới)
-            lines: List[str] = []
-            for idx, l in enumerate(raw_lines):
-                l_clean = l.strip()
-                if idx > 0:
-                    l_clean = re.sub(r"^[\|\-:\;/\\]+\s*", "", l_clean).strip()
-                l_clean = re.sub(r"\s*[\|\-:\;/\\]+$", "", l_clean).strip()
-                if l_clean:
-                    lines.append(l_clean)
-
-            line_h = get_line_h()
-            # Bù trừ line_spacing cho font lớn để 2 dòng ôm sát nhau chuẩn poster
-            eff_spacing = line_spacing
-            if cur_font_size >= 60:
-                eff_spacing = line_spacing - int(cur_font_size * 0.20)
-            elif cur_font_size >= 35:
-                eff_spacing = line_spacing - int(cur_font_size * 0.10)
-
-            total_h = len(lines) * line_h + (len(lines) - 1) * eff_spacing
-            max_line_w = max((get_w(l) for l in lines), default=0)
-
-            # Điều kiện đạt chuẩn: Không vượt quá max_lines (2 dòng), không tràn chiều rộng, không tràn chiều cao
-            if len(lines) <= max_lines and max_line_w <= avail_w and total_h <= avail_h:
-                return "\n".join(lines), cur_font_size
-
-            best_lines = lines if lines else raw_lines
-            best_size = cur_font_size
-            cur_font_size -= 2
-
-        return "\n".join(best_lines), best_size

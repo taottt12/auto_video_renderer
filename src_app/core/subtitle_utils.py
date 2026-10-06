@@ -100,6 +100,68 @@ def post_process_subtitle_text(text: str, keywords: str | List[str] = "") -> str
     return clean_t
 
 
+def split_long_subtitle_event(
+    start_sec: float,
+    end_sec: float,
+    text: str,
+    max_words_per_line: int = 6,
+    max_chars: int = 45,
+) -> List[Tuple[float, float, str]]:
+    """Tự động băm nhỏ các block sub quá dài (>= 8 từ hoặc >= 45 ký tự) thành các cụm 5-7 từ, tối đa 2 dòng."""
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return []
+
+    words = clean_text.split()
+    # Nếu câu đã ngắn (<= 7 từ và <= 45 ký tự) thì giữ nguyên
+    if len(words) <= 7 and len(clean_text) <= 45:
+        return [(start_sec, end_sec, clean_text)]
+
+    punct_marks = {".", "?", "!", ",", ":", ";", "—", "...", "…"}
+    chunks: List[str] = []
+    current_chunk: List[str] = []
+
+    for w in words:
+        current_chunk.append(w)
+        cur_t = " ".join(current_chunk)
+        is_punct = any(w.endswith(p) for p in punct_marks)
+
+        should_break = False
+        if is_punct and len(current_chunk) >= 2:
+            should_break = True
+        elif len(current_chunk) >= max_words_per_line:
+            should_break = True
+        elif len(cur_t) >= max_chars:
+            should_break = True
+
+        if should_break:
+            chunks.append(cur_t.strip())
+            current_chunk = []
+
+    if current_chunk:
+        rem = " ".join(current_chunk).strip()
+        if rem:
+            chunks.append(rem)
+
+    if not chunks:
+        return [(start_sec, end_sec, clean_text)]
+    if len(chunks) == 1:
+        return [(start_sec, end_sec, chunks[0])]
+
+    res: List[Tuple[float, float, str]] = []
+    tot_words = sum(max(1, len(c.split())) for c in chunks)
+    tot_dur = max(0.4, end_sec - start_sec)
+    cur_s = start_sec
+    for idx, c in enumerate(chunks):
+        w_c = max(1, len(c.split()))
+        c_dur = tot_dur * (w_c / tot_words)
+        c_e = end_sec if idx == len(chunks) - 1 else min(end_sec, cur_s + c_dur)
+        res.append((cur_s, c_e, c))
+        cur_s = c_e
+
+    return res
+
+
 def parse_srt_to_raw_events(
     srt_text: str,
     speed: float = 1.0,
@@ -129,7 +191,10 @@ def parse_srt_to_raw_events(
             txt = " ".join(text_lines).strip()
             if txt:
                 txt = post_process_subtitle_text(txt, keywords=keywords)
-                raw_events.append((s_sec, e_sec, txt))
+                # Băm nhỏ ngay nếu block sub trong SRT ban đầu quá dài
+                sub_chunks = split_long_subtitle_event(s_sec, e_sec, txt)
+                for cs, ce, ct in sub_chunks:
+                    raw_events.append((cs, ce, ct))
     return raw_events
 
 
@@ -153,8 +218,8 @@ def generate_rolling_2line_events(
         else:
             prev_t = raw_events[i - 1][2]
             prev_s = raw_events[i - 1][0]
-            # Chỉ gộp dòng trước nếu khoảng cách ngắn (<= 3.0s)
-            if s_i - prev_s <= 3.0:
+            # Chỉ gộp dòng trước nếu khoảng cách ngắn (<= 2.5s) và dòng trước không quá dài
+            if (s_i - prev_s <= 2.5) and (len(prev_t) + len(t_i) <= 65):
                 dialogues.append((start_ass, end_ass, f"{prev_t}\\N{t_i}"))
             else:
                 dialogues.append((start_ass, end_ass, t_i))
@@ -163,8 +228,8 @@ def generate_rolling_2line_events(
 
 def generate_cinema_hold_events(
     raw_events: List[Tuple[float, float, str]],
-    min_hold_sec: float = 1.2,
-    max_gap_bridge_sec: float = 0.5
+    min_hold_sec: float = 1.0,
+    max_gap_bridge_sec: float = 0.25
 ) -> List[Tuple[str, str, str]]:
     """Tạo event ASS chuẩn điện ảnh: hiển thị từng câu/cụm ngắn chuẩn xác theo nhịp phát âm."""
     dialogues: List[Tuple[str, str, str]] = []
@@ -591,10 +656,9 @@ def _run_isolated_whisper(
     audio_duration: float,
     cancel_event: Any,
     log_callback: Any,
-    progress_callback: Any,
+    progress_callback: Any = None,
     cpu_threads: int = 0,
     enhance_voice: bool = True,
-    vocal_separation: bool = True,
     initial_prompt: str = "",
 ) -> Tuple[bool, str, str]:
     """Chạy Whisper AI trong Process Sandbox riêng biệt để cách ly tuyệt đối lỗi driver/C++ khỏi GUI."""
@@ -625,10 +689,6 @@ def _run_isolated_whisper(
     ]
     if initial_prompt:
         cmd.extend(["--initial-prompt", str(initial_prompt)])
-    if vocal_separation:
-        cmd.append("--vocal-separation")
-    else:
-        cmd.append("--no-vocal-separation")
     if enhance_voice:
         cmd.append("--enhance-voice")
     else:
@@ -734,7 +794,6 @@ def transcribe_audio_to_srt(
     cancel_event: Any = None,
     audio_duration: float = 0.0,
     enhance_voice: bool = True,
-    vocal_separation: bool = True,
     initial_prompt: str = "",
 ) -> Tuple[Path, str]:
     """Tự động nghe audio bằng Whisper AI, nhận diện ngôn ngữ và xuất file .srt chuẩn xác theo từng từ với Process Sandbox 100% an toàn."""
@@ -787,7 +846,6 @@ def transcribe_audio_to_srt(
                 log_callback=log_callback,
                 progress_callback=progress_callback,
                 enhance_voice=enhance_voice,
-                vocal_separation=vocal_separation,
                 initial_prompt=initial_prompt,
             )
             if ok:
@@ -820,7 +878,6 @@ def transcribe_audio_to_srt(
             progress_callback=progress_callback,
             cpu_threads=cpu_threads_count,
             enhance_voice=enhance_voice,
-            vocal_separation=vocal_separation,
             initial_prompt=initial_prompt,
         )
         if not ok:

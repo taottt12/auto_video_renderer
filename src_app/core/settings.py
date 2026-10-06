@@ -113,12 +113,14 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "auto_transcribe": False,
         "whisper_language": "auto",
         "whisper_model": "turbo",
-        "whisper_enhance_voice": True,  # Lọc tạp âm & dải tần giọng nói giúp Whisper dịch chuẩn 100%
+        "whisper_enhance_voice": True,  # Lọc dải tần DSP giọng đọc & triệt tiêu nhạc nền
+        "sub_mode": "rolling_2line",
         "auto_detect_srt": True,
         "custom_sub_file": "",
         "font_name": "Arial",
         "font_size": 28,
         "font_color": "#FFFFFF",
+        "highlight_color": "#FFE600",
         "outline_color": "#000000",
         "outline_width": 2.5,
         "bold": True,

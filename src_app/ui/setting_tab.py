@@ -1225,14 +1225,9 @@ class SettingTab(QWidget):
 
         self.sub_mode_combo.currentIndexChanged.connect(self._on_sub_mode_changed)
 
-        self.sub_enhance_voice_cb = QCheckBox("⚡ Tăng cường dải tần giọng nói cho Whisper AI (Chống nuốt chữ)")
+        self.sub_enhance_voice_cb = QCheckBox("⚡ Lọc tăng cường dải tần giọng nói DSP (Khuyên dùng - Quét nhanh & chống nuốt chữ)")
         self.sub_enhance_voice_cb.setChecked(True)
-        self.sub_enhance_voice_cb.setToolTip("Khi bật, audio sẽ được lọc trước dải tần giọng nói qua FFmpeg để Whisper AI nhận diện phụ đề chuẩn xác 100%, không bị tiếng nhạc nền làm sót câu chữ.")
-
-        self.sub_vocal_sep_cb = QCheckBox("🔥 Tách giọng nói AI (Vocal Isolation - Bóc sạch nhạc nền & SFX trước khi bóc Sub)")
-        self.sub_vocal_sep_cb.setChecked(True)
-        self.sub_vocal_sep_cb.setStyleSheet("color: #00e676; font-weight: bold;")
-        self.sub_vocal_sep_cb.setToolTip("Khi bật, hệ thống tự động bóc tách triệt để luồng giọng nói sạch (Vocals), triệt tiêu hoàn toàn nhạc nền to, tiếng cười và SFX để Whisper AI bóc sub chính xác 100%.")
+        self.sub_enhance_voice_cb.setToolTip("Khi bật, audio sẽ được lọc dải tần giọng nói qua DSP/FFmpeg để Whisper AI nhận diện phụ đề chuẩn xác 100%, không bị tiếng nhạc nền làm sót câu chữ.")
 
         self.sub_whisper_keywords = QPlainTextEdit()
         self.sub_whisper_keywords.setFixedHeight(50)
@@ -1243,7 +1238,6 @@ class SettingTab(QWidget):
         form.addRow("Kiểu hiển thị", mode_row)
         form.addRow("Quét Sub tự động", auto_row)
         form.addRow("Từ khóa AI Prompt", self.sub_whisper_keywords)
-        form.addRow("Tách Voice AI", self.sub_vocal_sep_cb)
         form.addRow("Tăng cường AI", self.sub_enhance_voice_cb)
         form.addRow("Thư mục Sub (.srt)", folder_row)
 
@@ -1253,7 +1247,7 @@ class SettingTab(QWidget):
 
         layout.addLayout(form)
 
-        for w in (self.sub_enabled, self.sub_auto_transcribe, self.sub_whisper_lang, self.sub_whisper_model, self.sub_vocal_sep_cb, self.sub_enhance_voice_cb, self.sub_whisper_keywords, self.sub_folder_edit, self.sub_mode_combo, self.sub_highlight_color_edit):
+        for w in (self.sub_enabled, self.sub_auto_transcribe, self.sub_whisper_lang, self.sub_whisper_model, self.sub_enhance_voice_cb, self.sub_whisper_keywords, self.sub_folder_edit, self.sub_mode_combo, self.sub_highlight_color_edit):
             if hasattr(w, "stateChanged"):
                 w.stateChanged.connect(lambda: self._emit())
             elif hasattr(w, "currentIndexChanged"):
@@ -2028,7 +2022,6 @@ class SettingTab(QWidget):
                 "sub_mode": self.sub_mode_combo.currentData() if hasattr(self, "sub_mode_combo") else "rolling_2line",
                 "highlight_color": self.sub_highlight_color_edit.text().strip() or "#FFE600" if hasattr(self, "sub_highlight_color_edit") else "#FFE600",
                 "auto_transcribe": self.sub_auto_transcribe.isChecked() if hasattr(self, "sub_auto_transcribe") else False,
-                "whisper_vocal_separation": self.sub_vocal_sep_cb.isChecked() if hasattr(self, "sub_vocal_sep_cb") else True,
                 "whisper_enhance_voice": self.sub_enhance_voice_cb.isChecked() if hasattr(self, "sub_enhance_voice_cb") else True,
                 "whisper_keywords": self.sub_whisper_keywords.toPlainText().strip() if hasattr(self, "sub_whisper_keywords") else "",
                 "whisper_language": self.sub_whisper_lang.currentData() if hasattr(self, "sub_whisper_lang") else "auto",
@@ -2157,8 +2150,6 @@ class SettingTab(QWidget):
                 self._update_sub_highlight_btn_style()
             if hasattr(self, "sub_auto_transcribe"):
                 self.sub_auto_transcribe.setChecked(bool(sub_cfg.get("auto_transcribe", False)))
-            if hasattr(self, "sub_vocal_sep_cb"):
-                self.sub_vocal_sep_cb.setChecked(bool(sub_cfg.get("whisper_vocal_separation", True)))
             if hasattr(self, "sub_enhance_voice_cb"):
                 self.sub_enhance_voice_cb.setChecked(bool(sub_cfg.get("whisper_enhance_voice", True)))
             if hasattr(self, "sub_whisper_keywords"):

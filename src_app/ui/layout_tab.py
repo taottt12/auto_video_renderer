@@ -50,21 +50,46 @@ class LayoutCanvasWidget(QWidget):
         self.pixmap_cache: Dict[str, QPixmap] = {}
         self.movie_cache: Dict[str, QMovie] = {}
 
+        # Render cache & dirty tracking
+        self._cached_pixmap: Optional[QPixmap] = None
+        self._dirty: bool = True
+
         # Drag state
         self._drag_mode: Optional[str] = None  # 'move', 'nw', 'ne', 'sw', 'se', 'n', 's', 'w', 'e'
         self._drag_start_pos = QPoint()
         self._drag_start_box: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
         self._canvas_rect = QRect()
 
-        # Animation timer for live badges & GIF preview
+        # Animation timer for live badges & GIF preview (only runs when needed)
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._on_anim_tick)
         self._anim_t: float = 0.0
-        self._anim_timer.start(40)
+
+    def mark_dirty(self) -> None:
+        self._dirty = True
+        self.update()
+
+    def _has_animated_layers(self) -> bool:
+        for l in self.layers:
+            if not l.get("enabled", True):
+                continue
+            l_type = str(l.get("type", "")).lower()
+            fp = str(l.get("file_path", "")).lower()
+            if l_type in {"gif", "reaction"} or fp.endswith(".gif"):
+                return True
+            in_eff = str(l.get("in_effect", "none")).lower()
+            out_eff = str(l.get("out_effect", "none")).lower()
+            mot_eff = str(l.get("motion_effect", "none")).lower()
+            if in_eff != "none" or out_eff != "none" or (mot_eff != "none" and mot_eff != "static"):
+                return True
+        return False
 
     def _on_anim_tick(self) -> None:
+        if not self._has_animated_layers():
+            self._anim_timer.stop()
+            return
         self._anim_t += 0.04
-        self.update()
+        self.mark_dirty()
 
     def set_aspect_ratio(self, width: int = 1920, height: int = 1080) -> None:
         if width > 0 and height > 0:
@@ -72,7 +97,7 @@ class LayoutCanvasWidget(QWidget):
             self.ratio_h = float(height)
         else:
             self.ratio_w, self.ratio_h = 16.0, 9.0
-        self.update()
+        self.mark_dirty()
 
     def set_layers(self, layers: List[Dict[str, Any]], selected_idx: int = -1) -> None:
         self.layers = layers
@@ -85,12 +110,20 @@ class LayoutCanvasWidget(QWidget):
                 if l_type in {"gif", "reaction"} or fp.lower().endswith(".gif"):
                     if fp not in self.movie_cache:
                         movie = QMovie(fp)
-                        movie.frameChanged.connect(lambda _: self.update())
+                        movie.frameChanged.connect(lambda _: self.mark_dirty())
                         movie.start()
                         self.movie_cache[fp] = movie
                 elif fp not in self.pixmap_cache:
                     self.pixmap_cache[fp] = QPixmap(fp)
-        self.update()
+
+        if self._has_animated_layers():
+            if not self._anim_timer.isActive():
+                self._anim_timer.start(40)
+        else:
+            if self._anim_timer.isActive():
+                self._anim_timer.stop()
+
+        self.mark_dirty()
 
     def _get_pixmap(self, file_path: str, is_gif: bool = False) -> Optional[QPixmap]:
         if not file_path:
@@ -177,22 +210,28 @@ class LayoutCanvasWidget(QWidget):
         painter.fillRect(cr, QColor("#1e1e28"))
 
         # 2. Render Canvas thông qua LayoutRenderer (Single Source of Truth - Chuẩn xác 100% WYSIWYG)
-        try:
-            canvas_pil, _ = LayoutRenderer.render_canvas(
-                self.layers,
-                width=1920,
-                height=1080,
-                audio_title=self.preview_title,
-                preview_mode=True
-            )
-            if canvas_pil:
-                data = canvas_pil.tobytes("raw", "RGBA")
-                qimg = QImage(data, 1920, 1080, QImage.Format_RGBA8888)
-                pixmap = QPixmap.fromImage(qimg)
-                painter.drawPixmap(cr, pixmap)
-        except Exception as e:
-            painter.setPen(QColor("#ff5555"))
-            painter.drawText(cr, Qt.AlignCenter, f"Lỗi hiển thị Preview: {e}")
+        if self._dirty or self._cached_pixmap is None:
+            try:
+                canvas_pil, _ = LayoutRenderer.render_canvas(
+                    self.layers,
+                    width=1920,
+                    height=1080,
+                    audio_title=self.preview_title,
+                    preview_mode=True
+                )
+                if canvas_pil:
+                    data = canvas_pil.tobytes("raw", "RGBA")
+                    qimg = QImage(data, 1920, 1080, QImage.Format_RGBA8888)
+                    self._cached_pixmap = QPixmap.fromImage(qimg)
+                    self._dirty = False
+            except Exception as e:
+                self._cached_pixmap = None
+                self._dirty = False
+                painter.setPen(QColor("#ff5555"))
+                painter.drawText(cr, Qt.AlignCenter, f"Lỗi hiển thị Preview: {e}")
+
+        if self._cached_pixmap and not self._cached_pixmap.isNull():
+            painter.drawPixmap(cr, self._cached_pixmap)
 
         # 3. Đường lưới trung tâm snap
         painter.setPen(QPen(QColor(255, 255, 255, 30), 1, Qt.DashLine))
@@ -331,7 +370,7 @@ class LayoutCanvasWidget(QWidget):
                 cur_layer["box_h"] = round(nbh, 4)
 
             self.layer_changed.emit(self.selected_idx, cur_layer)
-            self.update()
+            self.mark_dirty()
             return
 
         # Cập nhật con trỏ chuột khi hover
@@ -732,6 +771,32 @@ class LayoutStudioTab(QWidget):
         sm_layout.addWidget(self.prop_scale_mode_combo)
         prop_layout.addRow("Co giãn Khung:", self.scale_mode_row_widget)
 
+        # Biến đổi ảnh (Rotation & Flip Horizontal / Vertical)
+        self.img_transform_row_widget = QWidget()
+        it_layout = QHBoxLayout(self.img_transform_row_widget)
+        it_layout.setContentsMargins(0, 0, 0, 0)
+        it_layout.setSpacing(6)
+
+        it_layout.addWidget(QLabel("Xoay:"))
+        self.prop_rotation_spin = QSpinBox()
+        self.prop_rotation_spin.setRange(-180, 180)
+        self.prop_rotation_spin.setValue(0)
+        self.prop_rotation_spin.setSuffix("°")
+        self.prop_rotation_spin.valueChanged.connect(lambda: self._on_prop_edited())
+        it_layout.addWidget(self.prop_rotation_spin)
+
+        self.prop_flip_h_btn = QPushButton("↔ Lật Ngang")
+        self.prop_flip_h_btn.setCheckable(True)
+        self.prop_flip_h_btn.toggled.connect(lambda: self._on_prop_edited())
+        it_layout.addWidget(self.prop_flip_h_btn)
+
+        self.prop_flip_v_btn = QPushButton("↕ Lật Dọc")
+        self.prop_flip_v_btn.setCheckable(True)
+        self.prop_flip_v_btn.toggled.connect(lambda: self._on_prop_edited())
+        it_layout.addWidget(self.prop_flip_v_btn)
+
+        prop_layout.addRow("Xoay & Lật ảnh:", self.img_transform_row_widget)
+
         # Text & Subtitle properties (hiện khi layer type == 'text' hoặc 'subtitle')
         self.text_props_widget = QWidget()
         tp_layout = QFormLayout(self.text_props_widget)
@@ -880,6 +945,13 @@ class LayoutStudioTab(QWidget):
         bg_row.addWidget(QLabel("Độ mờ:"))
         bg_row.addWidget(self.prop_bg_opacity_spin)
         tp_layout.addRow("Nền Box & Bo góc:", bg_row)
+
+        # Tự động co nhỏ chữ khi tràn khung (Auto Fit Title / Text)
+        self.prop_auto_fit_chk = QCheckBox("Tự động co nhỏ cỡ chữ khi tràn khung (Auto Fit)")
+        self.prop_auto_fit_chk.setChecked(True)
+        self.prop_auto_fit_chk.setToolTip("Khi BẬT: Tự động wrap từ ngữ và hạ cỡ chữ nếu cần để chữ nằm vừa vặn trong khung.\nKhi TẮT: Giữ nguyên 100% kích thước Font chữ đã chọn (vẫn tự động xuống dòng trong khung).")
+        self.prop_auto_fit_chk.toggled.connect(lambda: self._on_prop_edited())
+        tp_layout.addRow("Tối ưu cỡ chữ:", self.prop_auto_fit_chk)
 
         prop_layout.addRow(self.text_props_widget)
 
@@ -1126,9 +1198,24 @@ class LayoutStudioTab(QWidget):
         self.prop_scale_mode_combo.blockSignals(False)
 
         l_type = layer.get("type", "image")
+        is_img_like = l_type in {"image", "gif", "video_mask", "banner", "logo", "watermark", "chat_bubble", "reaction"}
         self.file_row_widget.setVisible(l_type in {"image", "gif", "video_mask", "banner", "logo", "watermark"})
-        self.scale_mode_row_widget.setVisible(l_type in {"image", "gif", "video_mask", "banner", "logo", "watermark", "chat_bubble", "reaction"})
+        self.scale_mode_row_widget.setVisible(is_img_like)
+        self.img_transform_row_widget.setVisible(is_img_like)
         self.text_props_widget.setVisible(l_type in {"text", "subtitle"})
+
+        if is_img_like:
+            self.prop_rotation_spin.blockSignals(True)
+            self.prop_rotation_spin.setValue(int(layer.get("rotation", 0) or 0))
+            self.prop_rotation_spin.blockSignals(False)
+
+            self.prop_flip_h_btn.blockSignals(True)
+            self.prop_flip_h_btn.setChecked(bool(layer.get("flip_h", False)))
+            self.prop_flip_h_btn.blockSignals(False)
+
+            self.prop_flip_v_btn.blockSignals(True)
+            self.prop_flip_v_btn.setChecked(bool(layer.get("flip_v", False)))
+            self.prop_flip_v_btn.blockSignals(False)
 
         # Hiển thị nhóm hiệu ứng In/Out/Motion chỉ cho Text và các loại Ảnh
         can_animate = l_type in {"text", "image", "banner", "logo", "watermark", "chat_bubble"}
@@ -1201,6 +1288,10 @@ class LayoutStudioTab(QWidget):
             if a_idx >= 0:
                 self.prop_align_combo.setCurrentIndex(a_idx)
             self.prop_align_combo.blockSignals(False)
+
+            self.prop_auto_fit_chk.blockSignals(True)
+            self.prop_auto_fit_chk.setChecked(bool(layer.get("auto_fit", True)))
+            self.prop_auto_fit_chk.blockSignals(False)
 
             self.prop_outline_width_spin.blockSignals(True)
             self.prop_outline_width_spin.setValue(float(layer.get("outline_width", 2.0 if l_type == "text" else 2.5) or 2.0))
@@ -1296,7 +1387,7 @@ class LayoutStudioTab(QWidget):
 
     def _on_preview_title_changed(self, text: str) -> None:
         self.canvas.preview_title = text.strip()
-        self.canvas.update()
+        self.canvas.mark_dirty()
 
     def _on_opacity_changed(self, val: int) -> None:
         self.prop_opacity_label.setText(f"{val}%")
@@ -1325,6 +1416,12 @@ class LayoutStudioTab(QWidget):
             layer["scale_mode"] = self.prop_scale_mode_combo.currentData() or "stretch"
 
             l_type = layer.get("type")
+            is_img_like = l_type in {"image", "gif", "video_mask", "banner", "logo", "watermark", "chat_bubble", "reaction"}
+            if is_img_like:
+                layer["rotation"] = self.prop_rotation_spin.value()
+                layer["flip_h"] = self.prop_flip_h_btn.isChecked()
+                layer["flip_v"] = self.prop_flip_v_btn.isChecked()
+
             if l_type in {"text", "subtitle"}:
                 layer["text_content"] = self.prop_text_content.toPlainText()
                 layer["font_name"] = self.prop_font_combo.currentFont().family()
@@ -1332,6 +1429,7 @@ class LayoutStudioTab(QWidget):
                 layer["bold"] = self.prop_bold_btn.isChecked()
                 layer["italic"] = self.prop_italic_btn.isChecked()
                 layer["align"] = self.prop_align_combo.currentData() or "center"
+                layer["auto_fit"] = self.prop_auto_fit_chk.isChecked()
                 layer["outline_width"] = self.prop_outline_width_spin.value()
                 layer["box_radius"] = self.prop_box_radius_spin.value()
                 layer["bg_box_opacity"] = round(self.prop_bg_opacity_spin.value() / 100.0, 2)
