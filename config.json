@@ -1,6 +1,6 @@
 {
   "audio_files": [
-    "F:/YT/thumb/ania-la-ketdin-5-episodes-86-ilocano-comedy-drama-september-19-2026-anialaket_4EnJs831.mp3"
+    "F:/YT/mp3/yt/ania la kitdin/6-10 ANIA LA KETDIN ILOCANO COMEDY DRAMA  COMPILATION EPISODE - SEPTEMBER 28, 2026  Martinez Ilocano - Martinez Ilocano Comedy.mp3"
   ],
   "audio_source_mode": "crawler",
   "audio_crawler": {
@@ -81,7 +81,7 @@
   "transition_duration": 2.0,
   "layout_studio": {
     "enabled": true,
-    "selected_preset": "custom_tam",
+    "selected_preset": "custom_ANIA LA KETDIN 2",
     "layers": [
       {
         "blend_mode": "alpha",
@@ -144,22 +144,23 @@
         "bg_box_opacity": 0.5,
         "blend_mode": "alpha",
         "bold": true,
-        "box_h": 0.4871,
+        "box_h": 0.2422,
         "box_radius": 10,
-        "box_w": 0.8966,
-        "box_x": -0.0074,
-        "box_y": -0.0998,
+        "box_w": 0.7951,
+        "box_x": 0.0401,
+        "box_y": 0.0458,
         "enabled": true,
         "file_path": "",
         "font_color": "#00ff00",
-        "font_name": "Brush Script MT",
+        "font_name": "Britannic Bold",
         "font_size": 257,
         "id": "layer_724539",
         "in_duration": 1.6,
         "in_effect": "fade_in",
         "italic": true,
+        "italic_mode": "right",
         "locked": false,
-        "motion_effect": "pulse",
+        "motion_effect": "karaoke_bounce",
         "name": "tiêu-đề",
         "opacity": 1.0,
         "out_effect": "none",
@@ -207,11 +208,11 @@
         "bg_box_opacity": 0.5,
         "blend_mode": "alpha",
         "bold": true,
-        "box_h": 0.3164,
+        "box_h": 0.3465,
         "box_radius": 8,
-        "box_w": 0.7736,
-        "box_x": 0.1618,
-        "box_y": 0.2656,
+        "box_w": 0.9236,
+        "box_x": 0.0783,
+        "box_y": 0.242,
         "enabled": true,
         "file_path": "",
         "font_color": "#5500ff",
@@ -221,6 +222,7 @@
         "in_duration": 0.8,
         "in_effect": "none",
         "italic": true,
+        "italic_mode": "right",
         "locked": false,
         "motion_effect": "none",
         "name": "tiêu-đề (Copy)",
@@ -229,7 +231,7 @@
         "outline_color": "#ffff7f",
         "outline_width": 8.0,
         "scale_mode": "stretch",
-        "text_content": "BINALITUNGEG & PARAMMAG LA GAYAM",
+        "text_content": "TRENDING EPISODES",
         "type": "text"
       },
       {
@@ -370,7 +372,7 @@
     "whisper_language": "tl",
     "whisper_model": "turbo",
     "whisper_enhance_voice": true,
-    "sub_mode": "cinema_hold",
+    "sub_mode": "karaoke_highlight",
     "auto_detect_srt": true,
     "custom_sub_file": "",
     "font_name": "Arial",
@@ -386,14 +388,13 @@
     "bg_box_enabled": false,
     "bg_box_color": "#000000",
     "bg_box_opacity": 0.5,
-    "box_x": 0.15,
-    "box_y": 0.7,
-    "box_w": 0.7,
-    "box_h": 0.2,
+    "box_x": 0.0766,
+    "box_y": 0.7681,
+    "box_w": 0.7769,
+    "box_h": 0.1953,
     "folder": "",
     "font_family": "Arial",
-    "whisper_keywords": "ayna wow,",
-    "whisper_vocal_separation": true
+    "whisper_keywords": "ayna wow,"
   },
   "export": {
     "ratio": "16:9",

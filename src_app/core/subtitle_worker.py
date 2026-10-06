@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 # Cấu hình an toàn OpenMP, CUDA và mã hóa UTF-8
@@ -22,6 +23,7 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Thêm đường dẫn ffmpeg nội bộ của tool vào PATH nếu có
 _ROOT = Path(__file__).resolve().parents[2]
@@ -40,6 +42,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from src_app.core.subtitle_utils import (
+    CUDA_FATAL_EXIT_CODE,
     _register_cuda_dll_directories,
     format_timestamp_srt,
     post_process_subtitle_text,
@@ -171,10 +174,90 @@ def group_words_into_phrases(
 def normalize_whisper_model_name(raw_name: str) -> str:
     """Chuẩn hóa tên model theo danh mục hỗ trợ chuẩn của OpenAI Whisper."""
     name = str(raw_name or "turbo").strip().lower()
+    if name in ["turbo", "large-v3-turbo", "large_v3_turbo", "large-turbo", "turbo-v3"]:
+        return "turbo"
+    valid_exact = [
+        "tiny.en", "tiny",
+        "base.en", "base",
+        "small.en", "small",
+        "medium.en", "medium",
+        "large-v3", "large-v2", "large-v1", "large",
+    ]
+    if name in valid_exact:
+        return name
+    for valid in valid_exact:
+        if name == valid or name.startswith(valid) or f"/{valid}" in name or f"-{valid}" in name or f"_{valid}" in name:
+            return valid
+    if "turbo" in name:
+        return "turbo"
     if "medium" in name:
         return "medium"
-    # Mặc định tất cả các lựa chọn khác đều map chuẩn sang turbo (large-v3-turbo.pt) đã có sẵn trong cache
+    if "small" in name:
+        return "small"
+    if "base" in name:
+        return "base"
+    if "tiny" in name:
+        return "tiny"
+    if "large" in name:
+        return "large-v3"
     return "turbo"
+
+
+def get_cuda_memory_mb() -> tuple[float, float, float, float]:
+    """Trả về (allocated_mb, reserved_mb, max_allocated_mb, free_mb) trên thiết bị CUDA hiện tại."""
+    import torch
+    if not torch.cuda.is_available():
+        return 0.0, 0.0, 0.0, 0.0
+    try:
+        alloc = torch.cuda.memory_allocated() / (1024 * 1024)
+        res = torch.cuda.memory_reserved() / (1024 * 1024)
+        max_alloc = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        free_bytes, _ = torch.cuda.mem_get_info()
+        free_mb = free_bytes / (1024 * 1024)
+        return alloc, res, max_alloc, free_mb
+    except Exception:
+        return 0.0, 0.0, 0.0, 0.0
+
+
+def check_cuda_sanity() -> bool:
+    """Kiểm tra xem CUDA context có còn sống và thực thi kernel tensor cơ bản được hay không."""
+    import torch
+    if not torch.cuda.is_available():
+        return False
+    try:
+        t = torch.zeros((4, 4), device="cuda", dtype=torch.float32)
+        t = t + 1.0
+        torch.cuda.synchronize()
+        del t
+        return True
+    except Exception:
+        return False
+
+
+def clean_cuda_vram() -> None:
+    """Thu gom rác và giải phóng toàn bộ cached memory blocks của PyTorch Caching Allocator trên GPU."""
+    import torch
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
+def safe_load_whisper_model(model_name: str, device: str):
+    """
+    Nạp OpenAI Whisper chuẩn 100% bằng API gốc của whisper.load_model:
+    - Bảo toàn nguyên vẹn memory layout, sparse tensors (alignment_heads),
+      positional embeddings và attention buffers của Whisper.
+    - Dọn dẹp cache VRAM trước và sau khi load để tối ưu bộ nhớ sạch sẽ.
+    """
+    import whisper
+    clean_cuda_vram()
+    model = whisper.load_model(model_name, device=device)
+    clean_cuda_vram()
+    return model
 
 
 
@@ -194,6 +277,10 @@ def run_worker(args: argparse.Namespace) -> int:
     cpu_threads = int(args.cpu_threads or 0)
     initial_prompt = str(args.initial_prompt or "").strip()
 
+    gpu_name = torch.cuda.get_device_name(0) if (torch.cuda.is_available() and device == "cuda") else "N/A"
+    worker_pid = os.getpid()
+    emit_msg("log", {"text": f"🚀 [Worker PID: {worker_pid}] Khởi động tiến trình con trên {device.upper()} (GPU: {gpu_name})..."})
+
     if device == "cuda" and not torch.cuda.is_available():
         emit_msg("log", {"text": "⚠️ GPU CUDA không khả dụng trên tiến trình worker, tự động chuyển sang CPU..."})
         device = "cpu"
@@ -206,7 +293,6 @@ def run_worker(args: argparse.Namespace) -> int:
 
     input_to_whisper = audio_path
     temp_clean_wav: Path | None = None
-
 
     # GIAI ĐOẠN 1: BỘ LỌC TĂNG CƯỜNG DẢI TẦN GIỌNG NÓI & TRIỆT TIÊU TẠP ÂM (FFMPEG DSP)
     if getattr(args, "enhance_voice", True):
@@ -235,22 +321,75 @@ def run_worker(args: argparse.Namespace) -> int:
         except Exception as filter_err:
             emit_msg("log", {"text": f"ℹ️ Bộ lọc tiền xử lý bỏ qua ({filter_err}), tiếp tục dùng audio gốc."})
 
+    # Xác định Audio Length
+    audio_len_str = f"{duration:.2f}s" if duration > 0 else "Auto-detect"
+
     # FP16 trên CUDA tận dụng Tensor Cores, giảm 50% VRAM và tăng tốc gấp đôi
     use_fp16 = bool(device == "cuda")
-    device_label = "GPU CUDA (NVIDIA)" if device == "cuda" else "CPU Đa Luồng"
+    device_label = f"GPU CUDA ({gpu_name})" if device == "cuda" else "CPU Đa Luồng"
+
+    # MỐC 1: TRƯỚC KHI LOAD MODEL
+    if device == "cuda":
+        clean_cuda_vram()
+        alloc_mb, res_mb, max_mb, free_mb = get_cuda_memory_mb()
+        emit_msg("log", {"text": f"📊 [CUDA VRAM Before Model Load] Model: {model_name}, Audio Length: {audio_len_str}, Device: {device_label} | Alloc: {alloc_mb:.1f}MB, Res: {res_mb:.1f}MB, MaxAlloc: {max_mb:.1f}MB, Free: {free_mb:.1f}MB"})
 
     emit_msg("log", {"text": f"Đang nạp Whisper AI [{model_name}] trên {device_label}..."})
-    model = whisper.load_model(model_name, device=device)
+    try:
+        model = safe_load_whisper_model(model_name, device=device)
+    except Exception as load_err:
+        alloc_mb, res_mb, max_mb, free_mb = get_cuda_memory_mb()
+        stack = traceback.format_exc()
+        emit_msg("log", {"text": f"❌ [Model Load Error] Không thể nạp model {model_name} trên {device_label}:\n"
+                                 f"VRAM State: Alloc={alloc_mb:.1f}MB, Res={res_mb:.1f}MB, MaxAlloc={max_mb:.1f}MB, Free={free_mb:.1f}MB\n"
+                                 f"Error: {load_err}\nFull Stacktrace:\n{stack}"})
+        if device == "cuda":
+            emit_msg("error", {"text": f"CUDA Fatal Error during model load: {load_err}"})
+            sys.exit(CUDA_FATAL_EXIT_CODE)
+        raise
+
+    # MỐC 2: SAU KHI LOAD MODEL - GIẢI PHÓNG NGAY CACHE PEAK CỦA ALLOCATOR
+    if device == "cuda":
+        clean_cuda_vram()
+        alloc_mb, res_mb, max_mb, free_mb = get_cuda_memory_mb()
+        emit_msg("log", {"text": f"📊 [CUDA VRAM After Model Load] Model: {model_name}, Audio Length: {audio_len_str}, Device: {device_label} | Alloc: {alloc_mb:.1f}MB, Res: {res_mb:.1f}MB, MaxAlloc: {max_mb:.1f}MB, Free: {free_mb:.1f}MB"})
+
+        # Sanity Check kiểm tra tính toàn vẹn của CUDA context sau khi load model
+        if not check_cuda_sanity():
+            emit_msg("log", {"text": "❌ [CUDA Sanity Check] GPU CUDA context bị hỏng hoặc không phản hồi sau khi nạp model. Thoát worker để sandbox xử lý cô lập..."})
+            emit_msg("error", {"text": "CUDA Sanity Check Failed after model load"})
+            sys.exit(CUDA_FATAL_EXIT_CODE)
 
     lang_desc = f"ngôn ngữ [{target_lang.upper()}]" if target_lang else "tự động nhận diện"
     if initial_prompt:
         emit_msg("log", {"text": f"💡 Whisper Context Prompt: Gợi ý từ khóa [{initial_prompt}]"})
     emit_msg("log", {"text": f"Đang quét giọng nói trong '{audio_path.name}' ({lang_desc}) bằng {device_label}..."})
 
-    with torch.no_grad():
-        result = None
+    # MỐC 3: TRƯỚC KHI TRANSCRIBE
+    if device == "cuda":
+        clean_cuda_vram()
+        alloc_mb, res_mb, max_mb, free_mb = get_cuda_memory_mb()
+        emit_msg("log", {"text": f"📊 [CUDA VRAM Before Transcribe] Model: {model_name}, Audio Length: {audio_len_str}, Device: {device_label} | Alloc: {alloc_mb:.1f}MB, Res: {res_mb:.1f}MB, MaxAlloc: {max_mb:.1f}MB, Free: {free_mb:.1f}MB"})
+
+    # Tối ưu siêu tham số decode cho GPU 6GB: Greedy Search cho turbo/large/medium model tiết kiệm VRAM và tăng tốc gấp 3
+    is_large_or_turbo = (device == "cuda" and any(k in model_name.lower() for k in ("turbo", "large", "medium")))
+    whisper_temp = 0.0 if is_large_or_turbo else (0.0, 0.2, 0.4)
+    whisper_beam = 1 if is_large_or_turbo else 5
+
+    inference_context = torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
+    with inference_context():
+        emit_msg("log", {"text": f"Đang quét giọng nói với độ chính xác chuẩn từng từ (Word-level timestamps) [Model: {model_name}, Audio: {audio_len_str}]..."})
         try:
-            emit_msg("log", {"text": f"Đang quét giọng nói với độ chính xác chuẩn từng từ (Word-level timestamps)..."})
+            # Simulation hook để test Process Sandbox CUDA crash
+            if os.environ.get("AVR_SIMULATE_CUDA_CRASH") == "1":
+                sim_flag = Path(os.environ.get("AVR_SIMULATE_FLAG_FILE", ""))
+                if sim_flag.exists():
+                    try:
+                        sim_flag.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
             result = model.transcribe(
                 str(input_to_whisper),
                 language=target_lang,
@@ -261,24 +400,58 @@ def run_worker(args: argparse.Namespace) -> int:
                 no_speech_threshold=0.3,
                 logprob_threshold=-1.0,
                 condition_on_previous_text=False,
-                temperature=(0.0, 0.2, 0.4),
-                beam_size=5,
+                temperature=whisper_temp,
+                beam_size=whisper_beam,
             )
-        except Exception as wt_err:
-            emit_msg("log", {"text": f"ℹ️ Chuyển sang Native Tokens an toàn ({wt_err})..."})
-            result = model.transcribe(
-                str(input_to_whisper),
-                language=target_lang,
-                initial_prompt=initial_prompt if initial_prompt else None,
-                fp16=use_fp16,
-                verbose=False,
-                word_timestamps=False,
-                no_speech_threshold=0.3,
-                logprob_threshold=-1.0,
-                condition_on_previous_text=False,
-                temperature=(0.0, 0.2, 0.4),
-                beam_size=5,
-            )
+        except torch.cuda.OutOfMemoryError as oom_err:
+            alloc_mb, res_mb, max_mb, free_mb = get_cuda_memory_mb()
+            stack = traceback.format_exc()
+            emit_msg("log", {"text": f"❌ [CUDA Out of Memory] Model: {model_name}, Audio Length: {audio_len_str}, GPU: {gpu_name}\n"
+                                     f"VRAM State: Alloc={alloc_mb:.1f}MB, Res={res_mb:.1f}MB, MaxAlloc={max_mb:.1f}MB, Free={free_mb:.1f}MB\n"
+                                     f"Error: {oom_err}\nFull Stacktrace:\n{stack}"})
+            emit_msg("error", {"text": f"CUDA Out of Memory: {oom_err}"})
+            sys.exit(CUDA_FATAL_EXIT_CODE)
+        except Exception as trans_err:
+            err_str = str(trans_err).lower()
+            alloc_mb, res_mb, max_mb, free_mb = get_cuda_memory_mb()
+            stack = traceback.format_exc()
+
+            is_fatal_cuda = (device == "cuda") and any(k in err_str for k in [
+                "illegal memory access",
+                "device-side assert",
+                "cublas_status_execution_failed",
+                "cublas",
+                "cudnn",
+                "cuda context",
+                "cuda error",
+                "out of memory",
+                "cufft",
+                "curand",
+                "cusparse",
+                "an illegal memory access",
+            ])
+
+            if is_fatal_cuda:
+                emit_msg("log", {"text": f"❌ [CUDA Fatal Error: {trans_err.__class__.__name__}] Model: {model_name}, Audio Length: {audio_len_str}, GPU: {gpu_name}\n"
+                                         f"VRAM State: Alloc={alloc_mb:.1f}MB, Res={res_mb:.1f}MB, MaxAlloc={max_mb:.1f}MB, Free={free_mb:.1f}MB\n"
+                                         f"Error: {trans_err}\nFull Stacktrace:\n{stack}"})
+                emit_msg("error", {"text": f"CUDA Fatal Error: {trans_err}"})
+                sys.exit(CUDA_FATAL_EXIT_CODE)
+            elif device == "cuda" and ("cuda" in err_str or not check_cuda_sanity()):
+                emit_msg("log", {"text": f"❌ [CUDA Unrecoverable State] CUDA context không còn hợp lệ sau lỗi: {trans_err}\n"
+                                         f"Error: {trans_err}\nFull Stacktrace:\n{stack}"})
+                emit_msg("error", {"text": f"CUDA State Error: {trans_err}"})
+                sys.exit(CUDA_FATAL_EXIT_CODE)
+            else:
+                emit_msg("log", {"text": f"❌ [Inference Error] {trans_err}\nStacktrace:\n{stack}"})
+                emit_msg("error", {"text": str(trans_err)})
+                sys.exit(1)
+
+    # MỐC 4: SAU KHI TRANSCRIBE
+    if device == "cuda":
+        clean_cuda_vram()
+        alloc_mb, res_mb, max_mb, free_mb = get_cuda_memory_mb()
+        emit_msg("log", {"text": f"📊 [CUDA VRAM After Transcribe] Model: {model_name}, Audio Length: {audio_len_str}, Device: {device_label} | Alloc: {alloc_mb:.1f}MB, Res: {res_mb:.1f}MB, MaxAlloc: {max_mb:.1f}MB, Free: {free_mb:.1f}MB"})
 
     # Dọn dẹp file wav tạm sau khi transcribe
     if temp_clean_wav and temp_clean_wav.exists():
@@ -349,6 +522,8 @@ def run_worker(args: argparse.Namespace) -> int:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        alloc_mb, res_mb, max_mb, free_mb = get_cuda_memory_mb()
+        emit_msg("log", {"text": f"📊 [CUDA VRAM] Sau khi dọn dẹp: Đã cấp phát {alloc_mb:.1f}MB, Dự trữ {res_mb:.1f}MB, VRAM trống: {free_mb:.1f}MB"})
 
     valid_events = []
     for s, e, t in events_list:

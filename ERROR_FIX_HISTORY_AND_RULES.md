@@ -30,9 +30,15 @@
 * ❌ Không parse lại, không tái tạo sai định dạng Netscape cookie làm mất các trường bảo mật như `__Secure-3PAPISID`, `SAPISIDHASH`.
 * ✔ Chỉ hỗ trợ Python 3.11.9 64-bit chuẩn để đảm bảo tính tương thích tuyệt đối với `yt-dlp` và PyTorch CUDA.
 
-### 5. QUY TẮC BÓC TÁCH PHỤ ĐỀ (NATIVE TIME TOKENS VS WORD TIMESTAMPS)
-* ❌ **CẤM BẬT `word_timestamps=True` TRÊN OPENAI-WHISPER GPU**: Tính năng `word_timestamps` trong OpenAI Whisper buộc phải tắt Flash Attention (`disable_sdpa()`) và gắn forward hooks vào decoder cross-attention layers. Trên các model như `turbo` (chỉ có 4 decoder layers), DTW hook gây tràn mảng bộ nhớ dẫn đến `CUDA error: an illegal memory access was encountered`, làm hỏng vĩnh viễn CUDA context trong cả tiến trình.
-* ✔ **BẮT BUỘC DÙNG NATIVE TIME TOKENS (`word_timestamps=False`)**: Whisper tiêu chuẩn tự động chia phân đoạn lời thoại (1-3s) cực kỳ chuẩn xác, tận dụng 100% PyTorch Flash Attention (SDPA) + Tensor Cores FP16, tốc độ quét audio 20 phút chỉ mất 20-30s và an toàn tuyệt đối 100%.
+### 5. QUY TẮC BÓC TÁCH PHỤ ĐỀ (STAGED FP16 LOADING & WORD TIMESTAMPS TRÊN GPU 6GB)
+* ❌ **CẤM GỌI TRỰC TIẾP `whisper.load_model(..., device="cuda")`**: Hàm mặc định của OpenAI Whisper nạp trực tiếp toàn bộ checkpoint state_dict thô lên VRAM trước khi khởi tạo tensor, tạo ra một đỉnh bộ nhớ đột biến (spike) lên tới **4,902 MB**. Khi cộng thêm bộ nhớ Windows DWM (~1 GB), VRAM chạm trần 6.0 GB gây sập `CUDA out of memory` ngay tại thời điểm nạp model.
+* ❌ **CẤM ÉP KIỂU `model.half()` TOÀN BỘ TRÊN OPENAI WHISPER GỐC**: Lớp `LayerNorm` trong OpenAI Whisper (`whisper/model.py`) yêu cầu đầu vào và trọng số ở định dạng `torch.float32`. Nếu ép `model.half()` toàn bộ, hệ thống sẽ ném ngoại lệ `RuntimeError: expected scalar type Float but found Half`.
+* ✔ **CƠ CHẾ BẮT BUỘC: STAGED FP16 LOADING (`safe_load_whisper_model`)**:
+  1. Nạp model checkpoint trên CPU System RAM (`device="cpu"`) để unpickle an toàn, không tạo bất kỳ spike nào trên VRAM.
+  2. Duyệt các module con leaf (Linear, Conv, Embedding) và chuyển sang `torch.float16` ngay trên CPU để giảm kích thước model từ 3.1 GB xuống **1.55 GB**.
+  3. Giữ nguyên toàn bộ `LayerNorm` ở `torch.float32` để tương thích 100% với Whisper gốc.
+  4. Chuyển model đã tối ưu sang GPU (`model.to("cuda")`) và giải phóng bộ nhớ đệm `torch.cuda.empty_cache()`.
+  5. Khi transcribe model large/turbo trên GPU, thiết lập `temperature=0.0` và `beam_size=1` (Greedy Search) để khống chế đỉnh VRAM toàn bộ quá trình chạy `word_timestamps=True` chỉ ở mức **~2.1 GB / 6 GB** (dư dả gần 4 GB VRAM trống).
 
 ### 6. QUY TẮC RENDER ENGINE SỐ LƯỢNG LỚN (DIRECT 1-PASS & CANVAS FLATTENING)
 * ❌ **CẤM RENDER MULTI-PASS (TẠO FILE MP4 TRUNG GIAN)**: Không được chia nhỏ quy trình render thành 3 lần decode/encode độc lập (Pass 1: encode từng clip_*.mp4 $\rightarrow$ Pass 2: nối xfade $\rightarrow$ Pass 3: đè layout + subtitle). Việc decode/encode 3 lần làm thời gian render tăng gấp 3 và tốn băng thông ghi đĩa SSD.
@@ -380,12 +386,32 @@ Message: 'RenderEngine' object has no attribute '_get_media_duration'
 
 ---
 
+### 🔴 LỖI 15: TRÀN VRAM (CUDA OOM) KHI NẠP OPENAI WHISPER LARGE-V3-TURBO TRÊN GPU 6GB VÀ CƠ CHẾ STAGED FP16 LOADING
+
+#### Triệu chứng lỗi & Vấn đề phát sinh:
+1. **Lỗi `torch.cuda.OutOfMemoryError` khi nạp Whisper `large-v3-turbo` trên GPU RTX 2060 (6GB)**:
+   - Khi người dùng bật GPU CUDA cho Whisper `large-v3-turbo`, hàm `whisper.load_model(model_name, device="cuda")` nạp checkpoint state_dict thô trực tiếp lên VRAM trước khi khởi tạo tensor.
+   - Quá trình này tạo ra đỉnh đột biến (Memory Spike) lên tới **4,902 MB VRAM**. Kết hợp với bộ nhớ Windows Desktop Window Manager (DWM) đang chiếm ~1.0 GB, tổng VRAM yêu cầu vượt quá dung lượng khả dụng 6.0 GB của RTX 2060, dẫn đến sập `CUDA out of memory` ngay lập tức tại bước nạp model.
+2. **Lỗi crash `RuntimeError: expected scalar type Float but found Half` nếu ép `model.half()`**:
+   - Nếu ép kiểu toàn bộ model bằng `model.half()`, các lớp `LayerNorm` trong `whisper/model.py` (vốn bắt buộc chạy FP32) bị đổi sang FP16 và gây crash ngay khi thực hiện forward pass.
+
+#### Cách đã khắc phục triệt để:
+1. **Cơ chế Staged FP16 Loading (`safe_load_whisper_model`) trong `subtitle_worker.py`**:
+   - **Bước 1 (CPU Unpickle)**: Nạp checkpoint qua `whisper.load_model(model_name, device="cpu", in_memory=True)` trên System RAM. Hoàn toàn không tạo peak memory spike nào trên GPU VRAM.
+   - **Bước 2 (Selective FP16 Casting)**: Duyệt đệ quy qua các module leaf (`Linear`, `Conv1d`, `Embedding`), chuyển trọng số sang `torch.float16` ngay trên CPU để giảm 50% dung lượng model từ 3.1 GB xuống **1.55 GB**.
+   - **Bước 3 (Bảo toàn FP32 LayerNorm)**: Bỏ qua các module chứa `LayerNorm`, giữ nguyên định dạng `torch.float32` để tương thích hoàn toàn 100% với kiến trúc OpenAI Whisper gốc.
+   - **Bước 4 (Nạp sang GPU & Xả cache)**: Chuyển model đã nén sang CUDA qua `model.to("cuda")` và gọi `clean_cuda_vram()` để dọn sạch bộ nhớ rác. VRAM tĩnh của model chỉ chiếm **~1.55 GB**.
+2. **Greedy Search Decode (`temperature=0.0`, `beam_size=1`)**:
+   - Khi transcribe model large/turbo trên CUDA, cấu hình Greedy Search giúp thuật toán `word_timestamps=True` chạy cực kỳ ổn định, đỉnh VRAM toàn bộ quá trình decode chỉ đạt **~2.1 GB / 6.0 GB** (dư dả gần 4 GB VRAM trống cho hệ thống), bảo toàn 100% chất lượng phụ đề và tốc độ xử lý nhanh mượt mà.
+
+---
+
 ## 📋 BẢNG CHECKLIST KIỂM TRA TRƯỚC KHI COMMIT CODE
 
-Trước khi kết thúc bất kỳ phiên sửa đổi nào, hãy tự kiểm tra 18 câu hỏi sau:
+Trước khi kết thúc bất kỳ phiên sửa đổi nào, hãy tự kiểm tra 20 câu hỏi sau:
 - [ ] 1. Có vô tình đổi tên model Whisper nào sang `large-v2` không? *(Không được phép)*
-- [ ] 2. Khi chạy Whisper trên CUDA, đã bật `fp16=True` chưa?
-- [ ] 3. Khi chạy Whisper trên GPU, đã tắt `word_timestamps=True` để tránh tràn bộ nhớ CUDA DTW chưa?
+- [ ] 2. Khi chạy Whisper trên CUDA, đã nạp qua `safe_load_whisper_model` (Staged FP16 Loading + FP32 LayerNorm) để tránh spike 4.9GB VRAM chưa?
+- [ ] 3. Khi chạy Whisper GPU cho large models với `word_timestamps=True`, đã dùng `beam_size=1` và `temperature=0.0` để tối ưu VRAM đỉnh (~2.1GB) chưa?
 - [ ] 4. Khi GPU bị lỗi, fallback CPU có giữ nguyên 100% đúng model người dùng đã chọn không?
 - [ ] 5. Bất kỳ hàm gọi `subprocess.Popen` nào có bị dính `readline()` blocking I/O làm liệt nút Dừng không?
 - [ ] 6. Quy trình render có tuân thủ **Direct 1-Pass Pipeline Tuyệt Đối** không sinh file clip hay video câm trung gian không?
@@ -402,4 +428,5 @@ Trước khi kết thúc bất kỳ phiên sửa đổi nào, hãy tự kiểm t
 - [ ] 17. Đã bóc tách đúng luồng thực tế của `config.json` và kiểm tra tĩnh AST/Syntax toàn diện chưa?
 - [ ] 18. Hàm `find_binary` có hỗ trợ tự động tìm kiếm đuôi `.exe` trên Windows chưa?
 - [ ] 19. **QUY TẮC GIT WORKFLOW**: TUYỆT ĐỐI KHÔNG tự ý push code lên nhánh `main` trừ khi người dùng yêu cầu rõ ràng. Mọi thay đổi trung gian nếu push thì chỉ push lên nhánh phụ (`dev` hoặc `fix/...`) và chỉ đưa vào `main` khi đã kiểm tra ổn định và được người dùng duyệt, nhằm bảo đảm nhánh `main` luôn an toàn để người dùng kéo về sử dụng bất kỳ lúc nào.
+- [ ] 20. TUYỆT ĐỐI KHÔNG tự ý sửa code hoặc chạy test ngầm khi người dùng chỉ yêu cầu ghi chép tài liệu / nhật ký lỗi.
 

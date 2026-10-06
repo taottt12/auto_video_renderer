@@ -2,6 +2,8 @@ import os
 import re
 import sys
 import json
+import math
+import colorsys
 import hashlib
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
@@ -16,15 +18,17 @@ from src_app.core.paths import CACHE_DIR, ASSETS_DIR
 _FONT_PATH_CACHE: Dict[Tuple[str, bool, bool], Optional[Path]] = {}
 _FONT_OBJ_CACHE: Dict[Tuple[str, int], Any] = {}
 _LAYER_IMG_CACHE: Dict[Tuple[str, int, int, str, float, bool, bool, float, float], Image.Image] = {}
+_TEXT_CHIP_CACHE: Dict[Tuple[str, int, str, str, int, bool, int, int], Image.Image] = {}
 _REGISTRY_FONTS_CACHE: Optional[List[Tuple[str, Path]]] = None
 
 
 def clear_layout_caches():
     """Xóa sạch các tầng cache trong bộ nhớ khi cần thiết."""
-    global _FONT_PATH_CACHE, _FONT_OBJ_CACHE, _LAYER_IMG_CACHE, _REGISTRY_FONTS_CACHE
+    global _FONT_PATH_CACHE, _FONT_OBJ_CACHE, _LAYER_IMG_CACHE, _TEXT_CHIP_CACHE, _REGISTRY_FONTS_CACHE
     _FONT_PATH_CACHE.clear()
     _FONT_OBJ_CACHE.clear()
     _LAYER_IMG_CACHE.clear()
+    _TEXT_CHIP_CACHE.clear()
     _REGISTRY_FONTS_CACHE = None
 
 
@@ -259,6 +263,135 @@ def clean_text_content(text: str) -> str:
     return s.strip()
 
 
+def is_genuine_italic_font(font_path: Optional[Path]) -> bool:
+    """
+    Kiểm tra xem file font có phải là biến thể italic tự nhiên (native italic) hay không.
+    Nếu font là Regular/Bold (như Haettenschweiler, Impact, Goudy Stout) -> trả về False để kích hoạt Synthetic Skew.
+    """
+    if not font_path:
+        return False
+    name_lower = font_path.name.lower()
+    if any(tag in name_lower for tag in ["italic", "oblique", "i.ttf", "i.otf", "bi.ttf", "bi.otf", "it.ttf", "it.otf"]):
+        return True
+    return False
+
+
+def apply_synthetic_skew(img: Image.Image, angle_deg: float = 12.0, italic_mode: str = "right") -> Image.Image:
+    """
+    Tạo độ nghiêng nhân tạo (Synthetic Italic / Oblique) mượt mà bằng ma trận Pillow Affine Transform.
+    Hỗ trợ 3 chế độ:
+      - "none": Không nghiêng
+      - "right": Nghiêng về bên phải (+tan(angle))
+      - "left": Nghiêng về bên trái (-tan(angle))
+    """
+    mode = str(italic_mode or "right").strip().lower()
+    if img is None or img.width <= 0 or img.height <= 0 or abs(angle_deg) < 0.1 or mode in {"none", "off", "false"}:
+        return img
+
+    rad = math.radians(abs(angle_deg))
+    if mode == "left":
+        shear = -math.tan(rad)
+        extra_w = int(math.ceil(abs(shear) * img.height))
+        dst_w = img.width + extra_w
+        dst_h = img.height
+        x_shift = 0.0
+    else:  # right (default)
+        shear = math.tan(rad)
+        extra_w = int(math.ceil(abs(shear) * img.height))
+        dst_w = img.width + extra_w
+        dst_h = img.height
+        x_shift = -shear * dst_h
+
+    # Affine matrix: x_src = 1.0 * x_dst + shear * y_dst + x_shift
+    affine_matrix = (1.0, shear, x_shift, 0.0, 1.0, 0.0)
+
+    skewed = img.transform(
+        (dst_w, dst_h),
+        Image.Transform.AFFINE,
+        affine_matrix,
+        resample=Image.Resampling.BICUBIC
+    )
+    return skewed
+
+
+def get_rendered_text_chip(
+    text: str,
+    font_file: Optional[Path],
+    font_size: int,
+    font_rgba: Tuple[int, int, int, int] = (255, 255, 255, 255),
+    stroke_w: int = 0,
+    outline_rgba: Optional[Tuple[int, int, int, int]] = None,
+    need_skew: bool = False,
+    skew_angle: float = 12.0,
+    italic_mode: str = "right",
+    pad: int = 16,
+) -> Tuple[Image.Image, int, int]:
+    """
+    Render 1 từ, 1 ký tự, hoặc 1 dòng chữ thành 1 ảnh RGBA nhỏ (Text Chip) trong bộ nhớ RAM.
+    Có gắn cache để tái sử dụng cực nhanh cho Preview Animation (< 3ms per frame).
+    Trả về: (chip, draw_x, draw_y) trong đó (draw_x, draw_y) là vị trí origin của text trên chip.
+    """
+    if not text:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0)), 0, 0
+
+    mode = str(italic_mode or "right").strip().lower()
+    f_key = str(font_file) if font_file else "__def__"
+    f_col = f"{font_rgba[0]},{font_rgba[1]},{font_rgba[2]},{font_rgba[3]}"
+    o_col = f"{outline_rgba[0]},{outline_rgba[1]},{outline_rgba[2]},{outline_rgba[3]}" if (outline_rgba and stroke_w > 0) else "none"
+    cache_key = (text, font_size, f_key, f_col, o_col, stroke_w, need_skew, mode, int(skew_angle), pad)
+
+    cached = _TEXT_CHIP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    font = get_cached_font(font_file, font_size)
+    dummy = Image.new("RGB", (1, 1))
+    d = ImageDraw.Draw(dummy)
+
+    if hasattr(d, "textbbox"):
+        bbox = d.textbbox((0, 0), text, font=font, stroke_width=stroke_w)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        bx0, by0 = bbox[0], bbox[1]
+    else:
+        tw = int(round(font.getlength(text))) if hasattr(font, "getlength") else int(len(text) * font_size * 0.6)
+        th = int(font_size * 1.25)
+        bx0, by0 = 0, 0
+
+    chip_w = max(4, tw + stroke_w * 2 + pad * 2)
+    chip_h = max(4, th + stroke_w * 2 + pad * 2)
+
+    chip = Image.new("RGBA", (chip_w, chip_h), (0, 0, 0, 0))
+    chip_draw = ImageDraw.Draw(chip)
+
+    draw_x = pad + stroke_w - bx0
+    draw_y = pad + stroke_w - by0
+
+    chip_draw.text(
+        (draw_x, draw_y),
+        text,
+        font=font,
+        fill=font_rgba,
+        stroke_width=stroke_w,
+        stroke_fill=outline_rgba if stroke_w > 0 else None
+    )
+
+    eff_draw_x = draw_x
+    eff_draw_y = draw_y
+    if need_skew and mode in {"right", "left"}:
+        chip = apply_synthetic_skew(chip, angle_deg=skew_angle, italic_mode=mode)
+        if mode == "right":
+            shear_rad = math.radians(abs(skew_angle))
+            eff_draw_x += int(round(math.tan(shear_rad) * (chip_h - draw_y)))
+
+    if len(_TEXT_CHIP_CACHE) > 1000:
+        _TEXT_CHIP_CACHE.clear()
+
+    res = (chip, eff_draw_x, eff_draw_y)
+    _TEXT_CHIP_CACHE[cache_key] = res
+    return res
+
+
 def measure_text_and_fit_box(
     text: str,
     font_file: Optional[Path],
@@ -274,10 +407,11 @@ def measure_text_and_fit_box(
 ) -> Tuple[List[str], int, int, int, int]:
     """
     Thuật toán dùng chung duy nhất (Single Source of Truth) giữa Preview và Render:
-    1. Tự động ngắt dòng theo ranh giới từ (không xé đôi từ, không ngắt ở dấu gạch nối)
-    2. Nếu auto_fit=True: Tự động co nhỏ font_size sao cho tiêu đề nằm vừa vặn hoàn hảo trong tối đa max_lines
-       Nếu auto_fit=False: Giữ nguyên font_size cấu hình và chỉ bẻ dòng
-    3. Đồng bộ chuẩn xác margin và line spacing
+    1. Tự động ngắt dòng thông minh theo ranh giới từ (Smart Balanced Line Partitioning)
+    2. Nếu auto_fit=True: Tự động tối ưu hóa font_size và cấu hình ngắt dòng (1..max_lines)
+       sao cho tiêu đề lấp đầy khung tối đa theo chuẩn YouTube Thumbnail (chữ to, nổi bật, fill_h & fill_w cao nhất).
+       Nếu auto_fit=False: Giữ nguyên font_size cấu hình và chỉ bẻ dòng.
+    3. Đồng bộ chuẩn xác margin và line spacing.
     Trả về: (lines, fitted_font_size, total_text_h, line_h, eff_spacing)
     """
     clean_text = clean_text_content(text)
@@ -291,7 +425,7 @@ def measure_text_and_fit_box(
     dummy_img = Image.new("RGB", (1, 1))
     draw = ImageDraw.Draw(dummy_img)
 
-    def _measure_with_size(sz: int) -> Tuple[List[str], int, int, int]:
+    def _measure_lines_at_size(lines_input: List[str], sz: int) -> Tuple[List[str], int, int, int, int]:
         font = get_cached_font(font_file, sz)
 
         def get_w(s: str) -> int:
@@ -313,7 +447,42 @@ def measure_text_and_fit_box(
                 return bbox[3] - bbox[1]
             return int(sz * 1.25)
 
-        # Ngắt dòng theo từ ngữ nguyên vẹn
+        lines: List[str] = []
+        for idx, l in enumerate(lines_input):
+            l_clean = l.strip()
+            if idx > 0:
+                l_clean = re.sub(r"^[\|\-:\;/\\]+\s*", "", l_clean).strip()
+            l_clean = re.sub(r"\s*[\|\-:\;/\\]+$", "", l_clean).strip()
+            if l_clean:
+                lines.append(l_clean)
+
+        if not lines:
+            return ([], 0, 0, line_spacing, 0)
+
+        line_h = get_line_h()
+        eff_spacing = line_spacing
+        if sz >= 60:
+            eff_spacing = line_spacing - int(sz * 0.20)
+        elif sz >= 35:
+            eff_spacing = line_spacing - int(sz * 0.10)
+
+        total_h = len(lines) * line_h + (len(lines) - 1) * eff_spacing
+        max_w = max((get_w(l) for l in lines), default=0)
+        return (lines, total_h, line_h, eff_spacing, max_w)
+
+    def _greedy_wrap(sz: int) -> List[str]:
+        font = get_cached_font(font_file, sz)
+
+        def get_w(s: str) -> int:
+            if not s:
+                return 0
+            if font and hasattr(draw, "textbbox"):
+                bbox = draw.textbbox((0, 0), s, font=font)
+                return bbox[2] - bbox[0]
+            elif font and hasattr(font, "getlength"):
+                return int(round(font.getlength(s)))
+            return int(len(s) * sz * 0.55)
+
         paragraphs = clean_text.splitlines() if ("\n" in clean_text or "\r" in clean_text) else [clean_text]
         raw_lines: List[str] = []
         for paragraph in paragraphs:
@@ -331,65 +500,150 @@ def measure_text_and_fit_box(
                     cur_line = w
             if cur_line:
                 raw_lines.append(cur_line)
-
-        # Dọn dẹp ký tự ngăn cách ở đầu/cuối dòng
-        lines: List[str] = []
-        for idx, l in enumerate(raw_lines):
-            l_clean = l.strip()
-            if idx > 0:
-                l_clean = re.sub(r"^[\|\-:\;/\\]+\s*", "", l_clean).strip()
-            l_clean = re.sub(r"\s*[\|\-:\;/\\]+$", "", l_clean).strip()
-            if l_clean:
-                lines.append(l_clean)
-
-        line_h = get_line_h()
-        eff_spacing = line_spacing
-        if sz >= 60:
-            eff_spacing = line_spacing - int(sz * 0.20)
-        elif sz >= 35:
-            eff_spacing = line_spacing - int(sz * 0.10)
-
-        total_h = len(lines) * line_h + (len(lines) - 1) * eff_spacing
-        return (lines, total_h, line_h, eff_spacing)
+        return raw_lines
 
     if not auto_fit:
-        # Giữ nguyên font size, chỉ wrap text
-        lines, total_h, line_h, eff_spacing = _measure_with_size(cur_font_size)
+        raw_lines = _greedy_wrap(cur_font_size)
+        lines, total_h, line_h, eff_spacing, _ = _measure_lines_at_size(raw_lines, cur_font_size)
         return (lines, cur_font_size, total_h, line_h, eff_spacing)
 
-    best_lines: List[str] = [clean_text]
-    best_size = cur_font_size
-    best_total_h = 0
-    best_line_h = 0
-    best_eff_spacing = line_spacing
+    # 1. Sinh danh sách các cấu hình ngắt dòng ứng viên (Candidate Wrappings)
+    has_explicit_newlines = ("\n" in clean_text or "\r" in clean_text)
+    candidate_wrappings: List[List[str]] = []
 
-    while cur_font_size >= min_font_size:
-        lines, total_h, line_h, eff_spacing = _measure_with_size(cur_font_size)
-        font = get_cached_font(font_file, cur_font_size)
+    if has_explicit_newlines:
+        candidate_wrappings.append([line.strip() for line in clean_text.splitlines() if line.strip()])
+    else:
+        words = clean_text.split()
+        n_words = len(words)
+        if n_words <= 1:
+            candidate_wrappings.append([clean_text])
+        else:
+            # 1 dòng
+            candidate_wrappings.append([" ".join(words)])
 
-        def get_w(s: str) -> int:
-            if not s:
-                return 0
-            if font and hasattr(draw, "textbbox"):
-                bbox = draw.textbbox((0, 0), s, font=font)
-                return bbox[2] - bbox[0]
-            elif font and hasattr(font, "getlength"):
-                return int(round(font.getlength(s)))
-            return int(len(s) * cur_font_size * 0.55)
+            # 2 dòng (Tất cả điểm cắt từ)
+            if max_lines >= 2 and n_words >= 2:
+                for i in range(1, n_words):
+                    candidate_wrappings.append([" ".join(words[:i]), " ".join(words[i:])])
 
-        max_line_w = max((get_w(l) for l in lines), default=0)
+            # 3 dòng (Nếu max_lines >= 3)
+            if max_lines >= 3 and n_words >= 3:
+                if n_words <= 12:
+                    for i in range(1, n_words - 1):
+                        for j in range(i + 1, n_words):
+                            candidate_wrappings.append([" ".join(words[:i]), " ".join(words[i:j]), " ".join(words[j:])])
+                else:
+                    mid1 = n_words // 3
+                    mid2 = (2 * n_words) // 3
+                    for i in range(max(1, mid1 - 2), min(n_words - 1, mid1 + 3)):
+                        for j in range(max(i + 1, mid2 - 2), min(n_words, mid2 + 3)):
+                            candidate_wrappings.append([" ".join(words[:i]), " ".join(words[i:j]), " ".join(words[j:])])
 
-        if len(lines) <= max_lines and max_line_w <= avail_w and total_h <= avail_h:
-            return (lines, cur_font_size, total_h, line_h, eff_spacing)
+        # Luôn thêm ứng viên ngắt dòng tự nhiên
+        ref_sizes = [min_font_size, int(font_size), max(14, int(avail_h * 0.45))]
+        for r_sz in ref_sizes:
+            gw = _greedy_wrap(r_sz)
+            if gw and gw not in candidate_wrappings and len(gw) <= max_lines:
+                candidate_wrappings.append(gw)
 
-        best_lines = lines if lines else [clean_text]
-        best_size = cur_font_size
-        best_total_h = total_h
-        best_line_h = line_h
-        best_eff_spacing = eff_spacing
-        cur_font_size -= 2
+    # 2. Binary Search tìm font size lớn nhất vừa box cho từng ứng viên
+    low = max(8, int(min_font_size))
+    upper_bound = max(int(font_size), min(int(avail_w), int(avail_h * 1.6), 350))
+    upper_bound = max(low, upper_bound)
 
-    return (best_lines, best_size, best_total_h, best_line_h, best_eff_spacing)
+    evaluated_candidates = []
+
+    for cand in candidate_wrappings:
+        if len(cand) > max_lines:
+            continue
+        l, r = low, upper_bound
+        best_cand_sz = None
+        while l <= r:
+            mid = (l + r) // 2
+            lines, total_h, line_h, eff_spacing, max_w = _measure_lines_at_size(cand, mid)
+            if max_w <= avail_w and total_h <= avail_h:
+                best_cand_sz = (lines, mid, total_h, line_h, eff_spacing, max_w)
+                l = mid + 1
+            else:
+                r = mid - 1
+
+        if best_cand_sz is not None:
+            lines, sz, total_h, line_h, eff_spacing, max_w = best_cand_sz
+            fill_w = max_w / max(1, box_w)
+            fill_h = total_h / max(1, box_h)
+            area_fill = fill_w * fill_h
+
+            evaluated_candidates.append({
+                "lines": lines,
+                "font_size": sz,
+                "total_text_h": total_h,
+                "line_h": line_h,
+                "eff_spacing": eff_spacing,
+                "max_w": max_w,
+                "fill_w": fill_w,
+                "fill_h": fill_h,
+                "area_fill": area_fill,
+            })
+
+    if evaluated_candidates:
+        box_aspect = box_w / max(1, box_h)
+        clean_words = clean_text.split()
+        n_words = len(clean_words)
+
+        one_line_cand = next(
+            (c for c in evaluated_candidates if len(c["lines"]) == 1),
+            None
+        )
+
+        for c in evaluated_candidates:
+            base_score = c["font_size"] * (c["area_fill"] ** 0.20)
+
+            if len(c["lines"]) > 1:
+                lengths = [len(x) for x in c["lines"]]
+                balance = min(lengths) / max(lengths) if max(lengths) > 0 else 1.0
+                base_score *= (0.75 + 0.25 * balance)
+
+                # Thumbnail Mode cho Box Ngang (box_aspect >= 2.5)
+                if box_aspect >= 2.5 and one_line_cand is not None:
+                    area_gain = (c["area_fill"] - one_line_cand["area_fill"]) / max(0.001, one_line_cand["area_fill"])
+                    font_gain = (c["font_size"] - one_line_cand["font_size"]) / max(0.001, one_line_cand["font_size"])
+
+                    # Ưu tiên 1 dòng cho tiêu đề ngắn (<= 4 từ)
+                    if n_words <= 4 and one_line_cand["fill_w"] >= 0.50:
+                        if area_gain < 0.20 and font_gain < 0.25:
+                            base_score *= 0.60
+                        elif area_gain < 0.20 and font_gain < 0.20:
+                            base_score *= 0.75
+
+            c["score"] = base_score
+
+        evaluated_candidates.sort(key=lambda item: item["score"], reverse=True)
+        winner = evaluated_candidates[0]
+
+        # Log debug thông số Auto-Fit (box_w, box_h, text_w, text_h, fill_w, fill_h, font_size, lines)
+        try:
+            print(
+                f"[AutoFit] text='{clean_text[:30]}' | box=({box_w}x{box_h}) | "
+                f"text_size=({winner['max_w']}x{winner['total_text_h']}) | "
+                f"fill_w={winner['fill_w']*100:.1f}% | fill_h={winner['fill_h']*100:.1f}% | "
+                f"font_size={winner['font_size']} | lines={winner['lines']}"
+            )
+        except Exception:
+            pass
+
+        return (
+            winner["lines"],
+            winner["font_size"],
+            winner["total_text_h"],
+            winner["line_h"],
+            winner["eff_spacing"],
+        )
+
+    # Fallback an toàn
+    fallback_lines = _greedy_wrap(low)
+    lines, total_h, line_h, eff_spacing, _ = _measure_lines_at_size(fallback_lines, low)
+    return (lines, low, total_h, line_h, eff_spacing)
 
 
 def resolve_asset_path(path_str: str) -> Optional[Path]:
@@ -479,10 +733,12 @@ class LayoutRenderer:
         height: int = 1080,
         audio_title: str = "",
         preview_mode: bool = False,
+        anim_t: float = 0.0,
         log_fn: Optional[Any] = None,
     ) -> Tuple[Image.Image, List[Dict[str, Any]]]:
         """
         Dựng hình ảnh toàn bộ các layer tĩnh (Ảnh, Logo, Frame, Text tiêu đề, Badge) thành 1 Canvas RGBA duy nhất.
+        Hỗ trợ Synthetic Italic và Text Motion Engine siêu mượt với Text Chip Cache (< 2ms/frame).
         Trả về:
             canvas (PIL Image RGBA 1920x1080)
             dynamic_layers (danh sách layer động có animation / gif / video mask cần FFmpeg xử lý tiếp)
@@ -503,12 +759,12 @@ class LayoutRenderer:
             is_gif = (l_type in {"gif", "reaction", "animated_image"}) or f_path_raw.lower().endswith(".gif")
 
             # Kiểm tra xem layer có hiệu ứng hoạt họa theo thời gian hay không
-            has_time_anim = (in_eff != "none" or out_eff != "none" or mot_eff != "none")
+            has_time_anim = (in_eff != "none" or out_eff != "none" or mot_eff not in {"none", "static", ""})
             is_dynamic = is_gif or (l_type in {"video_mask"}) or has_time_anim
 
             # Nếu là GIF động hoặc video mask hoặc layer có hiệu ứng chuyển động theo thời gian:
             # - Khi Render Video: Chuyển sang dynamic_layers để FFmpeg xử lý hoạt họa đa khung hình
-            # - Khi Preview Mode: Vẽ khung hình đầu tiên lên Canvas để người dùng nhìn thấy trực quan
+            # - Khi Preview Mode: Vẽ khung hình trực quan theo anim_t
             if not preview_mode and is_dynamic:
                 dynamic_layers.append(layer)
                 continue
@@ -659,11 +915,23 @@ class LayoutRenderer:
                 font_name = str(layer.get("font_name", "Arial") or "Arial")
                 font_size = int(layer.get("font_size", 36) or 36)
                 font_bold = bool(layer.get("bold", True))
-                font_italic = bool(layer.get("italic", False))
+                italic_mode = str(layer.get("italic_mode") or "").strip().lower()
+                if not italic_mode:
+                    font_italic = bool(layer.get("italic", False))
+                    italic_mode = "right" if font_italic else "none"
+                else:
+                    font_italic = (italic_mode in {"right", "left"})
 
                 # Scale font size theo độ phân giải canvas (chuẩn 1080p)
                 scaled_font_size = max(10, int(round(font_size * (height / 1080.0))))
                 font_file = find_font_file(font_name, font_bold, font_italic)
+                is_genuine_italic = is_genuine_italic_font(font_file)
+                if italic_mode == "right":
+                    need_synthetic_italic = not is_genuine_italic
+                elif italic_mode == "left":
+                    need_synthetic_italic = True
+                else:
+                    need_synthetic_italic = False
 
                 bx = float(layer.get("box_x", 0.1))
                 by = float(layer.get("box_y", 0.1 if l_type != "subtitle" else 0.7))
@@ -729,25 +997,193 @@ class LayoutRenderer:
 
                 font_align = str(layer.get("align", "center")).lower()
 
-                for i, line_str in enumerate(lines):
-                    line_w = get_text_w(line_str)
-                    if font_align == "left":
-                        cur_x = px
-                    elif font_align == "right":
-                        cur_x = px + pw - line_w
-                    else:  # center
-                        cur_x = px + (pw - line_w) // 2
+                # Dispatch Text Motion Engine
+                # -------------------------------------------------------------
+                # Nhóm 1: Chuyển động từng từ (Word Bounce, Karaoke Bounce)
+                if mot_eff in {"word_bounce", "karaoke_bounce"}:
+                    total_words = sum(len(line_s.split()) for line_s in lines)
+                    active_word_idx = int((anim_t * 2.2) % max(1, total_words)) if mot_eff == "karaoke_bounce" else -1
+                    global_w_idx = 0
+                    space_w = get_text_w(" ")
 
-                    cur_y = start_y + i * line_step_h
+                    for i, line_str in enumerate(lines):
+                        words = [w for w in line_str.split(" ") if w]
+                        line_w = get_text_w(line_str)
+                        if font_align == "left":
+                            cur_line_x = px
+                        elif font_align == "right":
+                            cur_line_x = px + pw - line_w
+                        else:  # center
+                            cur_line_x = px + (pw - line_w) // 2
 
-                    draw.text(
-                        (cur_x, cur_y),
-                        line_str,
-                        font=font,
-                        fill=font_rgba,
-                        stroke_width=stroke_w,
-                        stroke_fill=outline_rgba,
-                    )
+                        cur_y = start_y + i * line_step_h
+                        cur_w_x = cur_line_x
+
+                        for w in words:
+                            w_w = get_text_w(w)
+                            w_dy = 0.0
+                            w_font_rgba = font_rgba
+                            w_outline_rgba = outline_rgba
+                            w_stroke_w = stroke_w
+
+                            if mot_eff == "word_bounce":
+                                phase = anim_t * 5.0 - global_w_idx * 0.55
+                                bounce = max(0.0, math.sin(phase))
+                                w_dy = - bounce * (11.0 * height / 1080.0)
+                            elif mot_eff == "karaoke_bounce":
+                                if global_w_idx == active_word_idx:
+                                    w_dy = - (6.0 * height / 1080.0)
+                                    w_font_rgba = (255, 245, 60, 255)  # Highlight vàng sáng
+                                    w_outline_rgba = (0, 0, 0, 255)
+                                    w_stroke_w = max(2, stroke_w)
+
+                            chip, ox, oy = get_rendered_text_chip(
+                                text=w,
+                                font_file=font_file,
+                                font_size=fitted_font_size,
+                                font_rgba=w_font_rgba,
+                                stroke_w=w_stroke_w,
+                                outline_rgba=w_outline_rgba,
+                                need_skew=need_synthetic_italic,
+                                italic_mode=italic_mode,
+                            )
+                            canvas.paste(chip, (int(round(cur_w_x - ox)), int(round(cur_y + w_dy - oy))), chip)
+                            cur_w_x += w_w + space_w
+                            global_w_idx += 1
+
+                # Nhóm 2: Chuyển động từng ký tự (Letter Bounce, Rotate Letters, Wave, Orbit Letters, Flag Wave)
+                elif mot_eff in {"letter_bounce", "rotate_letters", "wave", "orbit_letters", "flag_wave"}:
+                    global_c_idx = 0
+                    for i, line_str in enumerate(lines):
+                        line_w = get_text_w(line_str)
+                        if font_align == "left":
+                            cur_line_x = px
+                        elif font_align == "right":
+                            cur_line_x = px + pw - line_w
+                        else:  # center
+                            cur_line_x = px + (pw - line_w) // 2
+
+                        cur_y = start_y + i * line_step_h
+                        cur_c_x = cur_line_x
+
+                        for ch in line_str:
+                            ch_w = get_text_w(ch)
+                            if ch == " ":
+                                cur_c_x += ch_w
+                                global_c_idx += 1
+                                continue
+
+                            c_dx = 0.0
+                            c_dy = 0.0
+                            rot_angle = 0.0
+
+                            if mot_eff == "letter_bounce":
+                                phase = anim_t * 6.5 - global_c_idx * 0.4
+                                bounce = max(0.0, math.sin(phase))
+                                c_dy = - bounce * (8.5 * height / 1080.0)
+                            elif mot_eff == "wave":
+                                c_dy = math.sin(anim_t * 4.5 - global_c_idx * 0.35) * (6.5 * height / 1080.0)
+                            elif mot_eff == "rotate_letters":
+                                sign = 1.0 if (global_c_idx % 2 == 0) else -1.0
+                                rot_angle = sign * 6.0 * math.sin(anim_t * 4.0 + global_c_idx * 0.6)
+                            elif mot_eff == "orbit_letters":
+                                c_dx = math.cos(anim_t * 4.0 + global_c_idx * 0.6) * (3.5 * height / 1080.0)
+                                c_dy = math.sin(anim_t * 4.0 + global_c_idx * 0.6) * (3.5 * height / 1080.0)
+                            elif mot_eff == "flag_wave":
+                                c_dy = math.sin(anim_t * 5.0 - global_c_idx * 0.5) * (6.0 * height / 1080.0)
+
+                            chip, ox, oy = get_rendered_text_chip(
+                                text=ch,
+                                font_file=font_file,
+                                font_size=fitted_font_size,
+                                font_rgba=font_rgba,
+                                stroke_w=stroke_w,
+                                outline_rgba=outline_rgba,
+                                need_skew=need_synthetic_italic,
+                                italic_mode=italic_mode,
+                            )
+
+                            if abs(rot_angle) > 0.01:
+                                rotated = chip.rotate(rot_angle, resample=Image.Resampling.BILINEAR, expand=True)
+                                cx = cur_c_x + c_dx - ox + chip.width / 2.0
+                                cy = cur_y + c_dy - oy + chip.height / 2.0
+                                canvas.paste(rotated, (int(round(cx - rotated.width / 2.0)), int(round(cy - rotated.height / 2.0))), rotated)
+                            else:
+                                canvas.paste(chip, (int(round(cur_c_x + c_dx - ox)), int(round(cur_y + c_dy - oy))), chip)
+
+                            cur_c_x += ch_w
+                            global_c_idx += 1
+
+                # Nhóm 3: Hiệu ứng khối / dòng (Heartbeat, Float, Pulse, Pendulum, Shake Beat, Earthquake, Glow, Rainbow, Static)
+                else:
+                    b_dx = 0.0
+                    b_dy = 0.0
+                    b_rot = 0.0
+                    eff_font_rgba = font_rgba
+                    eff_outline_rgba = outline_rgba
+                    eff_stroke_w = stroke_w
+
+                    if mot_eff == "heartbeat":
+                        b_dy = - (6.0 * height / 1080.0) * pow(max(0.0, math.sin(anim_t * 2.0 * math.pi * 1.5)), 2)
+                    elif mot_eff == "float":
+                        b_dy = math.sin(anim_t * 2.0 * math.pi / 3.0) * (5.0 * height / 1080.0)
+                    elif mot_eff == "pulse":
+                        b_dy = math.sin(anim_t * 2.0 * math.pi / 2.0) * (3.0 * height / 1080.0)
+                    elif mot_eff == "pendulum":
+                        b_rot = math.sin(anim_t * 2.0 * math.pi / 2.0) * 4.0
+                        b_dy = abs(math.sin(anim_t * 2.0 * math.pi / 2.0)) * (2.0 * height / 1080.0)
+                    elif mot_eff == "shake_beat":
+                        cycle_t = anim_t % 0.6
+                        b_dy = - (5.0 * height / 1080.0) * max(0.0, math.sin(cycle_t / 0.15 * math.pi)) if cycle_t < 0.15 else 0.0
+                    elif mot_eff == "earthquake_gentle":
+                        b_dx = math.sin(anim_t * 28.0) * (1.5 * height / 1080.0)
+                        b_dy = math.cos(anim_t * 33.0) * (1.5 * height / 1080.0)
+                    elif mot_eff == "glow_pulse":
+                        pulse_val = 0.5 + 0.5 * math.sin(anim_t * 4.0)
+                        if has_outline and outline_rgba:
+                            or_c, og_c, ob_c = outline_rgba[0], outline_rgba[1], outline_rgba[2]
+                            gr = int(or_c * (1.0 - pulse_val * 0.7) + 255 * (pulse_val * 0.7))
+                            gg = int(og_c * (1.0 - pulse_val * 0.7) + 230 * (pulse_val * 0.7))
+                            gb = int(ob_c * (1.0 - pulse_val * 0.7) + 30 * (pulse_val * 0.7))
+                            eff_outline_rgba = (min(255, gr), min(255, gg), min(255, gb), 255)
+                        else:
+                            eff_stroke_w = max(2, int(round(2.5 * (height / 1080.0))))
+                            eff_outline_rgba = (255, int(200 * pulse_val), 50, int(220 * pulse_val))
+                    elif mot_eff == "rainbow_border":
+                        hue = (anim_t * 0.35) % 1.0
+                        rgb = colorsys.hsv_to_rgb(hue, 0.9, 1.0)
+                        eff_outline_rgba = (int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255), 255)
+                        eff_stroke_w = max(2, stroke_w if stroke_w > 0 else int(round(3.0 * (height / 1080.0))))
+
+                    for i, line_str in enumerate(lines):
+                        line_w = get_text_w(line_str)
+                        if font_align == "left":
+                            cur_x = px
+                        elif font_align == "right":
+                            cur_x = px + pw - line_w
+                        else:  # center
+                            cur_x = px + (pw - line_w) // 2
+
+                        cur_y = start_y + i * line_step_h
+
+                        chip, ox, oy = get_rendered_text_chip(
+                            text=line_str,
+                            font_file=font_file,
+                            font_size=fitted_font_size,
+                            font_rgba=eff_font_rgba,
+                            stroke_w=eff_stroke_w,
+                            outline_rgba=eff_outline_rgba,
+                            need_skew=need_synthetic_italic,
+                            italic_mode=italic_mode,
+                        )
+
+                        if abs(b_rot) > 0.01:
+                            rotated = chip.rotate(b_rot, resample=Image.Resampling.BILINEAR, expand=True)
+                            cx = cur_x + b_dx - ox + chip.width / 2.0
+                            cy = cur_y + b_dy - oy + chip.height / 2.0
+                            canvas.paste(rotated, (int(round(cx - rotated.width / 2.0)), int(round(cy - rotated.height / 2.0))), rotated)
+                        else:
+                            canvas.paste(chip, (int(round(cur_x + b_dx - ox)), int(round(cur_y + b_dy - oy))), chip)
 
             # -------------------------------------------------------------
             # 3. LAYER HUY HIỆU TRỰC TIẾP (Live Badge)
@@ -799,7 +1235,7 @@ class LayoutRenderer:
                 and (
                     str(l.get("in_effect", "none")).lower() != "none"
                     or str(l.get("out_effect", "none")).lower() != "none"
-                    or str(l.get("motion_effect", "none")).lower() != "none"
+                    or str(l.get("motion_effect", "none")).lower() not in {"none", "static", ""}
                     or str(l.get("type", "")).lower() in {"video_mask", "gif", "reaction", "animated_image"}
                     or str(l.get("file_path", "")).lower().endswith(".gif")
                 )
@@ -812,6 +1248,7 @@ class LayoutRenderer:
             height=height,
             audio_title=audio_title,
             preview_mode=False,
+            anim_t=0.0,
             log_fn=log_fn,
         )
 

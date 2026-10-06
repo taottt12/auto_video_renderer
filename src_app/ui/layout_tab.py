@@ -26,6 +26,29 @@ from ..core.paths import LAYOUTS_DIR, PRESETS_DIR
 from ..core.layout_renderer import LayoutRenderer
 LAYOUT_PRESETS_DIR = LAYOUTS_DIR
 
+TEXT_MOTIONS: Tuple[Tuple[str, str], ...] = (
+    ("Tĩnh (Không chuyển động)", "none"),
+    ("🦘 Nhảy từng từ (Word Bounce)", "word_bounce"),
+    ("💃 Nhảy từng chữ TikTok (Letter Bounce)", "letter_bounce"),
+    ("🔄 Nghiêng chữ xen kẽ (Rotate Letters)", "rotate_letters"),
+    ("🎤 Karaoke / Sáng từng từ (Karaoke Bounce)", "karaoke_bounce"),
+    ("〰️ Lượn sóng từng chữ (Wave)", "wave"),
+    ("🪐 Xoay tròn từng chữ (Orbit Letters)", "orbit_letters"),
+    ("🚩 Vẫy cờ nhịp nhàng (Flag Wave)", "flag_wave"),
+    ("💓 Đập thình thịch (Heartbeat)", "heartbeat"),
+    ("🔥 Nhịp thở viền sáng (Glow Pulse)", "glow_pulse"),
+    ("🌈 Viền đổi màu cầu vồng (Rainbow Border)", "rainbow_border"),
+)
+
+IMAGE_MOTIONS: Tuple[Tuple[str, str], ...] = (
+    ("Tĩnh (Không chuyển động)", "none"),
+    ("🌊 Bồng bềnh nhẹ (Floating 5px)", "float"),
+    ("💓 Co giãn nhịp thở (Pulse)", "pulse"),
+    ("🕰️ Đu đưa con lắc (Pendulum Swing)", "pendulum"),
+    ("💥 Giật nhịp nhạc (Shake On Beat)", "shake_beat"),
+    ("📳 Rung nhẹ chống mỏi mắt (Earthquake 1-2px)", "earthquake_gentle"),
+)
+
 
 class LayoutCanvasWidget(QWidget):
     """Màn hình Canvas tương tác trực quan cho phép kéo thả, di chuyển và co giãn các Layer."""
@@ -217,7 +240,8 @@ class LayoutCanvasWidget(QWidget):
                     width=1920,
                     height=1080,
                     audio_title=self.preview_title,
-                    preview_mode=True
+                    preview_mode=True,
+                    anim_t=self._anim_t
                 )
                 if canvas_pil:
                     data = canvas_pil.tobytes("raw", "RGBA")
@@ -873,11 +897,12 @@ class LayoutStudioTab(QWidget):
         self.prop_bold_btn.setStyleSheet("font-weight: bold; font-size: 13px;")
         self.prop_bold_btn.toggled.connect(lambda: self._on_prop_edited())
 
-        self.prop_italic_btn = QPushButton("I")
-        self.prop_italic_btn.setCheckable(True)
-        self.prop_italic_btn.setFixedWidth(28)
-        self.prop_italic_btn.setStyleSheet("font-style: italic; font-size: 13px;")
-        self.prop_italic_btn.toggled.connect(lambda: self._on_prop_edited())
+        self.prop_italic_combo = QComboBox()
+        self.prop_italic_combo.addItem("I Thẳng", "none")
+        self.prop_italic_combo.addItem("I Nghiêng Phải", "right")
+        self.prop_italic_combo.addItem("I Nghiêng Trái", "left")
+        self.prop_italic_combo.setStyleSheet("font-style: italic; font-size: 12px;")
+        self.prop_italic_combo.currentIndexChanged.connect(lambda: self._on_prop_edited())
 
         self.prop_align_combo = QComboBox()
         self.prop_align_combo.addItem("Căn Giữa", "center")
@@ -888,7 +913,7 @@ class LayoutStudioTab(QWidget):
         font_row.addWidget(self.prop_font_combo, 1)
         font_row.addWidget(self.prop_font_size_spin)
         font_row.addWidget(self.prop_bold_btn)
-        font_row.addWidget(self.prop_italic_btn)
+        font_row.addWidget(self.prop_italic_combo)
         font_row.addWidget(self.prop_align_combo)
         tp_layout.addRow("Kiểu chữ & Cỡ:", font_row)
 
@@ -996,9 +1021,8 @@ class LayoutStudioTab(QWidget):
         self.prop_out_effect_combo.currentIndexChanged.connect(lambda: self._on_prop_edited())
 
         self.prop_motion_combo = QComboBox()
-        self.prop_motion_combo.addItem("Tĩnh (Không chuyển động)", "none")
-        self.prop_motion_combo.addItem("🌊 Bồng bềnh nhẹ (Floating 5px)", "float")
-        self.prop_motion_combo.addItem("💓 Nhịp thở (Pulse nhẹ)", "pulse")
+        for label, val in TEXT_MOTIONS:
+            self.prop_motion_combo.addItem(label, val)
         self.prop_motion_combo.currentIndexChanged.connect(lambda: self._on_prop_edited())
 
         out_row.addWidget(self.prop_out_effect_combo, 1)
@@ -1238,9 +1262,17 @@ class LayoutStudioTab(QWidget):
             self.prop_out_effect_combo.setCurrentIndex(max(0, out_idx))
             self.prop_out_effect_combo.blockSignals(False)
 
-            mot_eff = layer.get("motion_effect", "none")
-            mot_idx = self.prop_motion_combo.findData(mot_eff)
+            is_text_layer = (l_type in {"text", "subtitle"})
+            current_motion_items = TEXT_MOTIONS if is_text_layer else IMAGE_MOTIONS
             self.prop_motion_combo.blockSignals(True)
+            self.prop_motion_combo.clear()
+            for label, val in current_motion_items:
+                self.prop_motion_combo.addItem(label, val)
+
+            mot_eff = str(layer.get("motion_effect", "none") or "none")
+            mot_idx = self.prop_motion_combo.findData(mot_eff)
+            if mot_idx < 0:
+                mot_idx = self.prop_motion_combo.findData("none")
             self.prop_motion_combo.setCurrentIndex(max(0, mot_idx))
             self.prop_motion_combo.blockSignals(False)
 
@@ -1279,9 +1311,13 @@ class LayoutStudioTab(QWidget):
             self.prop_bold_btn.setChecked(bool(layer.get("bold", True)))
             self.prop_bold_btn.blockSignals(False)
 
-            self.prop_italic_btn.blockSignals(True)
-            self.prop_italic_btn.setChecked(bool(layer.get("italic", False)))
-            self.prop_italic_btn.blockSignals(False)
+            raw_italic_mode = layer.get("italic_mode")
+            if not raw_italic_mode:
+                raw_italic_mode = "right" if layer.get("italic", False) else "none"
+            self.prop_italic_combo.blockSignals(True)
+            it_idx = self.prop_italic_combo.findData(raw_italic_mode)
+            self.prop_italic_combo.setCurrentIndex(max(0, it_idx))
+            self.prop_italic_combo.blockSignals(False)
 
             self.prop_align_combo.blockSignals(True)
             a_idx = self.prop_align_combo.findData(layer.get("align", "center"))
@@ -1427,7 +1463,9 @@ class LayoutStudioTab(QWidget):
                 layer["font_name"] = self.prop_font_combo.currentFont().family()
                 layer["font_size"] = self.prop_font_size_spin.value()
                 layer["bold"] = self.prop_bold_btn.isChecked()
-                layer["italic"] = self.prop_italic_btn.isChecked()
+                it_mode = self.prop_italic_combo.currentData() or "none"
+                layer["italic_mode"] = it_mode
+                layer["italic"] = (it_mode != "none")
                 layer["align"] = self.prop_align_combo.currentData() or "center"
                 layer["auto_fit"] = self.prop_auto_fit_chk.isChecked()
                 layer["outline_width"] = self.prop_outline_width_spin.value()
@@ -1450,6 +1488,7 @@ class LayoutStudioTab(QWidget):
                     sub_cfg["outline_width"] = layer["outline_width"]
                     sub_cfg["bold"] = layer["bold"]
                     sub_cfg["italic"] = layer["italic"]
+                    sub_cfg["italic_mode"] = layer["italic_mode"]
                     sub_cfg["align"] = layer["align"]
                     sub_cfg["sub_mode"] = layer["sub_mode"]
                     sub_cfg["enabled"] = layer["enabled"]
@@ -1566,6 +1605,7 @@ class LayoutStudioTab(QWidget):
             new_layer["font_size"] = 32
             new_layer["bold"] = True
             new_layer["italic"] = False
+            new_layer["italic_mode"] = "none"
             new_layer["align"] = "center"
             new_layer["font_color"] = "#FFFFFF"
             new_layer["outline_color"] = "#000000"
@@ -1588,6 +1628,7 @@ class LayoutStudioTab(QWidget):
             new_layer["font_size"] = int(sub_cfg.get("font_size", 38) or 38)
             new_layer["bold"] = bool(sub_cfg.get("bold", True))
             new_layer["italic"] = bool(sub_cfg.get("italic", False))
+            new_layer["italic_mode"] = str(sub_cfg.get("italic_mode", "right" if new_layer["italic"] else "none"))
             new_layer["align"] = "center"
             new_layer["font_color"] = str(sub_cfg.get("font_color", "#FFFFFF") or "#FFFFFF")
             new_layer["outline_color"] = str(sub_cfg.get("outline_color", "#000000") or "#000000")
@@ -1608,6 +1649,7 @@ class LayoutStudioTab(QWidget):
             sub_cfg["outline_width"] = new_layer["outline_width"]
             sub_cfg["bold"] = new_layer["bold"]
             sub_cfg["italic"] = new_layer["italic"]
+            sub_cfg["italic_mode"] = new_layer["italic_mode"]
             sub_cfg["sub_mode"] = new_layer["sub_mode"]
         elif layer_type == "live_badge":
             new_layer["name"] = "🔴 Huy hiệu Live"

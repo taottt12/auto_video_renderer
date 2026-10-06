@@ -17,11 +17,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
+from PIL import Image, ImageDraw
+
 from .layout_renderer import (
     LayoutRenderer,
     find_font_file,
     clean_text_content,
     measure_text_and_fit_box,
+    get_cached_font,
 )
 from .media_utils import choose_media_sequence, get_duration_seconds, is_image, is_video
 from .overlay_generator import get_overlay_file, ensure_default_overlays
@@ -2390,6 +2393,27 @@ class RenderEngine:
                     elif mot_eff == "pulse":
                         y_expr = f"({y_expr})+2*sin(2*PI*t/2)"
                         has_spatial_anim = True
+                    elif mot_eff == "shake_beat":
+                        y_expr = f"({y_expr})-5*max(0,sin(2*PI*t*2))*lt(mod(t,0.5),0.15)"
+                        has_spatial_anim = True
+                    elif mot_eff == "earthquake_gentle":
+                        x_expr = f"({x_expr})+1.5*sin(28*t)"
+                        y_expr = f"({y_expr})+1.5*cos(33*t)"
+                        has_spatial_anim = True
+                    elif mot_eff == "pendulum":
+                        x_expr = f"({x_expr})+12*sin(2*PI*t/2.5)"
+                        y_expr = f"({y_expr})+3*pow(sin(2*PI*t/2.5),2)"
+                        has_spatial_anim = True
+                    elif mot_eff in {"word_bounce", "letter_bounce", "wave", "karaoke_bounce"}:
+                        y_expr = f"({y_expr})-8*abs(sin(2*PI*t*1.5))"
+                        has_spatial_anim = True
+                    elif mot_eff in {"glow_pulse", "rainbow_border"}:
+                        y_expr = f"({y_expr})+1.5*sin(2*PI*t/1.8)"
+                        has_spatial_anim = True
+                    elif mot_eff == "rotate_letters":
+                        x_expr = f"({x_expr})+2*sin(2*PI*t*1.2)"
+                        y_expr = f"({y_expr})+2*cos(2*PI*t*1.2)"
+                        has_spatial_anim = True
 
                     filters.append(f"[{input_index}:v]{','.join(filter_chain)}{in_lbl}")
                     if has_spatial_anim:
@@ -2417,21 +2441,24 @@ class RenderEngine:
                     font_size = int(layer.get("font_size", 36) or 36)
                     font_name = str(layer.get("font_name", "Arial") or "Arial")
                     font_bold = bool(layer.get("bold", True))
-                    font_italic = bool(layer.get("italic", False))
+                    italic_mode = str(layer.get("italic_mode") or ("right" if layer.get("italic") else "none")).strip().lower()
+                    font_italic = (italic_mode != "none")
 
                     font_file = self._find_font_file_by_name(font_name, font_bold, font_italic)
 
-                    # Tự động ngắt dòng và co kích thước chữ vừa vặn hoàn hảo trong ô
+                    # Tự động ngắt dòng và co kích thước chữ vừa vặn hoàn hảo trong ô (Single Source of Truth)
                     layer_spacing = int(layer.get("line_spacing", 4) or 4)
-                    wrapped_content, fitted_font_size = self._wrap_text_for_box(
+                    lines, fitted_font_size, total_text_h, line_h, eff_spacing = measure_text_and_fit_box(
                         text=content,
                         font_file=font_file,
                         font_size=font_size,
-                        max_w=pw,
-                        max_h=ph,
+                        box_w=pw,
+                        box_h=ph,
                         line_spacing=layer_spacing,
                         max_lines=2,
                     )
+                    if not lines:
+                        continue
 
                     font_color_raw = str(layer.get("font_color", "#FFFFFF")).strip()
                     font_color = self._normalize_ffmpeg_color(font_color_raw)
@@ -2447,82 +2474,307 @@ class RenderEngine:
                     in_eff = str(layer.get("in_effect", "none")).lower()
                     in_dur = max(0.2, min(5.0, float(layer.get("in_duration", 0.8) or 0.8)))
                     mot_eff = str(layer.get("motion_effect", "none")).lower()
-
                     font_align = str(layer.get("align", "center")).lower()
-                    if font_align == "center":
-                        base_x = f"{px}+({pw}-text_w)/2"
-                        base_y = f"{py}+({ph}-text_h)/2"
-                    elif font_align == "right":
-                        base_x = f"{px}+{pw}-text_w"
-                        base_y = f"{py}+({ph}-text_h)/2"
-                    else:  # left
-                        base_x = f"{px}"
-                        base_y = f"{py}+({ph}-text_h)/2"
 
-                    x_pos = base_x
-                    y_pos = base_y
-                    has_anim_pos = False
+                    pil_font = get_cached_font(font_file, fitted_font_size)
+                    dummy_img = Image.new("RGB", (1, 1))
+                    dummy_draw = ImageDraw.Draw(dummy_img)
 
-                    if in_eff == "slide_up":
-                        y_pos = f"if(lte(t,{in_dur:.2f}), ({base_y})+({ph}*(1-t/{in_dur:.2f})), ({base_y}))"
-                        has_anim_pos = True
-                    elif in_eff == "slide_down":
-                        y_pos = f"if(lte(t,{in_dur:.2f}), ({base_y})-({ph}*(1-t/{in_dur:.2f})), ({base_y}))"
-                        has_anim_pos = True
-                    elif in_eff == "slide_left":
-                        x_pos = f"if(lte(t,{in_dur:.2f}), ({base_x})-({pw}*(1-t/{in_dur:.2f})), ({base_x}))"
-                        has_anim_pos = True
-                    elif in_eff == "slide_right":
-                        x_pos = f"if(lte(t,{in_dur:.2f}), ({base_x})+({pw}*(1-t/{in_dur:.2f})), ({base_x}))"
-                        has_anim_pos = True
+                    def _calc_text_w(s: str) -> int:
+                        if not s:
+                            return 0
+                        if hasattr(pil_font, "getlength"):
+                            return int(round(pil_font.getlength(s)))
+                        if hasattr(dummy_draw, "textbbox"):
+                            bbox = dummy_draw.textbbox((0, 0), s, font=pil_font)
+                            return bbox[2] - bbox[0]
+                        return int(len(s) * fitted_font_size * 0.55)
 
-                    if mot_eff == "float":
-                        y_pos = f"({y_pos})+4*sin(2*PI*t/3)"
-                        has_anim_pos = True
-                    elif mot_eff == "pulse":
-                        y_pos = f"({y_pos})+2*sin(2*PI*t/2)"
-                        has_anim_pos = True
+                    line_step_h = line_h + eff_spacing
+                    start_y = py + max(0, (ph - total_text_h) // 2)
 
-                    if has_anim_pos:
-                        pos_expr = f"x='{x_pos}':y='{y_pos}'"
+                    # Tách drawtext theo từng từ/ký tự khi motion yêu cầu; ngược lại dùng single drawtext
+                    if mot_eff in {"word_bounce", "karaoke_bounce", "letter_bounce", "wave", "rotate_letters", "orbit_letters", "flag_wave"}:
+                        if bg_box_enabled:
+                            norm_bg = self._normalize_ffmpeg_color(bg_color_raw)
+                            out_lbl = f"[layer_v_{stage}]"
+                            filters.append(f"{last}drawbox=x={px}:y={py}:w={pw}:h={ph}:color={norm_bg}@{bg_opacity:.2f}:t=fill{out_lbl}")
+                            last = out_lbl
+                            stage += 1
+
+                        if mot_eff in {"word_bounce", "karaoke_bounce"}:
+                            total_words = sum(len(line_s.split()) for line_s in lines)
+                            global_w_idx = 0
+                            space_w = _calc_text_w(" ")
+
+                            for i, line_str in enumerate(lines):
+                                words = [w for w in line_str.split(" ") if w]
+                                line_w = _calc_text_w(line_str)
+                                if font_align == "left":
+                                    cur_line_x = px
+                                elif font_align == "right":
+                                    cur_line_x = px + pw - line_w
+                                else:  # center
+                                    cur_line_x = px + (pw - line_w) // 2
+
+                                cur_y = start_y + i * line_step_h
+                                cur_w_x = cur_line_x
+
+                                for w in words:
+                                    w_w = _calc_text_w(w)
+                                    w_x = cur_w_x
+                                    w_y = cur_y
+
+                                    x_expr = str(w_x)
+                                    y_expr = str(w_y)
+
+                                    if in_eff == "slide_up":
+                                        y_expr = f"if(lte(t,{in_dur:.2f}), ({w_y})+({ph}*(1-t/{in_dur:.2f})), ({y_expr}))"
+                                    elif in_eff == "slide_down":
+                                        y_expr = f"if(lte(t,{in_dur:.2f}), ({w_y})-({ph}*(1-t/{in_dur:.2f})), ({y_expr}))"
+                                    elif in_eff == "slide_left":
+                                        x_expr = f"if(lte(t,{in_dur:.2f}), ({w_x})-({pw}*(1-t/{in_dur:.2f})), ({x_expr}))"
+                                    elif in_eff == "slide_right":
+                                        x_expr = f"if(lte(t,{in_dur:.2f}), ({w_x})+({pw}*(1-t/{in_dur:.2f})), ({x_expr}))"
+
+                                    if mot_eff == "word_bounce":
+                                        bounce_amp = 11.0 * height / 1080.0
+                                        y_expr = f"({y_expr})-{bounce_amp:.2f}*max(0,sin(5.0*t-{global_w_idx * 0.55:.4f}))"
+
+                                        dt_parts = [
+                                            f"text='{self._escape_drawtext(w)}'",
+                                            f"fontsize={fitted_font_size}",
+                                            f"fontcolor={font_color}",
+                                            f"x='{x_expr}':y='{y_expr}'",
+                                        ]
+                                        if in_eff == "fade_in":
+                                            dt_parts.append(f"alpha='if(lte(t,{in_dur:.2f}), t/{in_dur:.2f}, 1)'")
+                                        if has_outline:
+                                            border_color = self._normalize_ffmpeg_color(outline_color_raw)
+                                            dt_parts.append(f"borderw={int(round(outline_width))}")
+                                            dt_parts.append(f"bordercolor={border_color}")
+                                        else:
+                                            dt_parts.append("borderw=0")
+                                        if font_file:
+                                            dt_parts.append(f"fontfile='{self._escape_drawtext(font_file.as_posix())}'")
+
+                                        out_lbl = f"[layer_v_{stage}]"
+                                        filters.append(f"{last}drawtext={':'.join(dt_parts)}{out_lbl}")
+                                        last = out_lbl
+                                        stage += 1
+
+                                    elif mot_eff == "karaoke_bounce":
+                                        dt_inact = [
+                                            f"text='{self._escape_drawtext(w)}'",
+                                            f"fontsize={fitted_font_size}",
+                                            f"fontcolor={font_color}",
+                                            f"x='{x_expr}':y='{y_expr}'",
+                                            f"enable='not(eq(mod(floor(2.2*t),{max(1, total_words)}),{global_w_idx}))'",
+                                        ]
+                                        if in_eff == "fade_in":
+                                            dt_inact.append(f"alpha='if(lte(t,{in_dur:.2f}), t/{in_dur:.2f}, 1)'")
+                                        if has_outline:
+                                            border_color = self._normalize_ffmpeg_color(outline_color_raw)
+                                            dt_inact.append(f"borderw={int(round(outline_width))}")
+                                            dt_inact.append(f"bordercolor={border_color}")
+                                        else:
+                                            dt_inact.append("borderw=0")
+                                        if font_file:
+                                            dt_inact.append(f"fontfile='{self._escape_drawtext(font_file.as_posix())}'")
+
+                                        out_lbl = f"[layer_v_{stage}]"
+                                        filters.append(f"{last}drawtext={':'.join(dt_inact)}{out_lbl}")
+                                        last = out_lbl
+                                        stage += 1
+
+                                        bounce_amp = 6.0 * height / 1080.0
+                                        active_y_expr = f"({y_expr})-{bounce_amp:.2f}"
+                                        dt_act = [
+                                            f"text='{self._escape_drawtext(w)}'",
+                                            f"fontsize={fitted_font_size}",
+                                            f"fontcolor=0xFFF53C",
+                                            f"x='{x_expr}':y='{active_y_expr}'",
+                                            f"enable='eq(mod(floor(2.2*t),{max(1, total_words)}),{global_w_idx})'",
+                                            f"borderw={max(2, int(round(outline_width)))}",
+                                            f"bordercolor=0x000000",
+                                        ]
+                                        if in_eff == "fade_in":
+                                            dt_act.append(f"alpha='if(lte(t,{in_dur:.2f}), t/{in_dur:.2f}, 1)'")
+                                        if font_file:
+                                            dt_act.append(f"fontfile='{self._escape_drawtext(font_file.as_posix())}'")
+
+                                        out_lbl = f"[layer_v_{stage}]"
+                                        filters.append(f"{last}drawtext={':'.join(dt_act)}{out_lbl}")
+                                        last = out_lbl
+                                        stage += 1
+
+                                    cur_w_x += w_w + space_w
+                                    global_w_idx += 1
+
+                        else:  # Char-based motions
+                            global_c_idx = 0
+                            for i, line_str in enumerate(lines):
+                                line_w = _calc_text_w(line_str)
+                                if font_align == "left":
+                                    cur_line_x = px
+                                elif font_align == "right":
+                                    cur_line_x = px + pw - line_w
+                                else:  # center
+                                    cur_line_x = px + (pw - line_w) // 2
+
+                                cur_y = start_y + i * line_step_h
+                                cur_c_x = cur_line_x
+
+                                for ch in line_str:
+                                    ch_w = _calc_text_w(ch)
+                                    if ch == " ":
+                                        cur_c_x += ch_w
+                                        global_c_idx += 1
+                                        continue
+
+                                    c_x = cur_c_x
+                                    c_y = cur_y
+                                    x_expr = str(c_x)
+                                    y_expr = str(c_y)
+
+                                    if in_eff == "slide_up":
+                                        y_expr = f"if(lte(t,{in_dur:.2f}), ({c_y})+({ph}*(1-t/{in_dur:.2f})), ({y_expr}))"
+                                    elif in_eff == "slide_down":
+                                        y_expr = f"if(lte(t,{in_dur:.2f}), ({c_y})-({ph}*(1-t/{in_dur:.2f})), ({y_expr}))"
+                                    elif in_eff == "slide_left":
+                                        x_expr = f"if(lte(t,{in_dur:.2f}), ({c_x})-({pw}*(1-t/{in_dur:.2f})), ({x_expr}))"
+                                    elif in_eff == "slide_right":
+                                        x_expr = f"if(lte(t,{in_dur:.2f}), ({c_x})+({pw}*(1-t/{in_dur:.2f})), ({x_expr}))"
+
+                                    if mot_eff == "letter_bounce":
+                                        bounce_amp = 8.5 * height / 1080.0
+                                        y_expr = f"({y_expr})-{bounce_amp:.2f}*max(0,sin(6.5*t-{global_c_idx * 0.4:.4f}))"
+                                    elif mot_eff == "wave":
+                                        amp = 6.5 * height / 1080.0
+                                        y_expr = f"({y_expr})+{amp:.2f}*sin(4.5*t-{global_c_idx * 0.35:.4f})"
+                                    elif mot_eff == "rotate_letters":
+                                        sign = 1 if (global_c_idx % 2 == 0) else -1
+                                        x_expr = f"({x_expr})+{2.5 * height / 1080.0:.2f}*{sign}*sin(4.0*t+{global_c_idx * 0.6:.4f})"
+                                        y_expr = f"({y_expr})+{3.5 * height / 1080.0:.2f}*{sign}*cos(4.0*t+{global_c_idx * 0.6:.4f})"
+                                    elif mot_eff == "orbit_letters":
+                                        x_expr = f"({x_expr})+{3.5 * height / 1080.0:.2f}*cos(4.0*t+{global_c_idx * 0.6:.4f})"
+                                        y_expr = f"({y_expr})+{3.5 * height / 1080.0:.2f}*sin(4.0*t+{global_c_idx * 0.6:.4f})"
+                                    elif mot_eff == "flag_wave":
+                                        y_expr = f"({y_expr})+{6.0 * height / 1080.0:.2f}*sin(5.0*t-{global_c_idx * 0.5:.4f})"
+
+                                    dt_parts = [
+                                        f"text='{self._escape_drawtext(ch)}'",
+                                        f"fontsize={fitted_font_size}",
+                                        f"fontcolor={font_color}",
+                                        f"x='{x_expr}':y='{y_expr}'",
+                                    ]
+                                    if in_eff == "fade_in":
+                                        dt_parts.append(f"alpha='if(lte(t,{in_dur:.2f}), t/{in_dur:.2f}, 1)'")
+                                    if has_outline:
+                                        border_color = self._normalize_ffmpeg_color(outline_color_raw)
+                                        dt_parts.append(f"borderw={int(round(outline_width))}")
+                                        dt_parts.append(f"bordercolor={border_color}")
+                                    else:
+                                        dt_parts.append("borderw=0")
+                                    if font_file:
+                                        dt_parts.append(f"fontfile='{self._escape_drawtext(font_file.as_posix())}'")
+
+                                    out_lbl = f"[layer_v_{stage}]"
+                                    filters.append(f"{last}drawtext={':'.join(dt_parts)}{out_lbl}")
+                                    last = out_lbl
+                                    stage += 1
+
+                                    cur_c_x += ch_w
+                                    global_c_idx += 1
+
                     else:
-                        pos_expr = f"x={base_x}:y={base_y}"
+                        # Whole-box motion or static
+                        wrapped_content = "\n".join(lines)
+                        if font_align == "center":
+                            base_x = f"{px}+({pw}-text_w)/2"
+                            base_y = f"{py}+({ph}-text_h)/2"
+                        elif font_align == "right":
+                            base_x = f"{px}+{pw}-text_w"
+                            base_y = f"{py}+({ph}-text_h)/2"
+                        else:  # left
+                            base_x = f"{px}"
+                            base_y = f"{py}+({ph}-text_h)/2"
 
-                    eff_spacing = layer_spacing
-                    if fitted_font_size >= 60:
-                        eff_spacing = max(-35, layer_spacing - int(fitted_font_size * 0.20))
-                    elif fitted_font_size >= 35:
-                        eff_spacing = max(-20, layer_spacing - int(fitted_font_size * 0.10))
+                        x_pos = base_x
+                        y_pos = base_y
+                        has_anim_pos = False
 
-                    dt_parts = [
-                        f"text='{self._escape_drawtext(wrapped_content)}'",
-                        f"fontsize={fitted_font_size}",
-                        f"fontcolor={font_color}",
-                        pos_expr,
-                        f"line_spacing={eff_spacing}",
-                    ]
+                        if in_eff == "slide_up":
+                            y_pos = f"if(lte(t,{in_dur:.2f}), ({base_y})+({ph}*(1-t/{in_dur:.2f})), ({base_y}))"
+                            has_anim_pos = True
+                        elif in_eff == "slide_down":
+                            y_pos = f"if(lte(t,{in_dur:.2f}), ({base_y})-({ph}*(1-t/{in_dur:.2f})), ({base_y}))"
+                            has_anim_pos = True
+                        elif in_eff == "slide_left":
+                            x_pos = f"if(lte(t,{in_dur:.2f}), ({base_x})-({pw}*(1-t/{in_dur:.2f})), ({base_x}))"
+                            has_anim_pos = True
+                        elif in_eff == "slide_right":
+                            x_pos = f"if(lte(t,{in_dur:.2f}), ({base_x})+({pw}*(1-t/{in_dur:.2f})), ({base_x}))"
+                            has_anim_pos = True
 
-                    if in_eff == "fade_in":
-                        dt_parts.append(f"alpha='if(lte(t,{in_dur:.2f}), t/{in_dur:.2f}, 1)'")
+                        if mot_eff == "heartbeat":
+                            y_pos = f"({y_pos})-{6.0 * height / 1080.0:.2f}*pow(max(0,sin(3*PI*t)),2)"
+                            has_anim_pos = True
+                        elif mot_eff in {"glow_pulse", "rainbow_border"}:
+                            y_pos = f"({y_pos})+{1.5 * height / 1080.0:.2f}*sin(2*PI*t/1.8)"
+                            has_anim_pos = True
+                        elif mot_eff == "float":
+                            y_pos = f"({y_pos})+{4.0 * height / 1080.0:.2f}*sin(2*PI*t/3)"
+                            has_anim_pos = True
+                        elif mot_eff == "pulse":
+                            y_pos = f"({y_pos})+{2.0 * height / 1080.0:.2f}*sin(2*PI*t/2)"
+                            has_anim_pos = True
+                        elif mot_eff == "shake_beat":
+                            y_pos = f"({y_pos})-{5.0 * height / 1080.0:.2f}*max(0,sin(2*PI*t*2))*lt(mod(t,0.5),0.15)"
+                            has_anim_pos = True
+                        elif mot_eff == "earthquake_gentle":
+                            x_pos = f"({x_pos})+{1.5 * height / 1080.0:.2f}*sin(28*t)"
+                            y_pos = f"({y_pos})+{1.5 * height / 1080.0:.2f}*cos(33*t)"
+                            has_anim_pos = True
+                        elif mot_eff == "pendulum":
+                            x_pos = f"({x_pos})+{12.0 * height / 1080.0:.2f}*sin(2*PI*t/2.5)"
+                            y_pos = f"({y_pos})+{3.0 * height / 1080.0:.2f}*pow(sin(2*PI*t/2.5),2)"
+                            has_anim_pos = True
 
-                    if has_outline:
-                        border_color = self._normalize_ffmpeg_color(outline_color_raw)
-                        dt_parts.append(f"borderw={int(round(outline_width))}")
-                        dt_parts.append(f"bordercolor={border_color}")
-                    else:
-                        dt_parts.append("borderw=0")
+                        if has_anim_pos:
+                            pos_expr = f"x='{x_pos}':y='{y_pos}'"
+                        else:
+                            pos_expr = f"x={base_x}:y={base_y}"
 
-                    if font_file:
-                        dt_parts.append(f"fontfile='{self._escape_drawtext(font_file.as_posix())}'")
+                        dt_parts = [
+                            f"text='{self._escape_drawtext(wrapped_content)}'",
+                            f"fontsize={fitted_font_size}",
+                            f"fontcolor={font_color}",
+                            pos_expr,
+                            f"line_spacing={eff_spacing}",
+                        ]
 
-                    if bg_box_enabled:
-                        norm_bg = self._normalize_ffmpeg_color(bg_color_raw)
-                        dt_parts += ["box=1", f"boxcolor={norm_bg}@{bg_opacity:.2f}", "boxborderw=10"]
+                        if in_eff == "fade_in":
+                            dt_parts.append(f"alpha='if(lte(t,{in_dur:.2f}), t/{in_dur:.2f}, 1)'")
 
-                    out_lbl = f"[layer_v_{stage}]"
-                    filters.append(f"{last}drawtext={':'.join(dt_parts)}{out_lbl}")
-                    last = out_lbl
-                    stage += 1
+                        if has_outline:
+                            border_color = self._normalize_ffmpeg_color(outline_color_raw)
+                            dt_parts.append(f"borderw={int(round(outline_width))}")
+                            dt_parts.append(f"bordercolor={border_color}")
+                        else:
+                            dt_parts.append("borderw=0")
+
+                        if font_file:
+                            dt_parts.append(f"fontfile='{self._escape_drawtext(font_file.as_posix())}'")
+
+                        if bg_box_enabled:
+                            norm_bg = self._normalize_ffmpeg_color(bg_color_raw)
+                            dt_parts += ["box=1", f"boxcolor={norm_bg}@{bg_opacity:.2f}", "boxborderw=10"]
+
+                        out_lbl = f"[layer_v_{stage}]"
+                        filters.append(f"{last}drawtext={':'.join(dt_parts)}{out_lbl}")
+                        last = out_lbl
+                        stage += 1
 
                 elif l_type == "subtitle":
                     if sub_ass_file and sub_ass_file.exists():

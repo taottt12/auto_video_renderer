@@ -555,6 +555,41 @@ def _register_cuda_dll_directories() -> None:
                     pass
 
 
+CUDA_FATAL_EXIT_CODE = 42
+
+
+def normalize_whisper_model_name(raw_name: str) -> str:
+    """Chuẩn hóa tên model theo danh mục hỗ trợ chuẩn của OpenAI Whisper."""
+    name = str(raw_name or "turbo").strip().lower()
+    if name in ["turbo", "large-v3-turbo", "large_v3_turbo", "large-turbo", "turbo-v3"]:
+        return "turbo"
+    valid_exact = [
+        "tiny.en", "tiny",
+        "base.en", "base",
+        "small.en", "small",
+        "medium.en", "medium",
+        "large-v3", "large-v2", "large-v1", "large",
+    ]
+    if name in valid_exact:
+        return name
+    for valid in valid_exact:
+        if name == valid or name.startswith(valid) or f"/{valid}" in name or f"-{valid}" in name or f"_{valid}" in name:
+            return valid
+    if "turbo" in name:
+        return "turbo"
+    if "medium" in name:
+        return "medium"
+    if "small" in name:
+        return "small"
+    if "base" in name:
+        return "base"
+    if "tiny" in name:
+        return "tiny"
+    if "large" in name:
+        return "large-v3"
+    return "turbo"
+
+
 def check_cuda_whisper_support() -> bool:
     """Kiểm tra thực tế xem CUDA GPU có sẵn sàng chạy PyTorch Whisper AI không."""
     try:
@@ -586,7 +621,7 @@ def preflight_whisper_model(model_name: str = "turbo", log_callback: Any = None)
             _safe_log_local(f"ℹ️ {msg}")
             return True, msg
 
-        m_id = str(model_name or "turbo").strip()
+        m_id = normalize_whisper_model_name(model_name)
         _safe_log_local(f"🔍 [Preflight] Đang kiểm tra Whisper AI [{m_id}] trên GPU CUDA...")
 
         import tempfile
@@ -602,7 +637,7 @@ def preflight_whisper_model(model_name: str = "turbo", log_callback: Any = None)
                 wf.setframerate(16000)
                 wf.writeframes(struct.pack("<16000h", *([0] * 16000)))
 
-            ok, err_msg, detected = _run_isolated_whisper(
+            ok, err_msg, detected, ret_code = _run_isolated_whisper(
                 audio_path=tmp_wav,
                 out_srt_path=tmp_srt,
                 model_size=m_id,
@@ -660,7 +695,7 @@ def _run_isolated_whisper(
     cpu_threads: int = 0,
     enhance_voice: bool = True,
     initial_prompt: str = "",
-) -> Tuple[bool, str, str]:
+) -> Tuple[bool, str, str, int]:
     """Chạy Whisper AI trong Process Sandbox riêng biệt để cách ly tuyệt đối lỗi driver/C++ khỏi GUI."""
     import json
     import queue
@@ -698,6 +733,11 @@ def _run_isolated_whisper(
     if sys.platform == "win32":
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
+    worker_env = os.environ.copy()
+    worker_env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    worker_env["CUDA_MODULE_LOADING"] = "LAZY"
+    worker_env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
     try:
         proc = subprocess.Popen(
             cmd,
@@ -709,9 +749,10 @@ def _run_isolated_whisper(
             bufsize=1,
             creationflags=creation_flags,
             cwd=str(Path(__file__).resolve().parents[2]),
+            env=worker_env,
         )
     except Exception as spawn_err:
-        return False, f"Không thể khởi động worker: {spawn_err}", "unknown"
+        return False, f"Không thể khởi động worker: {spawn_err}", "unknown", -1
 
     detected_lang = language or "unknown"
     error_msg = ""
@@ -776,11 +817,14 @@ def _run_isolated_whisper(
         pass
 
     ret_code = proc.poll()
+    if ret_code is None:
+        ret_code = 0 if (out_srt_path.exists() and out_srt_path.stat().st_size > 0) else 1
+
     if ret_code == 0 and out_srt_path.exists():
-        return True, "", detected_lang
+        return True, "", detected_lang, ret_code
     else:
         err = error_msg or f"Tiến trình kết thúc với mã {ret_code}"
-        return False, err, detected_lang
+        return False, err, detected_lang, ret_code
 
 
 def transcribe_audio_to_srt(
@@ -805,13 +849,8 @@ def transcribe_audio_to_srt(
     p_out = Path(out_srt_path)
     p_out.parent.mkdir(parents=True, exist_ok=True)
 
-    raw_model = str(model_size or "turbo").strip().lower()
-    if raw_model in ["turbo", "large-v3-turbo", "large_v3_turbo", "large-v3", "large"]:
-        model_size = "turbo"
-    elif raw_model in ["medium", "medium.en"]:
-        model_size = "medium"
-    else:
-        model_size = "turbo"
+    # Chuẩn hóa model size chính xác theo danh mục chuẩn (không ép nhỏ về turbo)
+    model_size = normalize_whisper_model_name(model_size)
 
     # Chuẩn hóa mã ngôn ngữ (Philippines: tl / fil)
     target_lang = None
@@ -830,10 +869,10 @@ def transcribe_audio_to_srt(
     detected_lang = target_lang or "unknown"
     used_device = "cpu"
 
-    # Giai đoạn 1: Chạy trực tiếp trên GPU CUDA bằng chính xác model người dùng đã chọn
+    # Giai đoạn 1: Chạy trực tiếp trên GPU CUDA bằng Process Sandbox (Tách biệt hoàn toàn process)
     if has_cuda_runtime:
         try:
-            ok, err_msg, lang_res = _run_isolated_whisper(
+            ok, err_msg, lang_res, ret_code = _run_isolated_whisper(
                 audio_path=p_audio,
                 out_srt_path=p_out,
                 model_size=model_size,
@@ -852,8 +891,43 @@ def transcribe_audio_to_srt(
                 success = True
                 used_device = "GPU CUDA (PyTorch Native FP16)"
                 detected_lang = lang_res
+            elif ret_code == CUDA_FATAL_EXIT_CODE:
+                _safe_log(
+                    log_callback,
+                    f"⚠️ [Process Sandbox] Worker CUDA gặp lỗi CUDA context/driver (Exit code {CUDA_FATAL_EXIT_CODE}: {err_msg}). "
+                    f"Tiến trình cũ đã bị hủy. Đang spawn 1 worker CUDA MỚI hoàn toàn để retry (1/1)..."
+                )
+                if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
+                    raise RenderCancelled("Đã dừng bởi người dùng")
+
+                # Spawn worker CUDA mới toanh (fresh process, fresh CUDA context)
+                ok_retry, err_retry, lang_retry, ret_retry = _run_isolated_whisper(
+                    audio_path=p_audio,
+                    out_srt_path=p_out,
+                    model_size=model_size,
+                    language=target_lang,
+                    device="cuda",
+                    compute_type="fp16",
+                    speed=speed,
+                    audio_duration=audio_duration,
+                    cancel_event=cancel_event,
+                    log_callback=log_callback,
+                    progress_callback=progress_callback,
+                    enhance_voice=enhance_voice,
+                    initial_prompt=initial_prompt,
+                )
+                if ok_retry:
+                    success = True
+                    used_device = "GPU CUDA (PyTorch Native FP16 - Recovered Worker)"
+                    detected_lang = lang_retry
+                    _safe_log(log_callback, f"🎉 [Process Sandbox] Worker CUDA mới đã hoàn tất bóc tách phụ đề thành công!")
+                else:
+                    _safe_log(
+                        log_callback,
+                        f"⚠️ [Process Sandbox] Worker CUDA mới retry tiếp tục thất bại ({err_retry}) -> Chuyển sang fallback CPU đa luồng giữ nguyên model [{model_size}]..."
+                    )
             else:
-                _safe_log(log_callback, f"⚠️ GPU CUDA gặp lỗi [{err_msg}] -> Tự động chuyển sang CPU đa luồng giữ nguyên model [{model_size}]...")
+                _safe_log(log_callback, f"⚠️ GPU CUDA gặp sự cố [{err_msg}] -> Tự động chuyển sang CPU đa luồng giữ nguyên model [{model_size}]...")
         except RenderCancelled:
             raise
         except Exception as cuda_ex:
@@ -864,7 +938,7 @@ def transcribe_audio_to_srt(
         if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
             raise RenderCancelled("Đã dừng bởi người dùng")
         cpu_threads_count = min(8, max(2, os.cpu_count() or 4))
-        ok, err_msg, lang_cpu = _run_isolated_whisper(
+        ok, err_msg, lang_cpu, ret_code = _run_isolated_whisper(
             audio_path=p_audio,
             out_srt_path=p_out,
             model_size=model_size,
