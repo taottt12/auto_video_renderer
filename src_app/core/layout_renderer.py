@@ -953,8 +953,9 @@ class LayoutRenderer:
                     draw.rounded_rectangle([px, py, px + pw, py + ph], radius=box_radius, fill=bg_rgba)
 
                 # 2.2 Thuật toán đo và fit text dùng chung duy nhất với Render
-                layer_spacing = int(layer.get("line_spacing", 4) or 4)
-                scaled_line_spacing = max(0, int(round(layer_spacing * (height / 1080.0))))
+                raw_line_spacing = layer.get("line_spacing", 4)
+                layer_spacing = int(4 if raw_line_spacing is None else raw_line_spacing)
+                scaled_line_spacing = int(round(layer_spacing * (height / 1080.0)))
                 min_sz = max(10, int(round(14 * (height / 1080.0))))
                 auto_fit = bool(layer.get("auto_fit", True))
 

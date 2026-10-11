@@ -1982,9 +1982,16 @@ class SettingTab(QWidget):
         out_row.addWidget(self.output_edit)
         out_row.addWidget(self.output_btn)
 
-        form.addRow("Tỉ lệ khung hình", self.ratio_combo)
+        form.addRow("Độ phân giải xuất", self.ratio_combo)
         form.addRow("FPS", self.fps_spin)
         form.addRow("Chất lượng xuất", self.quality_combo)
+        resolution_hint = QLabel(
+            "💡 RTX 2060 6GB: chọn 1280×720 và 25 FPS để render nhanh. "
+            "Chất lượng xuất chỉ điều chỉnh bitrate/dung lượng file."
+        )
+        resolution_hint.setWordWrap(True)
+        resolution_hint.setStyleSheet("color: #3a7ca5; font-size: 11px;")
+        form.addRow("", resolution_hint)
         form.addRow(self.custom_bitrate_label, self.custom_bitrate_spin)
         form.addRow("Ước tính dung lượng", self.estimated_size_label)
         form.addRow("Thư mục xuất", out_row)

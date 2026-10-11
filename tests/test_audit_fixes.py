@@ -221,6 +221,24 @@ class TestAuditAndOptimizationFixes(unittest.TestCase):
         for path in created_files:
             path.unlink(missing_ok=True)
 
+    def test_multiline_dynamic_title_uses_explicit_line_positions(self):
+        layer = {
+            "type": "text", "name": "title", "enabled": True,
+            "text_content": "FIRST LINE\nSECOND LINE", "font_name": "Arial",
+            "font_size": 72, "line_spacing": -8, "auto_fit": True,
+            "font_color": "#ffffff", "outline_color": "#000000", "outline_width": 2,
+            "box_x": 0.1, "box_y": 0.2, "box_w": 0.8, "box_h": 0.3,
+            "in_effect": "fade_in", "out_effect": "none", "motion_effect": "none",
+        }
+        engine = RenderEngine(settings={"layout_studio": {"enabled": True, "layers": [layer]}})
+        cmd, filters = [engine.ffmpeg], []
+        engine._build_visual_layers_filtergraph(cmd, filters, "[0:v]", 1, 1280, 720, fps=25)
+        title_filters = [part for part in filters if "drawtext=" in part]
+        self.assertEqual(len(title_filters), 2)
+        self.assertTrue(any("FIRST LINE" in part for part in title_filters))
+        self.assertTrue(any("SECOND LINE" in part for part in title_filters))
+        self.assertTrue(all("\n" not in part and "\r" not in part for part in title_filters))
+
 
 if __name__ == "__main__":
     unittest.main()

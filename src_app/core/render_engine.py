@@ -2816,7 +2816,8 @@ class RenderEngine:
                     if not content:
                         continue
 
-                    font_size = int(layer.get("font_size", 36) or 36)
+                    resolution_scale = height / 1080.0
+                    font_size = max(10, int(round(int(layer.get("font_size", 36) or 36) * resolution_scale)))
                     font_name = str(layer.get("font_name", "Arial") or "Arial")
                     font_bold = bool(layer.get("bold", True))
                     italic_mode = str(layer.get("italic_mode") or ("right" if layer.get("italic") else "none")).strip().lower()
@@ -2825,7 +2826,10 @@ class RenderEngine:
                     font_file = self._find_font_file_by_name(font_name, font_bold, font_italic)
 
                     # Tự động ngắt dòng và co kích thước chữ vừa vặn hoàn hảo trong ô (Single Source of Truth)
-                    layer_spacing = int(layer.get("line_spacing", 4) or 4)
+                    raw_line_spacing = layer.get("line_spacing", 4)
+                    layer_spacing = int(round(int(4 if raw_line_spacing is None else raw_line_spacing) * resolution_scale))
+                    min_font_size = max(10, int(round(14 * resolution_scale)))
+                    auto_fit = bool(layer.get("auto_fit", True))
                     lines, fitted_font_size, total_text_h, line_h, eff_spacing = measure_text_and_fit_box(
                         text=content,
                         font_file=font_file,
@@ -2833,7 +2837,9 @@ class RenderEngine:
                         box_w=pw,
                         box_h=ph,
                         line_spacing=layer_spacing,
+                        min_font_size=min_font_size,
                         max_lines=2,
+                        auto_fit=auto_fit,
                     )
                     if not lines:
                         continue
@@ -2842,7 +2848,7 @@ class RenderEngine:
                     font_color = self._normalize_ffmpeg_color(font_color_raw)
 
                     outline_color_raw = str(layer.get("outline_color", "#000000")).strip()
-                    outline_width = float(layer.get("outline_width", 2.0) or 2.0)
+                    outline_width = float(layer.get("outline_width", 2.0) or 2.0) * resolution_scale
                     has_outline = (outline_color_raw.lower() not in {"none", "transparent", ""}) and outline_width > 0
 
                     bg_color_raw = str(layer.get("bg_box_color", "black")).strip()
@@ -3066,93 +3072,88 @@ class RenderEngine:
                                     global_c_idx += 1
 
                     else:
-                        # Whole-box motion or static
-                        wrapped_content = "\n".join(lines)
-                        if font_align == "center":
-                            base_x = f"{px}+({pw}-text_w)/2"
-                            base_y = f"{py}+({ph}-text_h)/2"
-                        elif font_align == "right":
-                            base_x = f"{px}+{pw}-text_w"
-                            base_y = f"{py}+({ph}-text_h)/2"
-                        else:  # left
-                            base_x = f"{px}"
-                            base_y = f"{py}+({ph}-text_h)/2"
-
-                        x_pos = base_x
-                        y_pos = base_y
-                        has_anim_pos = False
-
-                        if in_eff == "slide_up":
-                            y_pos = f"if(lte(t,{in_dur:.2f}), ({base_y})+({ph}*(1-t/{in_dur:.2f})), ({base_y}))"
-                            has_anim_pos = True
-                        elif in_eff == "slide_down":
-                            y_pos = f"if(lte(t,{in_dur:.2f}), ({base_y})-({ph}*(1-t/{in_dur:.2f})), ({base_y}))"
-                            has_anim_pos = True
-                        elif in_eff == "slide_left":
-                            x_pos = f"if(lte(t,{in_dur:.2f}), ({base_x})-({pw}*(1-t/{in_dur:.2f})), ({base_x}))"
-                            has_anim_pos = True
-                        elif in_eff == "slide_right":
-                            x_pos = f"if(lte(t,{in_dur:.2f}), ({base_x})+({pw}*(1-t/{in_dur:.2f})), ({base_x}))"
-                            has_anim_pos = True
-
-                        if mot_eff == "heartbeat":
-                            y_pos = f"({y_pos})-{6.0 * height / 1080.0:.2f}*pow(max(0,sin(3*PI*t)),2)"
-                            has_anim_pos = True
-                        elif mot_eff in {"glow_pulse", "rainbow_border"}:
-                            y_pos = f"({y_pos})+{1.5 * height / 1080.0:.2f}*sin(2*PI*t/1.8)"
-                            has_anim_pos = True
-                        elif mot_eff == "float":
-                            y_pos = f"({y_pos})+{4.0 * height / 1080.0:.2f}*sin(2*PI*t/3)"
-                            has_anim_pos = True
-                        elif mot_eff == "pulse":
-                            y_pos = f"({y_pos})+{2.0 * height / 1080.0:.2f}*sin(2*PI*t/2)"
-                            has_anim_pos = True
-                        elif mot_eff == "shake_beat":
-                            y_pos = f"({y_pos})-{5.0 * height / 1080.0:.2f}*max(0,sin(2*PI*t*2))*lt(mod(t,0.5),0.15)"
-                            has_anim_pos = True
-                        elif mot_eff == "earthquake_gentle":
-                            x_pos = f"({x_pos})+{1.5 * height / 1080.0:.2f}*sin(28*t)"
-                            y_pos = f"({y_pos})+{1.5 * height / 1080.0:.2f}*cos(33*t)"
-                            has_anim_pos = True
-                        elif mot_eff == "pendulum":
-                            x_pos = f"({x_pos})+{12.0 * height / 1080.0:.2f}*sin(2*PI*t/2.5)"
-                            y_pos = f"({y_pos})+{3.0 * height / 1080.0:.2f}*pow(sin(2*PI*t/2.5),2)"
-                            has_anim_pos = True
-
-                        if has_anim_pos:
-                            pos_expr = f"x='{x_pos}':y='{y_pos}'"
-                        else:
-                            pos_expr = f"x={base_x}:y={base_y}"
-
-                        dt_parts = [
-                            f"text='{self._escape_drawtext(wrapped_content)}'",
-                            f"fontsize={fitted_font_size}",
-                            f"fontcolor={font_color}",
-                            pos_expr,
-                            f"line_spacing={eff_spacing}",
-                        ]
-
-                        if in_eff == "fade_in":
-                            dt_parts.append(f"alpha='if(lte(t,{in_dur:.2f}), t/{in_dur:.2f}, 1)'")
-
-                        if has_outline:
-                            border_color = self._normalize_ffmpeg_color(outline_color_raw)
-                            dt_parts.append(f"borderw={int(round(outline_width))}")
-                            dt_parts.append(f"bordercolor={border_color}")
-                        else:
-                            dt_parts.append("borderw=0")
-
-                        if font_file:
-                            dt_parts.append(f"fontfile='{self._escape_drawtext(font_file.as_posix())}'")
-
+                        # Draw each line separately at the exact PIL-measured Y.
+                        # A multiline drawtext in a Windows filter script contains
+                        # CRLF and FFmpeg computes a different baseline/text_h,
+                        # which caused a large blank gap compared with Preview.
                         if bg_box_enabled:
                             norm_bg = self._normalize_ffmpeg_color(bg_color_raw)
-                            dt_parts += ["box=1", f"boxcolor={norm_bg}@{bg_opacity:.2f}", "boxborderw=10"]
+                            out_lbl = f"[layer_v_{stage}]"
+                            filters.append(f"{last}drawbox=x={px}:y={py}:w={pw}:h={ph}:color={norm_bg}@{bg_opacity:.2f}:t=fill{out_lbl}")
+                            last = out_lbl
+                            stage += 1
 
-                        out_lbl = f"[layer_v_{stage}]"
-                        filters.append(f"{last}drawtext={':'.join(dt_parts)}{out_lbl}")
-                        last = out_lbl
-                        stage += 1
+                        for line_idx, line_text in enumerate(lines):
+                            line_w = _calc_text_w(line_text)
+                            if font_align == "center":
+                                base_x = str(px + (pw - line_w) // 2)
+                            elif font_align == "right":
+                                base_x = str(px + pw - line_w)
+                            else:
+                                base_x = str(px)
+                            base_y = str(start_y + line_idx * line_step_h)
+                            x_pos = base_x
+                            y_pos = base_y
+                            has_anim_pos = False
+
+                            if in_eff == "slide_up":
+                                y_pos = f"if(lte(t,{in_dur:.2f}),({base_y})+({ph}*(1-t/{in_dur:.2f})),({base_y}))"
+                                has_anim_pos = True
+                            elif in_eff == "slide_down":
+                                y_pos = f"if(lte(t,{in_dur:.2f}),({base_y})-({ph}*(1-t/{in_dur:.2f})),({base_y}))"
+                                has_anim_pos = True
+                            elif in_eff == "slide_left":
+                                x_pos = f"if(lte(t,{in_dur:.2f}),({base_x})-({pw}*(1-t/{in_dur:.2f})),({base_x}))"
+                                has_anim_pos = True
+                            elif in_eff == "slide_right":
+                                x_pos = f"if(lte(t,{in_dur:.2f}),({base_x})+({pw}*(1-t/{in_dur:.2f})),({base_x}))"
+                                has_anim_pos = True
+
+                            if mot_eff == "heartbeat":
+                                y_pos = f"({y_pos})-{6.0 * height / 1080.0:.2f}*pow(max(0,sin(3*PI*t)),2)"
+                                has_anim_pos = True
+                            elif mot_eff in {"glow_pulse", "rainbow_border"}:
+                                y_pos = f"({y_pos})+{1.5 * height / 1080.0:.2f}*sin(2*PI*t/1.8)"
+                                has_anim_pos = True
+                            elif mot_eff == "float":
+                                y_pos = f"({y_pos})+{4.0 * height / 1080.0:.2f}*sin(2*PI*t/3)"
+                                has_anim_pos = True
+                            elif mot_eff == "pulse":
+                                y_pos = f"({y_pos})+{2.0 * height / 1080.0:.2f}*sin(2*PI*t/2)"
+                                has_anim_pos = True
+                            elif mot_eff == "shake_beat":
+                                y_pos = f"({y_pos})-{5.0 * height / 1080.0:.2f}*max(0,sin(2*PI*t*2))*lt(mod(t,0.5),0.15)"
+                                has_anim_pos = True
+                            elif mot_eff == "earthquake_gentle":
+                                x_pos = f"({x_pos})+{1.5 * height / 1080.0:.2f}*sin(28*t)"
+                                y_pos = f"({y_pos})+{1.5 * height / 1080.0:.2f}*cos(33*t)"
+                                has_anim_pos = True
+                            elif mot_eff == "pendulum":
+                                x_pos = f"({x_pos})+{12.0 * height / 1080.0:.2f}*sin(2*PI*t/2.5)"
+                                y_pos = f"({y_pos})+{3.0 * height / 1080.0:.2f}*pow(sin(2*PI*t/2.5),2)"
+                                has_anim_pos = True
+
+                            pos_expr = f"x='{x_pos}':y='{y_pos}'" if has_anim_pos else f"x={base_x}:y={base_y}"
+                            dt_parts = [
+                                f"text='{self._escape_drawtext(line_text)}'",
+                                f"fontsize={fitted_font_size}",
+                                f"fontcolor={font_color}",
+                                pos_expr,
+                            ]
+                            if in_eff == "fade_in":
+                                dt_parts.append(f"alpha='if(lte(t,{in_dur:.2f}),t/{in_dur:.2f},1)'")
+                            if has_outline:
+                                border_color = self._normalize_ffmpeg_color(outline_color_raw)
+                                dt_parts.extend([f"borderw={int(round(outline_width))}", f"bordercolor={border_color}"])
+                            else:
+                                dt_parts.append("borderw=0")
+                            if font_file:
+                                dt_parts.append(f"fontfile='{self._escape_drawtext(font_file.as_posix())}'")
+
+                            out_lbl = f"[layer_v_{stage}]"
+                            filters.append(f"{last}drawtext={':'.join(dt_parts)}{out_lbl}")
+                            last = out_lbl
+                            stage += 1
 
                 elif l_type == "subtitle":
                     if sub_ass_file and sub_ass_file.exists():

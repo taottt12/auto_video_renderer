@@ -918,6 +918,16 @@ class LayoutStudioTab(QWidget):
         font_row.addWidget(self.prop_align_combo)
         tp_layout.addRow("Kiểu chữ & Cỡ:", font_row)
 
+        self.prop_line_spacing_spin = QSpinBox()
+        self.prop_line_spacing_spin.setRange(-100, 100)
+        self.prop_line_spacing_spin.setValue(4)
+        self.prop_line_spacing_spin.setSuffix(" px")
+        self.prop_line_spacing_spin.setToolTip(
+            "Khoảng cách giữa hai dòng chữ. Số âm kéo hai dòng sát nhau; số dương tách hai dòng xa hơn."
+        )
+        self.prop_line_spacing_spin.valueChanged.connect(lambda: self._on_prop_edited())
+        tp_layout.addRow("Khoảng cách dòng:", self.prop_line_spacing_spin)
+
         # Màu Chữ
         color_row = QHBoxLayout()
         self.prop_text_color_btn = QPushButton("🎨 Chọn Màu Chữ...")
@@ -1308,6 +1318,11 @@ class LayoutStudioTab(QWidget):
             self.prop_font_size_spin.setValue(int(layer.get("font_size", 32 if l_type == "text" else 38) or 32))
             self.prop_font_size_spin.blockSignals(False)
 
+            self.prop_line_spacing_spin.blockSignals(True)
+            raw_line_spacing = layer.get("line_spacing", 4)
+            self.prop_line_spacing_spin.setValue(int(4 if raw_line_spacing is None else raw_line_spacing))
+            self.prop_line_spacing_spin.blockSignals(False)
+
             self.prop_bold_btn.blockSignals(True)
             self.prop_bold_btn.setChecked(bool(layer.get("bold", True)))
             self.prop_bold_btn.blockSignals(False)
@@ -1463,6 +1478,7 @@ class LayoutStudioTab(QWidget):
                 layer["text_content"] = self.prop_text_content.toPlainText()
                 layer["font_name"] = self.prop_font_combo.currentFont().family()
                 layer["font_size"] = self.prop_font_size_spin.value()
+                layer["line_spacing"] = self.prop_line_spacing_spin.value()
                 layer["bold"] = self.prop_bold_btn.isChecked()
                 it_mode = self.prop_italic_combo.currentData() or "none"
                 layer["italic_mode"] = it_mode
@@ -1604,6 +1620,7 @@ class LayoutStudioTab(QWidget):
             new_layer["box_h"] = 0.14
             new_layer["font_name"] = "Arial"
             new_layer["font_size"] = 32
+            new_layer["line_spacing"] = 4
             new_layer["bold"] = True
             new_layer["italic"] = False
             new_layer["italic_mode"] = "none"
