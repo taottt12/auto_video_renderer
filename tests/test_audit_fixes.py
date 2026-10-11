@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 import sys
+import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -18,6 +20,7 @@ from src_app.core.process_utils import GpuResourceManager
 from src_app.core.paths import LOG_DIR
 from src_app.core.media_utils import _DURATION_CACHE, _DURATION_CACHE_LOCK
 from src_app.core.render_engine import RenderEngine
+from src_app.core.subtitle_worker import _checkpoint_path, _load_checkpoint, _save_checkpoint
 
 
 class TestAuditAndOptimizationFixes(unittest.TestCase):
@@ -136,6 +139,35 @@ class TestAuditAndOptimizationFixes(unittest.TestCase):
             # Trong lock của NVENC
             pass
 
+    def test_whisper_and_nvenc_share_one_gpu_gate(self):
+        """NVENC không được chen vào trong lúc Whisper đang giữ VRAM."""
+        entered_nvenc = threading.Event()
+
+        def try_nvenc():
+            with GpuResourceManager.acquire_nvenc_gpu(timeout=1.0):
+                entered_nvenc.set()
+
+        with GpuResourceManager.acquire_whisper_gpu():
+            thread = threading.Thread(target=try_nvenc)
+            thread.start()
+            time.sleep(0.1)
+            self.assertFalse(entered_nvenc.is_set())
+
+        thread.join(timeout=2.0)
+        self.assertTrue(entered_nvenc.is_set())
+
+    def test_whisper_checkpoint_round_trip(self):
+        out_path = self.logger.job_dir / "subtitle.srt"
+        signature = {"model": "turbo", "chunks": 2}
+        segments = [{"start": 0.0, "end": 1.0, "text": "hello"}]
+        _save_checkpoint(out_path, signature, segments, {0}, "en")
+
+        loaded_segments, completed, language = _load_checkpoint(out_path, signature)
+        self.assertEqual(loaded_segments, segments)
+        self.assertEqual(completed, {0})
+        self.assertEqual(language, "en")
+        self.assertTrue(_checkpoint_path(out_path).exists())
+
     def test_render_engine_initialization_with_logger(self):
         """Kiểm tra RenderEngine tích hợp đầy đủ JobLogger và thuộc tính truy vết."""
         engine = RenderEngine(
@@ -147,6 +179,47 @@ class TestAuditAndOptimizationFixes(unittest.TestCase):
         self.assertEqual(engine.job_id, self.test_job_id)
         self.assertEqual(engine.run_id, self.test_run_id)
         self.assertEqual(engine.job_logger, self.logger)
+
+    def test_audio_cleanup_is_combined_into_normalize_pass(self):
+        calls = []
+        engine = RenderEngine(settings={
+            "filter_bgm_after_30s": True,
+            "background_music": {"enabled": False},
+            "promo_audio": {"enabled": False},
+        })
+        engine._run = lambda cmd, stage, *args, **kwargs: calls.append((cmd, stage))
+        with tempfile.TemporaryDirectory() as tmp:
+            result = engine._build_final_audio(Path(tmp) / "input.mp3", Path(tmp), 3600.0, 1.0)
+        self.assertEqual(len(calls), 1, "Normalize và lọc voice phải dùng chung một lần encode AAC")
+        self.assertIn("-filter_complex", calls[0][0])
+        self.assertIn("asplit=2", calls[0][0][calls[0][0].index("-filter_complex") + 1])
+        self.assertEqual(result.name, "main_audio.m4a")
+
+    def test_animated_layout_is_replaced_by_reusable_overlay(self):
+        engine = RenderEngine(settings={"export": {"fps": 25}})
+        created_files = []
+
+        def fake_run(cmd, stage, *args, **kwargs):
+            out = Path(cmd[-1])
+            out.write_bytes(b"0" * 12000)
+            created_files.append(out)
+
+        engine._run = fake_run
+        with tempfile.TemporaryDirectory() as tmp:
+            gif = Path(tmp) / "badge.gif"
+            gif.write_bytes(b"GIF89a-test")
+            layers = [{
+                "type": "gif", "file_path": str(gif), "enabled": True,
+                "box_x": 0.1, "box_y": 0.2, "box_w": 0.3, "box_h": 0.2,
+                "in_effect": "none", "out_effect": "none", "motion_effect": "none",
+            }]
+            optimized = engine._prepare_cached_animated_layers(layers, 1280, 720, 25)
+            self.assertEqual(optimized[0]["type"], "compiled_overlay")
+            cached = Path(optimized[0]["file_path"])
+            self.assertTrue(cached.exists())
+            cached.unlink(missing_ok=True)
+        for path in created_files:
+            path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

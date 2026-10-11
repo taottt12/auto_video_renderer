@@ -737,7 +737,9 @@ def _run_isolated_whisper(
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
     worker_env = os.environ.copy()
-    worker_env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    worker_env["PYTORCH_CUDA_ALLOC_CONF"] = (
+        "backend:native,max_split_size_mb:128,garbage_collection_threshold:0.8"
+    )
     worker_env["CUDA_MODULE_LOADING"] = "LAZY"
     worker_env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
@@ -760,6 +762,9 @@ def _run_isolated_whisper(
     detected_lang = language or "unknown"
     error_msg = ""
     out_queue: queue.Queue[str | None] = queue.Queue()
+    last_worker_output = time.monotonic()
+    stall_timeout_sec = 300.0 if device == "cuda" else 900.0
+    forced_ret_code: int | None = None
 
     def _reader_thread_target():
         try:
@@ -787,6 +792,18 @@ def _run_isolated_whisper(
         try:
             line = out_queue.get(timeout=0.1)
         except queue.Empty:
+            if time.monotonic() - last_worker_output > stall_timeout_sec:
+                error_msg = (
+                    f"Worker {device.upper()} không phản hồi trong {int(stall_timeout_sec)} giây; "
+                    "đã kết thúc để tránh treo hàng đợi render."
+                )
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    pass
+                forced_ret_code = CUDA_FATAL_EXIT_CODE if device == "cuda" else 1
+                break
             if proc.poll() is not None:
                 # Tiến trình đã kết thúc và không còn dòng log mới trong queue
                 break
@@ -797,6 +814,7 @@ def _run_isolated_whisper(
             break
 
         clean_line = line.strip()
+        last_worker_output = time.monotonic()
         if clean_line.startswith("__AVR_MSG__"):
             try:
                 payload = json.loads(clean_line[len("__AVR_MSG__"):])
@@ -819,7 +837,7 @@ def _run_isolated_whisper(
     except Exception:
         pass
 
-    ret_code = proc.poll()
+    ret_code = forced_ret_code if forced_ret_code is not None else proc.poll()
     if ret_code is None:
         ret_code = 0 if (out_srt_path.exists() and out_srt_path.stat().st_size > 0) else 1
 

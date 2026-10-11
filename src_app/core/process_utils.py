@@ -60,10 +60,14 @@ class GpuResourceManager:
             return cls._instance
 
     def _init_semaphores(self) -> None:
-        # 1. Whisper GPU: Tuyệt đối chỉ 1 tác vụ chạy trên CUDA tại một thời điểm
-        self.whisper_gpu_semaphore = threading.Semaphore(1)
-        # 2. FFmpeg NVENC: Giới hạn số luồng GPU encode đồng thời (1 luồng cho GPU < 8GB để chống OOM/driver reset)
-        self.nvenc_gpu_semaphore = threading.Semaphore(1)
+        # RTX 2060 6 GB không đủ dư địa để Whisper và NVENC/NVDEC chạy đồng thời.
+        # Hai semaphore độc lập trước đây chỉ giới hạn từng loại tác vụ, nhưng vẫn
+        # cho phép job A encode trong lúc job B đang transcribe. Dùng chung một cổng
+        # GPU để tránh tranh chấp VRAM và driver reset/CUDA error 700.
+        self.gpu_heavy_semaphore = threading.Semaphore(1)
+        # Giữ alias để tương thích với code/plugin cũ có thể đọc thuộc tính này.
+        self.whisper_gpu_semaphore = self.gpu_heavy_semaphore
+        self.nvenc_gpu_semaphore = self.gpu_heavy_semaphore
 
     @classmethod
     @contextlib.contextmanager

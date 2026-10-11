@@ -9,12 +9,9 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import math
 import os
 import subprocess
 import sys
-import time
-import traceback
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +23,9 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# expandable_segments chưa được hỗ trợ trên PyTorch/CUDA Windows hiện dùng và
+# chỉ tạo warning. Native allocator với split cap phù hợp hơn cho GPU 6 GB.
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:native,max_split_size_mb:128,garbage_collection_threshold:0.8"
 
 # Thêm đường dẫn ffmpeg nội bộ của tool vào PATH nếu có
 _ROOT = Path(__file__).resolve().parents[2]
@@ -206,7 +205,11 @@ def normalize_whisper_model_name(raw_name: str) -> str:
     return "turbo"
 
 
-def clean_cuda_vram(sync: bool = True) -> None:
+class CudaWorkerFailure(RuntimeError):
+    """Buộc worker CUDA kết thúc để tiến trình cha tạo CUDA context sạch."""
+
+
+def clean_cuda_vram(sync: bool = True, strict: bool = False) -> None:
     """Thu gom rác, đồng bộ hóa GPU và giải phóng toàn bộ cached memory blocks của PyTorch Caching Allocator trên GPU."""
     import torch
     gc.collect()
@@ -217,7 +220,66 @@ def clean_cuda_vram(sync: bool = True) -> None:
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
         except Exception:
-            pass
+            # synchronize() thường là nơi lỗi kernel bất đồng bộ xuất hiện. Trong
+            # đường chạy chính phải để lỗi thoát ra; nuốt lỗi rồi chạy CPU trong
+            # CUDA context đã poisoned sẽ làm worker treo hoặc giữ nguyên VRAM.
+            if strict:
+                raise
+
+
+def cuda_memory_summary() -> str:
+    """Snapshot ngắn phục vụ chẩn đoán VRAM, không giữ tensor CUDA."""
+    try:
+        import torch
+        free_b, total_b = torch.cuda.mem_get_info()
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        peak = torch.cuda.max_memory_allocated()
+        mib = 1024 * 1024
+        return (
+            f"allocated={allocated / mib:.0f} MB, reserved={reserved / mib:.0f} MB, "
+            f"peak={peak / mib:.0f} MB, free={free_b / mib:.0f}/{total_b / mib:.0f} MB"
+        )
+    except Exception as ex:
+        return f"không đọc được VRAM ({ex})"
+
+
+def _checkpoint_path(out_path: Path) -> Path:
+    return out_path.with_suffix(out_path.suffix + ".whisper.partial.json")
+
+
+def _load_checkpoint(out_path: Path, signature: dict) -> tuple[list[dict], set[int], str]:
+    path = _checkpoint_path(out_path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("signature") != signature:
+            return [], set(), "unknown"
+        segments = payload.get("segments") or []
+        completed = {int(i) for i in (payload.get("completed_chunks") or [])}
+        language = str(payload.get("language") or "unknown")
+        return segments, completed, language
+    except Exception:
+        return [], set(), "unknown"
+
+
+def _save_checkpoint(
+    out_path: Path,
+    signature: dict,
+    segments: list[dict],
+    completed_chunks: set[int],
+    language: str,
+) -> None:
+    """Ghi atomic để worker mới có thể tiếp tục sau CUDA error/OOM."""
+    path = _checkpoint_path(out_path)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    payload = {
+        "signature": signature,
+        "segments": segments,
+        "completed_chunks": sorted(completed_chunks),
+        "language": language,
+    }
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(temp_path, path)
 
 
 def safe_load_whisper_model(model_name: str, device: str):
@@ -234,6 +296,15 @@ def safe_load_whisper_model(model_name: str, device: str):
 
     clean_cuda_vram()
     if device == "cuda" and torch.cuda.is_available():
+        free_b, total_b = torch.cuda.mem_get_info()
+        model_lower = model_name.lower()
+        required_free_mb = 3200 if ("turbo" in model_lower or "large" in model_lower) else 2400
+        free_mb = free_b / (1024 * 1024)
+        if free_mb < required_free_mb:
+            raise CudaWorkerFailure(
+                f"VRAM trống chỉ còn {free_mb:.0f} MB, cần tối thiểu {required_free_mb} MB "
+                f"để nạp Whisper [{model_name}] an toàn trên GPU {total_b / (1024**3):.1f} GB."
+            )
         # Bước 1: Nạp CPU System RAM
         model = whisper.load_model(model_name, device="cpu")
         # Bước 2: Selective FP16 Casting (Bảo toàn LayerNorm FP32)
@@ -406,15 +477,36 @@ class WhisperTranscriber:
 
         # 3. Hook progress bar của whisper.transcribe
         try:
-            import whisper.transcribe as wt_mod
+            import importlib
+            wt_mod = importlib.import_module("whisper.transcribe")
             wt_mod.tqdm.tqdm = AvrWhisperProgressBar
         except Exception:
             pass
 
-        # 4. Thực thi giải mã trên GPU CUDA (kèm Cơ Chế Model Auto-Refresh & Bảo Toàn Checkpoint)
+        # 4. Thực thi giải mã. Mỗi macro-chunk được checkpoint để nếu CUDA context
+        # hỏng, worker mới có thể tiếp tục mà không làm lại phần đã hoàn thành.
         use_gpu = (self.requested_device == "cuda" and torch.cuda.is_available())
-        completed_chunk_indices: set[int] = set()
-        self.all_segments = []
+        try:
+            audio_size = int(self.audio_path.stat().st_size)
+        except OSError:
+            audio_size = -1
+        checkpoint_signature = {
+            "model": self.model_name,
+            "language": self.target_lang or "auto",
+            "audio_size": audio_size,
+            "duration_ms": int(total_duration * 1000),
+            "chunks": total_chunks,
+        }
+        self.all_segments, completed_chunk_indices, checkpoint_lang = _load_checkpoint(
+            self.out_path, checkpoint_signature
+        )
+        if checkpoint_lang != "unknown" and self.detected_language == "unknown":
+            self.detected_language = checkpoint_lang
+        if completed_chunk_indices:
+            emit_msg("log", {"text": (
+                f"♻️ Khôi phục checkpoint: {len(completed_chunk_indices)}/{total_chunks} chunk, "
+                f"{len(self.all_segments)} segments; tiếp tục phần còn lại."
+            )})
 
         if use_gpu:
             emit_msg("log", {"text": f"⚡ Bắt đầu pipeline Whisper AI [{self.model_name}] (Staged FP16) trên GPU CUDA..."})
@@ -426,10 +518,9 @@ class WhisperTranscriber:
                 whisper_beam = 1 if is_large_or_turbo else 5
                 inference_context = torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
 
-                # Chu kỳ tự động làm mới Model GPU (mỗi 2 chunks ~ 20 phút audio) để triệt tiêu tích lũy rác C++ & context timeout
-                REFRESH_CHUNK_INTERVAL = 2
-
                 for chunk_idx, (chunk_audio, start_sec, end_sec) in enumerate(chunks):
+                    if chunk_idx in completed_chunk_indices:
+                        continue
                     AvrWhisperProgressBar.current_chunk_idx = chunk_idx
                     if total_chunks > 1:
                         emit_msg("log", {"text": f"🎙️ [GPU] Đang xử lý Chunk {chunk_idx + 1}/{total_chunks} ({start_sec/60:.1f}m -> {end_sec/60:.1f}m)..."})
@@ -467,37 +558,41 @@ class WhisperTranscriber:
                         completed_chunk_indices.add(chunk_idx)
                         del res
 
-                        # XẢ SẠCH VRAM SAU MỖI CHUNK ĐỂ RESET BỘ NHỚ
-                        clean_cuda_vram(sync=True)
-                        time.sleep(0.15)  # Khoảng nghỉ micro-yield để DWM và driver ổn định
+                        _save_checkpoint(
+                            self.out_path,
+                            checkpoint_signature,
+                            self.all_segments,
+                            completed_chunk_indices,
+                            self.detected_language,
+                        )
 
-                        # KIỂM TRA CHU KỲ LÀM MỚI MODEL GPU (Mỗi 2 chunks hoàn thành)
-                        if (chunk_idx + 1) % REFRESH_CHUNK_INTERVAL == 0 and (chunk_idx + 1) < total_chunks:
-                            del gpu_model
-                            gpu_model = None
-                            clean_cuda_vram(sync=True)
-                            time.sleep(0.1)
+                        # XẢ SẠCH VRAM SAU MỖI CHUNK ĐỂ RESET BỘ NHỚ
+                        clean_cuda_vram(sync=True, strict=True)
+                        emit_msg("log", {"text": f"🧠 [GPU] Sau chunk {chunk_idx + 1}: {cuda_memory_summary()}"})
 
                     except Exception as chunk_gpu_err:
-                        emit_msg("log", {"text": f"⚠️ Chunk {chunk_idx + 1}/{total_chunks} GPU gặp ngoại lệ ({chunk_gpu_err}) -> Đã bảo toàn an toàn {len(self.all_segments)} segments từ {len(completed_chunk_indices)} chunk trước."})
-                        if gpu_model is not None:
-                            del gpu_model
-                            gpu_model = None
-                        clean_cuda_vram(sync=False)
-                        break
+                        emit_msg("error", {"text": (
+                            f"Chunk {chunk_idx + 1}/{total_chunks} lỗi CUDA ({chunk_gpu_err}). "
+                            f"Đã checkpoint {len(completed_chunk_indices)} chunk; worker phải thoát để reset CUDA context."
+                        )})
+                        raise CudaWorkerFailure(str(chunk_gpu_err)) from chunk_gpu_err
 
                 if len(completed_chunk_indices) == total_chunks:
                     emit_msg("log", {"text": f"✔ Bóc tách GPU hoàn tất 100%: {len(self.all_segments)} segments."})
             except Exception as gpu_err:
-                emit_msg("log", {"text": f"⚠️ Khởi tạo GPU thất bại ({gpu_err}) -> Chuyển sang CPU..."})
+                if isinstance(gpu_err, CudaWorkerFailure):
+                    raise
+                emit_msg("error", {"text": f"Khởi tạo GPU thất bại ({gpu_err}); worker phải thoát để reset CUDA context."})
+                raise CudaWorkerFailure(str(gpu_err)) from gpu_err
             finally:
                 if gpu_model is not None:
                     del gpu_model
                 clean_cuda_vram(sync=False)
 
-        # Fallback sang CPU cho các Chunk chưa hoàn thành (Tiếp tục từ chunk bị gián đoạn, KHÔNG làm lại từ đầu)
+        # CPU chỉ chạy trong worker được khởi động với --device cpu. Worker CUDA
+        # tuyệt đối không fallback nội bộ vì context lỗi 700 không thể phục hồi.
         remaining_indices = [i for i in range(total_chunks) if i not in completed_chunk_indices]
-        if remaining_indices:
+        if remaining_indices and not use_gpu:
             start_rem_chunk = remaining_indices[0] + 1
             emit_msg("log", {"text": f"⚙️ Chuyển {len(remaining_indices)} chunk còn lại (từ Chunk {start_rem_chunk}/{total_chunks}) sang CPU đa luồng giữ nguyên model [{self.model_name}]..."})
             cpu_model = None
@@ -541,6 +636,13 @@ class WhisperTranscriber:
                     completed_chunk_indices.add(chunk_idx)
                     del res
                     gc.collect()
+                    _save_checkpoint(
+                        self.out_path,
+                        checkpoint_signature,
+                        self.all_segments,
+                        completed_chunk_indices,
+                        self.detected_language,
+                    )
 
                 emit_msg("log", {"text": f"✔ Bóc tách CPU hoàn tất các chunk còn lại: Tổng {len(self.all_segments)} segments."})
             except Exception as cpu_err:
@@ -605,6 +707,10 @@ class WhisperTranscriber:
         if not valid_events:
             emit_msg("log", {"text": f"ℹ️ Không phát hiện lời thoại trong '{self.audio_path.name}'. Tạo file phụ đề trống."})
             self.out_path.write_text("", encoding="utf-8")
+            try:
+                _checkpoint_path(self.out_path).unlink(missing_ok=True)
+            except OSError:
+                pass
             emit_msg("success", {"language": self.detected_language, "events_count": 0})
             return 0
 
@@ -615,6 +721,10 @@ class WhisperTranscriber:
             srt_lines.append(f"{idx}\n{start_str} --> {end_str}\n{text}\n")
 
         self.out_path.write_text("\n".join(srt_lines), encoding="utf-8")
+        try:
+            _checkpoint_path(self.out_path).unlink(missing_ok=True)
+        except OSError:
+            pass
         emit_msg("success", {
             "output": str(self.out_path),
             "language": self.detected_language,
@@ -713,6 +823,11 @@ def main():
     args = parser.parse_args()
     try:
         sys.exit(run_worker(args))
+    except CudaWorkerFailure as e:
+        emit_msg("error", {"text": str(e)})
+        # Mã riêng để tiến trình cha biết context đã hỏng và chỉ được retry bằng
+        # một process mới hoàn toàn.
+        sys.exit(CUDA_FATAL_EXIT_CODE)
     except Exception as e:
         emit_msg("error", {"text": str(e)})
         sys.exit(1)

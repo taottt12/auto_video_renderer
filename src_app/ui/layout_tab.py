@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1786,6 +1787,7 @@ class LayoutStudioTab(QWidget):
             }
             try:
                 file_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                self._prewarm_layout_cache(data["layers"])
                 self._reload_presets(select_key=p_key)
                 self.settings_changed.emit(self.settings)
                 QMessageBox.information(self, "Thành công", f"✔ Đã cập nhật và lưu đè vào mẫu '{clean_name}'!")
@@ -1809,11 +1811,39 @@ class LayoutStudioTab(QWidget):
             }
             try:
                 preset_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                self._prewarm_layout_cache(data["layers"])
                 self._reload_presets(select_key=f"custom_{safe_file_name}")
                 self.settings_changed.emit(self.settings)
                 QMessageBox.information(self, "Thành công", f"✔ Đã lưu mẫu bố cục '{clean_name}' vào presets/layouts/!")
             except Exception as ex:
                 QMessageBox.warning(self, "Lỗi", f"Không thể lưu file mẫu: {ex}")
+
+    def _prewarm_layout_cache(self, layers: List[Dict[str, Any]]) -> None:
+        """Build static and GIF caches in the background immediately after preset save."""
+        layers_copy = copy.deepcopy(layers)
+        export = copy.deepcopy(self.settings.get("export", {}) or {})
+        width = max(16, int(export.get("width", 1920) or 1920))
+        height = max(16, int(export.get("height", 1080) or 1080))
+        fps = max(1, int(export.get("fps", 30) or 30))
+        preview_title = str(getattr(self.canvas, "preview_title", "") or "")
+
+        def _worker() -> None:
+            try:
+                _cached_png, dynamic_layers = LayoutRenderer.get_or_render_cached_canvas(
+                    layers=layers_copy,
+                    width=width,
+                    height=height,
+                    audio_title=preview_title,
+                )
+                if dynamic_layers:
+                    from ..core.render_engine import RenderEngine
+                    engine = RenderEngine(settings={"export": export})
+                    engine._prepare_cached_animated_layers(dynamic_layers, width, height, fps)
+            except Exception:
+                # Cache is only an optimization; the normal render path remains the fallback.
+                pass
+
+        threading.Thread(target=_worker, name="layout-cache-prewarm", daemon=True).start()
 
     def _delete_custom_preset(self) -> None:
         p_key = self.preset_combo.currentData()

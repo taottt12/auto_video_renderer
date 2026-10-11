@@ -30,10 +30,11 @@ from .layout_renderer import (
 )
 from .media_utils import choose_media_sequence, get_duration_seconds, is_image, is_video
 from .overlay_generator import get_overlay_file, ensure_default_overlays
-from .paths import TEMP_DIR, OUTPUT_DIR, DATA_DIR, APP_ROOT, ensure_dirs, find_binary
+from .paths import TEMP_DIR, OUTPUT_DIR, DATA_DIR, CACHE_DIR, APP_ROOT, ensure_dirs, find_binary
 from .process_utils import popen_hidden, run_hidden, GpuResourceManager
 
 from .subtitle_utils import (
+    RenderCancelled as SubtitleRenderCancelled,
     ensure_cuda_whisper_libraries,
     find_subtitle_file,
     preflight_whisper_model,
@@ -68,6 +69,8 @@ class RenderEngine:
     6. Ghép intro/outro theo fast path copy, không encode lại main video nếu có thể.
     7. Move MP4 cuối và tự dọn temp.
     """
+
+    _animated_layout_cache_lock = threading.Lock()
 
     def __init__(
         self,
@@ -292,8 +295,10 @@ class RenderEngine:
                             initial_prompt=combined_prompt,
                             job_logger=self.job_logger,
                         )
-                    except RenderCancelled:
-                        raise
+                    except SubtitleRenderCancelled as ex:
+                        # Chuẩn hóa cancellation từ subtitle sandbox để outer
+                        # render loop không hiểu nhầm thao tác Dừng là lỗi Whisper.
+                        raise RenderCancelled(str(ex)) from ex
                     except Exception as ex:
                         self.log(f"❌ Lỗi Whisper AI khi tự động tạo phụ đề cho '{original_audio_path.name}': {ex}")
                         raise RuntimeError(f"Lỗi Whisper AI khi tạo phụ đề: {ex}") from ex
@@ -543,7 +548,10 @@ class RenderEngine:
             "-vf", "format=yuv420p",
             "-c:v", encoder_name, "-f", "null", "-"
         ]
-        test = run_hidden(test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore")
+        # Preflight cũng khởi tạo NVENC context; phải đi qua cùng GPU gate với
+        # Whisper để job song song không chen đúng lúc model đang dùng VRAM.
+        with GpuResourceManager.acquire_nvenc_gpu():
+            test = run_hidden(test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore")
         if test.returncode != 0:
             detail = (test.stderr or test.stdout or "").strip()
             lower_detail = detail.lower()
@@ -851,8 +859,16 @@ class RenderEngine:
             self.job_logger.log_event("ffmpeg_command_started", stage=stage, data={"cmd": cmd})
 
         is_nvenc = "-c:v" in cmd and any("nvenc" in part.lower() for part in cmd)
+        show_encode_progress = "render direct 1-pass" in stage.lower()
+        total_duration = 0.0
+        for idx, part in enumerate(cmd[:-1]):
+            if part == "-t":
+                parsed = self._parse_time_to_seconds(str(cmd[idx + 1]))
+                if parsed:
+                    total_duration = parsed
 
         def _execute_process() -> Tuple[int, List[str]]:
+            last_reported_percent = 44
             try:
                 process = popen_hidden(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="ignore")
             except OSError as exc:
@@ -907,6 +923,17 @@ class RenderEngine:
                             if len(recent_lines) > 30:
                                 recent_lines = recent_lines[-30:]
                             self.log(line)
+                            if show_encode_progress and total_duration > 0:
+                                match = re.search(r"\btime=(\d{1,3}:\d{2}:\d{2}(?:\.\d+)?)", line)
+                                if match:
+                                    encoded_seconds = self._parse_time_to_seconds(match.group(1)) or 0.0
+                                    percent = min(89, 45 + int(44 * encoded_seconds / total_duration))
+                                    if percent > last_reported_percent:
+                                        last_reported_percent = percent
+                                        self.progress(
+                                            percent,
+                                            f"{stage} • {self._format_seconds(encoded_seconds)} / {self._format_seconds(total_duration)}",
+                                        )
                     except queue.Empty:
                         if process.poll() is not None:
                             while not out_queue.empty():
@@ -1105,7 +1132,11 @@ class RenderEngine:
         if src_fps > (target_fps + 1.0):
             needs_norm = True
             reasons.append(f"fps cao {src_fps:.1f}fps -> {target_fps}fps")
-        if src_w > target_w * 1.5 and src_h > target_h * 1.5 and src_w > 0:
+        # 720p profile: normalize a larger reusable background once, instead of
+        # scaling 1920x1080 again for every frame of every long audio job.
+        downscale_for_fast_profile = target_w <= 1280 and target_h <= 720 and (src_w > target_w or src_h > target_h)
+        very_large_source = src_w > target_w * 1.5 and src_h > target_h * 1.5 and src_w > 0
+        if downscale_for_fast_profile or very_large_source:
             needs_norm = True
             reasons.append(f"độ phân giải {src_w}x{src_h} -> {target_w}x{target_h}")
 
@@ -1560,15 +1591,31 @@ class RenderEngine:
         afilters = ["aresample=48000", "aformat=channel_layouts=stereo"]
         if abs(speed - 1.0) > 0.001:
             afilters.append(self._atempo_filter(speed))
-        cmd = [
-            self.ffmpeg, "-y", "-i", str(audio), "-vn",
-            "-af", ",".join(afilters),
-            "-t", f"{duration:.6f}",
-            "-c:a", "aac", "-b:a", "192k", str(current),
-        ]
-        self._run(cmd, "Chuẩn hóa audio chính")
-
         bgm_cfg = self.settings.get("background_music", {}) or {}
+        promo_cfg = self.settings.get("promo_audio", {}) or {}
+        filter_after_30 = bool(self.settings.get("filter_bgm_after_30s", False) and duration > 30.0)
+        filter_applied = filter_after_30 and not bgm_cfg.get("enabled") and not promo_cfg.get("enabled")
+        if filter_applied:
+            base_chain = ",".join(afilters)
+            combined_filter = (
+                f"[0:a]{base_chain},asplit=2[a_full][a_to_filter];"
+                "[a_to_filter]highpass=f=120,lowpass=f=3800,afftdn=nf=-25,dynaudnorm=f=150:g=15[a_clean];"
+                "[a_full]atrim=0:30,asetpts=PTS-STARTPTS[a_intro];"
+                "[a_clean]atrim=30,asetpts=PTS-STARTPTS[a_body];"
+                "[a_intro][a_body]concat=n=2:v=0:a=1,aresample=48000,aformat=channel_layouts=stereo[a]"
+            )
+            cmd = [
+                self.ffmpeg, "-y", "-i", str(audio), "-vn", "-filter_complex", combined_filter,
+                "-map", "[a]", "-t", f"{duration:.6f}", "-c:a", "aac", "-b:a", "192k", str(current),
+            ]
+            self._run(cmd, "Chuẩn hóa + lọc audio trong 1 pass")
+        else:
+            cmd = [
+                self.ffmpeg, "-y", "-i", str(audio), "-vn", "-af", ",".join(afilters),
+                "-t", f"{duration:.6f}", "-c:a", "aac", "-b:a", "192k", str(current),
+            ]
+            self._run(cmd, "Chuẩn hóa audio chính")
+
         bgm_file = self._get_background_music_file()
         if bgm_cfg.get("enabled") and bgm_file:
             bgm_out = job_temp / "audio_with_background.m4a"
@@ -1579,7 +1626,6 @@ class RenderEngine:
         elif bgm_cfg.get("enabled"):
             self.log("Đã bật nhạc nền nhưng chưa có file nhạc nền hợp lệ.")
 
-        promo_cfg = self.settings.get("promo_audio", {}) or {}
         if promo_cfg.get("enabled"):
             positions = self._parse_promo_positions(str(promo_cfg.get("positions_text", "")), duration)
             promo_files = self._select_promo_files_for_positions(positions)
@@ -1593,7 +1639,7 @@ class RenderEngine:
                 self.log("Đã bật audio quảng bá nhưng chưa có file hoặc chưa có vị trí chèn hợp lệ.")
 
         # Lọc tạp âm / triệt tiêu nhạc nền sau 30s đầu (30s đầu giữ nguyên cho Voice Intro / Nhạc mở màn)
-        if self.settings.get("filter_bgm_after_30s", False) and duration > 30.0:
+        if filter_after_30 and not filter_applied:
             self.log("🎙️ Lọc tạp âm/nhạc nền sau 30s: Giữ nguyên 30s đầu (Voice/BGM Intro), lọc dải tần giọng nói từ giây thứ 30 trở đi.")
             filter_audio_out = job_temp / "audio_filtered_30s.m4a"
             af_filter_complex = (
@@ -2474,6 +2520,117 @@ class RenderEngine:
         # Fallback về static canvas nếu anim mov thất bại
         return self._bake_static_layout_canvas(layers, width, height, canvas_png)
 
+    def _prepare_cached_animated_layers(
+        self,
+        layers: List[Dict[str, Any]],
+        width: int,
+        height: int,
+        fps: int,
+    ) -> List[Dict[str, Any]]:
+        """Replace a contiguous GIF/video-mask run with one reusable RGBA movie."""
+        eligible: List[Tuple[int, Dict[str, Any], Path, str]] = []
+        for idx, layer in enumerate(layers):
+            layer_type = str(layer.get("type", "image")).lower()
+            raw_path = str(layer.get("file_path", "")).strip()
+            is_loop_visual = layer_type in {"gif", "reaction", "video_mask"} or raw_path.lower().endswith(".gif")
+            has_effect = any(
+                str(layer.get(key, "none")).lower() != "none"
+                for key in ("in_effect", "out_effect", "motion_effect")
+            )
+            resolved = self._resolve_asset_path(raw_path) if raw_path else None
+            if is_loop_visual and not has_effect and resolved and resolved.exists():
+                eligible.append((idx, layer, resolved, layer_type))
+        if not eligible:
+            return layers
+
+        # Only merge adjacent layers. This preserves the exact Studio z-order when
+        # animated text or another live layer sits between two GIFs.
+        runs: List[List[Tuple[int, Dict[str, Any], Path, str]]] = []
+        for item in eligible:
+            if not runs or item[0] != runs[-1][-1][0] + 1:
+                runs.append([item])
+            else:
+                runs[-1].append(item)
+        visual_layers = max(runs, key=len)
+        first_idx, last_idx = visual_layers[0][0], visual_layers[-1][0]
+
+        cache_dir = CACHE_DIR / "layouts"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        hasher = hashlib.md5(f"animated-layout-v2:{width}x{height}:{fps}".encode("utf-8"))
+        for _idx, layer, resolved, _kind in visual_layers:
+            hasher.update(json.dumps(layer, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+            try:
+                stat = resolved.stat()
+                hasher.update(f"{resolved.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode("utf-8"))
+            except OSError:
+                hasher.update(str(resolved).encode("utf-8"))
+        target = cache_dir / f"animated_{hasher.hexdigest()}.mov"
+        marker = {"type": "compiled_overlay", "name": "Cached animated layout", "file_path": str(target), "enabled": True}
+        optimized = list(layers[:first_idx]) + [marker] + list(layers[last_idx + 1:])
+        if target.exists() and target.stat().st_size > 10240:
+            self.log(f"⚡ Layout Animation Cache: tái sử dụng {target.name} ({len(visual_layers)} lớp động).")
+            return optimized
+
+        duration = 6.0
+        temp_out = cache_dir / f"animated_{hasher.hexdigest()}_{uuid.uuid4().hex[:8]}.mov"
+        cmd = [
+            self.ffmpeg, "-y", "-threads", "0", "-f", "lavfi", "-i",
+            f"color=c=0x00000000:s={width}x{height}:d={duration}:r={fps},format=rgba",
+        ]
+        filters = ["[0:v]format=rgba[c_base]"]
+        last_label = "[c_base]"
+        input_idx = 1
+        for _layer_idx, layer, resolved, layer_type in visual_layers:
+            if layer_type in {"gif", "reaction"} or str(resolved).lower().endswith(".gif"):
+                cmd += ["-ignore_loop", "0", "-t", str(duration), "-i", str(resolved)]
+            else:
+                cmd += ["-stream_loop", "-1", "-t", str(duration), "-i", str(resolved)]
+            px = int(width * float(layer.get("box_x", 0.0)))
+            py = int(height * float(layer.get("box_y", 0.0)))
+            pw = max(16, int(width * float(layer.get("box_w", 0.3))))
+            ph = max(16, int(height * float(layer.get("box_h", 0.2))))
+            opacity = max(0.0, min(1.0, float(layer.get("opacity", 1.0) or 1.0)))
+            scale_mode = str(layer.get("scale_mode", "stretch")).lower()
+            if scale_mode == "fit":
+                chain = f"scale={pw}:{ph}:force_original_aspect_ratio=decrease,pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black@0"
+            elif scale_mode == "crop":
+                chain = f"scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph}"
+            else:
+                chain = f"scale={pw}:{ph}"
+            chain += f",fps={fps},format=rgba"
+            if str(layer.get("blend_mode", "alpha")).lower() in {"colorkey_black", "screen"}:
+                chain += ",colorkey=0x000000:0.15:0.1"
+            if opacity < 0.999:
+                chain += f",colorchannelmixer=aa={opacity:.3f}"
+            input_label = f"[cache_in_{input_idx}]"
+            output_label = f"[cache_v_{input_idx}]"
+            filters.append(f"[{input_idx}:v]{chain}{input_label}")
+            filters.append(f"{last_label}{input_label}overlay={px}:{py}:format=auto{output_label}")
+            last_label = output_label
+            input_idx += 1
+        cmd += [
+            "-filter_complex", ";".join(filters), "-map", last_label, "-t", str(duration),
+            "-c:v", "qtrle", "-pix_fmt", "argb", str(temp_out),
+        ]
+        try:
+            with self._animated_layout_cache_lock:
+                if not (target.exists() and target.stat().st_size > 10240):
+                    self._run(cmd, "Tạo cache GIF/layout động", allow_cpu_fallback=False)
+                    if temp_out.exists() and temp_out.stat().st_size > 10240:
+                        temp_out.replace(target)
+            if target.exists() and target.stat().st_size > 10240:
+                self.log(f"⚡ Đã gom {len(visual_layers)} lớp GIF/mask thành một overlay cache dùng lại.")
+                return optimized
+        except Exception as exc:
+            self.log(f"⚠️ Không tạo được cache layout động ({exc}); tiếp tục render từng lớp.")
+        finally:
+            if temp_out.exists():
+                try:
+                    temp_out.unlink()
+                except OSError:
+                    pass
+        return layers
+
     def _build_visual_layers_filtergraph(
         self,
         cmd: List[str],
@@ -2516,7 +2673,7 @@ class RenderEngine:
                     last = out_lbl
                     input_index += 1
                     stage += 1
-                layers = dynamic_layers
+                layers = self._prepare_cached_animated_layers(dynamic_layers, width, height, fps)
             except Exception as ex:
                 self.log(f"⚠️ LayoutRenderer fallback ({ex}), tiếp tục xử lý qua FFmpeg.")
                 layers = raw_layers
@@ -2538,6 +2695,20 @@ class RenderEngine:
                 py = int(height * by)
                 pw = max(16, int(width * bw))
                 ph = max(16, int(height * bh))
+
+                if l_type == "compiled_overlay":
+                    compiled_path = Path(str(layer.get("file_path", "")))
+                    if not compiled_path.exists():
+                        continue
+                    cmd += ["-stream_loop", "-1", "-i", str(compiled_path)]
+                    in_lbl = f"[layer_in_{stage}]"
+                    out_lbl = f"[layer_v_{stage}]"
+                    filters.append(f"[{input_index}:v]fps={fps},format=rgba{in_lbl}")
+                    filters.append(f"{last}{in_lbl}overlay=0:0:format=auto{out_lbl}")
+                    last = out_lbl
+                    input_index += 1
+                    stage += 1
+                    continue
 
                 if l_type in {"image", "gif", "video_mask", "banner", "logo", "watermark", "chat_bubble", "reaction"}:
                     f_path_raw = str(layer.get("file_path", "")).strip()

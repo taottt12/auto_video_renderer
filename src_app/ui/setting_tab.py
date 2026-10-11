@@ -1947,6 +1947,7 @@ class SettingTab(QWidget):
         group = QGroupBox()
         form = QFormLayout(group)
         self.ratio_combo = QComboBox()
+        self.ratio_combo.addItem("16:9 (1280x720 - Nhanh, khuyên dùng RTX 2060 6GB)", (1280, 720, "16:9"))
         self.ratio_combo.addItem("16:9 (1920x1080 - YouTube chuẩn)", (1920, 1080, "16:9"))
         self.ratio_combo.addItem("9:16 (1080x1920 - Shorts/TikTok)", (1080, 1920, "9:16"))
         self.ratio_combo.addItem("1:1 (1080x1080 - Vuông)", (1080, 1080, "1:1"))
@@ -1990,7 +1991,7 @@ class SettingTab(QWidget):
 
         self.quality_combo.currentIndexChanged.connect(self._on_quality_changed)
         self.fps_spin.valueChanged.connect(self._update_estimated_size)
-        self.ratio_combo.currentIndexChanged.connect(self._update_estimated_size)
+        self.ratio_combo.currentIndexChanged.connect(self._on_export_resolution_changed)
         self.custom_bitrate_spin.valueChanged.connect(self._update_estimated_size)
 
         self._connect_change_widgets(
@@ -1999,6 +2000,12 @@ class SettingTab(QWidget):
         )
         self._on_quality_changed()
         return group
+
+    def _on_export_resolution_changed(self) -> None:
+        data = self.ratio_combo.currentData() if hasattr(self, "ratio_combo") else None
+        if data and tuple(data[:2]) == (1280, 720) and hasattr(self, "fps_spin"):
+            self.fps_spin.setValue(25)
+        self._update_estimated_size()
 
     def _on_quality_changed(self) -> None:
         if hasattr(self, "quality_combo") and hasattr(self, "custom_bitrate_label") and hasattr(self, "custom_bitrate_spin"):
@@ -2426,9 +2433,11 @@ class SettingTab(QWidget):
             self.sub_folder_edit.setText(str(sub_cfg.get("folder", "") or ""))
 
         export = settings.get("export", {})
-        self.fps_spin.setValue(int(export.get("fps", 30)))
         self.output_edit.setText(export.get("output_folder", "output"))
         self._set_ratio(export.get("width", 1920), export.get("height", 1080))
+        # Set FPS after resolution so loading an existing 720p/30 project keeps
+        # its explicit FPS; only a manual switch to the fast profile suggests 25.
+        self.fps_spin.setValue(int(export.get("fps", 30)))
         quality_val = str(export.get("quality", "standard") or "standard").lower()
         if quality_val in ["draft", "low"]:
             quality_val = "economy"
