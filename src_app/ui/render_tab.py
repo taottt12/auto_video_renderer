@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem,
     QTextEdit, QProgressBar, QMessageBox, QAbstractItemView, QGroupBox, QListWidget,
     QFileDialog, QCheckBox, QLabel, QSlider, QFrame, QSplitter, QHeaderView, QComboBox,
-    QDialog, QLineEdit, QRadioButton, QButtonGroup, QSpinBox
+    QDialog, QLineEdit, QRadioButton, QButtonGroup, QSpinBox, QFormLayout
 )
 
 from core.media_utils import (
@@ -29,6 +29,17 @@ from core.media_utils import (
 )
 from core.paths import find_binary
 from core.render_engine import RenderEngine, RenderResult
+
+COL_TITLE = 0
+COL_DURATION = 1
+COL_LAYOUT = 2
+COL_INTRO_OUTRO = 3
+COL_STATUS = 4
+COL_STAGE = 5
+COL_PROGRESS = 6
+COL_ELAPSED = 7
+COL_OUTPUT = 8
+NUM_COLS = 9
 
 
 def natural_sort_key(s: str) -> list:
@@ -333,12 +344,22 @@ class RenderWorker(QThread):
     row_finished_signal = Signal(int)
     finished_signal = Signal()
 
-    def __init__(self, settings: Dict[str, Any], rows: List[int], audio_files: List[str], titles: List[str] | None = None) -> None:
+    def __init__(
+        self,
+        settings: Dict[str, Any],
+        rows: List[int],
+        audio_files: List[str],
+        titles: List[str] | None = None,
+        row_intro_presets: List[Dict[str, Any]] | None = None,
+        row_layout_presets: List[Dict[str, Any]] | None = None,
+    ) -> None:
         super().__init__()
         self.settings = settings
         self.rows = rows
         self.audio_files = audio_files
         self.titles = titles or [""] * len(audio_files)
+        self.row_intro_presets = row_intro_presets or [{}] * len(audio_files)
+        self.row_layout_presets = row_layout_presets or [{}] * len(audio_files)
         self.cancel_event = threading.Event()
 
     def stop(self) -> None:
@@ -351,7 +372,15 @@ class RenderWorker(QThread):
         except Exception:
             return 1
 
-    def _render_one(self, row: int, audio: str, bgm_file: str = "", title: str = "") -> Tuple[int, RenderResult]:
+    def _render_one(
+        self,
+        row: int,
+        audio: str,
+        bgm_file: str = "",
+        title: str = "",
+        intro_cfg: Dict[str, Any] | None = None,
+        layout_cfg: Dict[str, Any] | None = None,
+    ) -> Tuple[int, RenderResult]:
         def log(msg: str, row=row) -> None:
             self.log_signal.emit(f"[Dòng {row + 1}] {msg}")
 
@@ -365,6 +394,26 @@ class RenderWorker(QThread):
         job_settings = copy.deepcopy(self.settings)
         if bgm_file:
             job_settings.setdefault("background_music", {})["selected_file"] = bgm_file
+
+        if layout_cfg is not None:
+            if "layout_studio" not in job_settings:
+                job_settings["layout_studio"] = {}
+            if "layers" in layout_cfg:
+                job_settings["layout_studio"]["layers"] = copy.deepcopy(layout_cfg.get("layers", []))
+            if "selected_preset" in layout_cfg:
+                job_settings["layout_studio"]["selected_preset"] = layout_cfg.get("selected_preset")
+
+        if intro_cfg is not None:
+            job_settings["intro_file"] = str(intro_cfg.get("intro_file", "")).strip()
+            job_settings["intro_mode"] = str(intro_cfg.get("intro_mode", "sequential")).strip()
+            job_settings["outro_file"] = str(intro_cfg.get("outro_file", "")).strip()
+
+        layout_name = layout_cfg.get("preset_name", "Mặc định") if layout_cfg else "Mặc định"
+        intro_p = Path(job_settings["intro_file"]).name if job_settings.get("intro_file") else "(Không)"
+        outro_p = Path(job_settings["outro_file"]).name if job_settings.get("outro_file") else "(Không)"
+        intro_mode_str = f" - {job_settings['intro_mode']}" if job_settings.get("intro_file") else ""
+        self.log_signal.emit(f"[Dòng {row + 1}] Cấu hình: Mẫu Layout [{layout_name}] | Intro [{intro_p}{intro_mode_str}] | Outro [{outro_p}]")
+
         engine = RenderEngine(job_settings, log=log, progress=progress, cancel_event=self.cancel_event)
         result = engine.render_audio(audio, custom_title=title)
         self.row_finished_signal.emit(row)
@@ -410,9 +459,12 @@ class RenderWorker(QThread):
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for idx, (row, audio, title) in enumerate(zip(self.rows, self.audio_files, self.titles)):
                 if self.cancel_event.is_set():
-                    self.row_update_signal.emit(row, "Đã dừng", "Dừng bởi người dùng", 0, "")
+                    self.row_update_signal.emit(row, "Đang dừng", "Dừng bởi người dùng", 0, "")
                     continue
-                futures.append(executor.submit(self._render_one, row, audio, bgm_assignments[idx] if idx < len(bgm_assignments) else "", title))
+                bgm_f = bgm_assignments[idx] if idx < len(bgm_assignments) else ""
+                intro_cfg = self.row_intro_presets[idx] if idx < len(self.row_intro_presets) else None
+                layout_cfg = self.row_layout_presets[idx] if idx < len(self.row_layout_presets) else None
+                futures.append(executor.submit(self._render_one, row, audio, bgm_f, title, intro_cfg, layout_cfg))
             for future in as_completed(futures):
                 try:
                     row, result = future.result()
@@ -471,11 +523,11 @@ class RenderTab(QWidget):
     @Slot(int, str)
     def _on_duration_loaded(self, row: int, dur_str: str) -> None:
         if 0 <= row < self.table.rowCount():
-            item = self.table.item(row, 1)
+            item = self.table.item(row, COL_DURATION)
             if item:
                 item.setText(dur_str)
             else:
-                self.table.setItem(row, 1, QTableWidgetItem(dur_str))
+                self.table.setItem(row, COL_DURATION, QTableWidgetItem(dur_str))
 
     def _ffmpeg_path(self) -> str:
         if not self._ffmpeg_bin:
@@ -759,22 +811,47 @@ class RenderTab(QWidget):
         title_toolbar.addWidget(self.btn_export_titles)
         title_toolbar.addWidget(self.btn_import_titles)
         title_toolbar.addWidget(self.btn_mix_titles)
+
+        self.btn_batch_layout = QPushButton("🎨 Gán Mẫu Layout nhanh")
+        self.btn_batch_layout.setStyleSheet("font-weight: bold; background-color: #00897b; color: white; padding: 4px 8px; border-radius: 3px;")
+        self.btn_batch_layout.setToolTip("Gán mẫu Bố Cục Layout nhanh cho các dòng được chọn hoặc toàn bộ bảng queue")
+        self.btn_batch_layout.clicked.connect(self._batch_apply_layout)
+        title_toolbar.addWidget(self.btn_batch_layout)
+
+        self.btn_batch_intro_outro = QPushButton("🎬 Gán Intro/Outro nhanh")
+        self.btn_batch_intro_outro.setStyleSheet("font-weight: bold; background-color: #5c6bc0; color: white; padding: 4px 8px; border-radius: 3px;")
+        self.btn_batch_intro_outro.setToolTip("Gán mẫu Intro/Outro nhanh cho các dòng được chọn hoặc toàn bộ bảng queue")
+        self.btn_batch_intro_outro.clicked.connect(self._batch_apply_intro_outro)
+        title_toolbar.addWidget(self.btn_batch_intro_outro)
+
         title_toolbar.addStretch(1)
         root.addLayout(title_toolbar)
 
-        # Bảng Queue
-        self.table = QTableWidget(0, 7)
+        # Bảng Queue (9 cột)
+        self.table = QTableWidget(0, NUM_COLS)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setHorizontalHeaderLabels(["Tiêu đề video (Nháy đúp để sửa)", "Thời lượng", "Trạng thái", "Giai đoạn", "Tiến trình", "Thời gian chạy", "Video xuất"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Fixed)
-        self.table.setColumnWidth(4, 90)
-        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.table.setHorizontalHeaderLabels([
+            "Tiêu đề video (Nháy đúp để sửa)",
+            "Thời lượng",
+            "Mẫu Layout",
+            "Intro / Outro",
+            "Trạng thái",
+            "Giai đoạn",
+            "Tiến trình",
+            "Thời gian chạy",
+            "Video xuất"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(COL_TITLE, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(COL_DURATION, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(COL_LAYOUT, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(COL_INTRO_OUTRO, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(COL_STATUS, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(COL_STAGE, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(COL_PROGRESS, QHeaderView.Fixed)
+        self.table.setColumnWidth(COL_PROGRESS, 90)
+        self.table.horizontalHeader().setSectionResizeMode(COL_ELAPSED, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(COL_OUTPUT, QHeaderView.ResizeToContents)
         root.addWidget(self.table, 2)
 
         # Khung Log Render
@@ -1037,7 +1114,7 @@ class RenderTab(QWidget):
     def _populate_table_from_list(self, audio_files: List[str]) -> None:
         if self.worker and self.worker.isRunning():
             return
-        current = [str(self.table.item(r, 0).data(Qt.UserRole) or self.table.item(r, 0).text()) for r in range(self.table.rowCount()) if self.table.item(r, 0)]
+        current = [str(self.table.item(r, COL_TITLE).data(Qt.UserRole) or self.table.item(r, COL_TITLE).text()) for r in range(self.table.rowCount()) if self.table.item(r, COL_TITLE)]
         if current == audio_files:
             return
         self.table.setRowCount(0)
@@ -1054,6 +1131,265 @@ class RenderTab(QWidget):
         if tasks:
             self.duration_loader.add_tasks(tasks)
 
+    def _create_layout_combo_for_row(self, row: int, selected_key: str = "") -> QComboBox:
+        combo = QComboBox()
+        self._populate_layout_combo(combo, selected_key)
+        combo.currentIndexChanged.connect(lambda _, c=combo: self._update_layout_combo_tooltip(c))
+        return combo
+
+    def _populate_layout_combo(self, combo: QComboBox, selected_key: str = "") -> None:
+        try:
+            from .layout_tab import get_all_layout_presets
+            presets = get_all_layout_presets()
+        except Exception:
+            presets = {}
+
+        prev_key = selected_key or (combo.currentData() if combo.count() > 0 else "") or ""
+        combo.blockSignals(True)
+        combo.clear()
+
+        # Tùy chọn "Theo cài đặt chung"
+        combo.addItem("⚙️ (Theo cài đặt chung)", "__default__")
+
+        for k, v in presets.items():
+            combo.addItem(f"🎨 {v.get('name', k)}", k)
+
+        # Khôi phục lựa chọn
+        found_idx = -1
+        if prev_key:
+            for i in range(combo.count()):
+                if combo.itemData(i) == prev_key:
+                    found_idx = i
+                    break
+        if found_idx >= 0:
+            combo.setCurrentIndex(found_idx)
+        else:
+            combo.setCurrentIndex(0)
+
+        combo.blockSignals(False)
+        self._update_layout_combo_tooltip(combo)
+
+    def _update_layout_combo_tooltip(self, combo: QComboBox) -> None:
+        key = combo.currentData()
+        if key == "__default__":
+            top_name = self.render_layout_combo.currentText() if hasattr(self, "render_layout_combo") else "Mặc định"
+            combo.setToolTip(f"Theo cài đặt chung tại thanh trên: [{top_name}]")
+            return
+
+        try:
+            from .layout_tab import get_all_layout_presets
+            presets = get_all_layout_presets()
+            p = presets.get(key, {})
+            name = p.get("name", key)
+            layers = p.get("layers", [])
+            layer_types = [l.get("type", "") for l in layers]
+            combo.setToolTip(f"Mẫu layout: {name}\nSố lớp: {len(layers)} ({', '.join(layer_types[:4])})")
+        except Exception:
+            combo.setToolTip(f"Mẫu layout: {key}")
+
+    def _reload_row_layout_combos(self) -> None:
+        if not hasattr(self, "table"):
+            return
+        for r in range(self.table.rowCount()):
+            widget = self.table.cellWidget(r, COL_LAYOUT)
+            if isinstance(widget, QComboBox):
+                cur_key = widget.currentData()
+                self._populate_layout_combo(widget, selected_key=cur_key)
+
+    def _batch_apply_layout(self) -> None:
+        if self.table.rowCount() == 0:
+            QMessageBox.information(self, "Danh sách trống", "Chưa có audio nào trong queue để gán.")
+            return
+
+        try:
+            from .layout_tab import get_all_layout_presets
+            presets = get_all_layout_presets()
+        except Exception:
+            presets = {}
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Gán nhanh Mẫu Bố Cục Layout")
+        dialog.setMinimumWidth(380)
+        vbox = QVBoxLayout(dialog)
+
+        form = QFormLayout()
+        layout_combo = QComboBox()
+        layout_combo.addItem("⚙️ (Theo cài đặt chung)", "__default__")
+        for k, v in presets.items():
+            layout_combo.addItem(f"🎨 {v.get('name', k)}", k)
+        form.addRow("Chọn mẫu Layout cần gán:", layout_combo)
+
+        selected_rows = self.selected_rows()
+        scope_all = QRadioButton("Áp dụng cho TOÀN BỘ video trong queue")
+        scope_selected = QRadioButton(f"Chỉ áp dụng cho {len(selected_rows)} dòng đang chọn")
+
+        if selected_rows:
+            scope_selected.setChecked(True)
+        else:
+            scope_all.setChecked(True)
+            scope_selected.setEnabled(False)
+
+        form.addRow("Phạm vi:", scope_all)
+        form.addRow("", scope_selected)
+        vbox.addLayout(form)
+
+        btn_box = QHBoxLayout()
+        btn_ok = QPushButton("Áp dụng")
+        btn_ok.setStyleSheet("font-weight: bold; background-color: #00897b; color: white; padding: 4px 12px;")
+        btn_cancel = QPushButton("Hủy")
+        btn_box.addStretch(1)
+        btn_box.addWidget(btn_ok)
+        btn_box.addWidget(btn_cancel)
+        vbox.addLayout(btn_box)
+
+        btn_ok.clicked.connect(dialog.accept)
+        btn_cancel.clicked.connect(dialog.reject)
+
+        if dialog.exec() == QDialog.Accepted:
+            chosen_key = layout_combo.currentData()
+            target_rows = selected_rows if scope_selected.isChecked() else list(range(self.table.rowCount()))
+            for r in target_rows:
+                widget = self.table.cellWidget(r, COL_LAYOUT)
+                if isinstance(widget, QComboBox):
+                    for i in range(widget.count()):
+                        if widget.itemData(i) == chosen_key:
+                            widget.setCurrentIndex(i)
+                            break
+            QMessageBox.information(self, "Thành công", f"Đã áp dụng mẫu Layout cho {len(target_rows)} dòng video.")
+
+    def _create_intro_outro_combo_for_row(self, row: int, selected_id: str = "") -> QComboBox:
+        combo = QComboBox()
+        self._populate_intro_outro_combo(combo, selected_id)
+        combo.currentIndexChanged.connect(lambda _, c=combo: self._update_intro_outro_combo_tooltip(c))
+        return combo
+
+    def _populate_intro_outro_combo(self, combo: QComboBox, selected_id: str = "") -> None:
+        from core.settings import normalize_intro_outro_presets
+        presets = normalize_intro_outro_presets(self.settings)
+
+        prev_id = selected_id or (combo.currentData() if combo.count() > 0 else "") or ""
+        combo.blockSignals(True)
+        combo.clear()
+
+        # Thêm tùy chọn "Mặc định (Chung)"
+        def_preset = next((p for p in presets if p.get("is_default")), presets[0] if presets else {})
+        def_name = def_preset.get("name", "Mặc định")
+        combo.addItem(f"⭐ {def_name} (Mặc định)", "__default__")
+        combo.setItemData(0, def_preset, Qt.UserRole + 1)
+
+        # Thêm từng preset
+        for p in presets:
+            p_id = p.get("id", "")
+            p_name = p.get("name", "Mẫu")
+            combo.addItem(f"🎬 {p_name}", p_id)
+            combo.setItemData(combo.count() - 1, p, Qt.UserRole + 1)
+
+        # Thêm tùy chọn "Không dùng Intro/Outro"
+        combo.addItem("🚫 Không dùng Intro/Outro", "__none__")
+        none_preset = {"id": "__none__", "name": "Không dùng", "intro_file": "", "outro_file": "", "intro_mode": "sequential"}
+        combo.setItemData(combo.count() - 1, none_preset, Qt.UserRole + 1)
+
+        # Khôi phục lựa chọn
+        found_idx = -1
+        if prev_id:
+            for i in range(combo.count()):
+                if combo.itemData(i) == prev_id:
+                    found_idx = i
+                    break
+        if found_idx >= 0:
+            combo.setCurrentIndex(found_idx)
+        else:
+            combo.setCurrentIndex(0)
+
+        combo.blockSignals(False)
+        self._update_intro_outro_combo_tooltip(combo)
+
+    def _update_intro_outro_combo_tooltip(self, combo: QComboBox) -> None:
+        p_id = combo.currentData()
+        if p_id == "__none__":
+            combo.setToolTip("Video này sẽ KHÔNG chèn Intro và KHÔNG chèn Outro.")
+            return
+
+        p = combo.currentData(Qt.UserRole + 1) or {}
+        intro_f = Path(p.get("intro_file", "")).name if p.get("intro_file") else "(Không có)"
+        mode_str = "Đè lên MP3" if p.get("intro_mode") == "overlay" else "Nối tiếp trước MP3"
+        outro_f = Path(p.get("outro_file", "")).name if p.get("outro_file") else "(Không có)"
+        tooltip = (
+            f"Mẫu: {p.get('name', 'Mặc định')}\n"
+            f"• Intro: {intro_f} ({mode_str})\n"
+            f"• Outro: {outro_f}"
+        )
+        combo.setToolTip(tooltip)
+
+    def _reload_intro_outro_combos(self) -> None:
+        if not hasattr(self, "table"):
+            return
+        for r in range(self.table.rowCount()):
+            widget = self.table.cellWidget(r, COL_INTRO_OUTRO)
+            if isinstance(widget, QComboBox):
+                cur_id = widget.currentData()
+                self._populate_intro_outro_combo(widget, selected_id=cur_id)
+
+    def _batch_apply_intro_outro(self) -> None:
+        if self.table.rowCount() == 0:
+            QMessageBox.information(self, "Danh sách trống", "Chưa có audio nào trong queue để gán.")
+            return
+
+        from core.settings import normalize_intro_outro_presets
+        presets = normalize_intro_outro_presets(self.settings)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Gán nhanh Mẫu Intro / Outro")
+        dialog.setMinimumWidth(380)
+        vbox = QVBoxLayout(dialog)
+
+        form = QFormLayout()
+        preset_combo = QComboBox()
+        def_p = next((p for p in presets if p.get("is_default")), presets[0] if presets else {})
+        preset_combo.addItem(f"⭐ {def_p.get('name', 'Mặc định')} (Mặc định)", "__default__")
+        for p in presets:
+            preset_combo.addItem(f"🎬 {p.get('name', 'Mẫu')}", p.get("id"))
+        preset_combo.addItem("🚫 Không dùng Intro/Outro", "__none__")
+        form.addRow("Chọn mẫu cần gán:", preset_combo)
+
+        selected_rows = self.selected_rows()
+        scope_all = QRadioButton("Áp dụng cho TOÀN BỘ video trong queue")
+        scope_selected = QRadioButton(f"Chỉ áp dụng cho {len(selected_rows)} dòng đang chọn")
+
+        if selected_rows:
+            scope_selected.setChecked(True)
+        else:
+            scope_all.setChecked(True)
+            scope_selected.setEnabled(False)
+
+        form.addRow("Phạm vi:", scope_all)
+        form.addRow("", scope_selected)
+        vbox.addLayout(form)
+
+        btn_box = QHBoxLayout()
+        btn_ok = QPushButton("Áp dụng")
+        btn_ok.setStyleSheet("font-weight: bold; background-color: #2e7d32; color: white; padding: 4px 12px;")
+        btn_cancel = QPushButton("Hủy")
+        btn_box.addStretch(1)
+        btn_box.addWidget(btn_ok)
+        btn_box.addWidget(btn_cancel)
+        vbox.addLayout(btn_box)
+
+        btn_ok.clicked.connect(dialog.accept)
+        btn_cancel.clicked.connect(dialog.reject)
+
+        if dialog.exec() == QDialog.Accepted:
+            chosen_id = preset_combo.currentData()
+            target_rows = selected_rows if scope_selected.isChecked() else list(range(self.table.rowCount()))
+            for r in target_rows:
+                widget = self.table.cellWidget(r, COL_INTRO_OUTRO)
+                if isinstance(widget, QComboBox):
+                    for i in range(widget.count()):
+                        if widget.itemData(i) == chosen_id:
+                            widget.setCurrentIndex(i)
+                            break
+            QMessageBox.information(self, "Thành công", f"Đã áp dụng mẫu cho {len(target_rows)} dòng video.")
+
     def add_audio_row_fast(self, row: int, audio: str) -> None:
         self.table.insertRow(row)
         title_text = Path(audio).stem
@@ -1061,18 +1397,25 @@ class RenderTab(QWidget):
         name_item.setData(Qt.UserRole, audio)
         name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
         name_item.setToolTip(f"Tiêu đề: {title_text}\nAudio gốc: {Path(audio).name}\nĐường dẫn: {audio}\n(Nháy đúp chuột để chỉnh sửa tiêu đề)")
-        self.table.setItem(row, 0, name_item)
-        self.table.setItem(row, 1, QTableWidgetItem("Đang đọc..."))
-        self.table.setItem(row, 2, QTableWidgetItem("Chưa chạy"))
-        self.table.setItem(row, 3, QTableWidgetItem("Chờ"))
+        self.table.setItem(row, COL_TITLE, name_item)
+        self.table.setItem(row, COL_DURATION, QTableWidgetItem("Đang đọc..."))
+
+        combo_layout = self._create_layout_combo_for_row(row)
+        self.table.setCellWidget(row, COL_LAYOUT, combo_layout)
+
+        combo_intro = self._create_intro_outro_combo_for_row(row)
+        self.table.setCellWidget(row, COL_INTRO_OUTRO, combo_intro)
+
+        self.table.setItem(row, COL_STATUS, QTableWidgetItem("Chưa chạy"))
+        self.table.setItem(row, COL_STAGE, QTableWidgetItem("Chờ"))
         progress = QProgressBar()
         progress.setRange(0, 100)
         progress.setValue(0)
-        self.table.setCellWidget(row, 4, progress)
-        self.table.setItem(row, 5, QTableWidgetItem("00:00"))
+        self.table.setCellWidget(row, COL_PROGRESS, progress)
+        self.table.setItem(row, COL_ELAPSED, QTableWidgetItem("00:00"))
         ph_item = QTableWidgetItem("-")
         ph_item.setTextAlignment(Qt.AlignCenter)
-        self.table.setItem(row, 6, ph_item)
+        self.table.setItem(row, COL_OUTPUT, ph_item)
 
     # ------------------ Quản lý & Xuất / Nhập Tiêu đề Video ------------------
 
@@ -1097,7 +1440,7 @@ class RenderTab(QWidget):
         p = Path(file_path)
         rows_data = []
         for r in range(self.table.rowCount()):
-            item = self.table.item(r, 0)
+            item = self.table.item(r, COL_TITLE)
             if item:
                 audio_path = str(item.data(Qt.UserRole) or item.text())
                 orig_name = Path(audio_path).name
@@ -1277,7 +1620,7 @@ class RenderTab(QWidget):
             # Áp dụng cập nhật vào bảng Queue
             updated_count = 0
             for r in range(self.table.rowCount()):
-                item = self.table.item(r, 0)
+                item = self.table.item(r, COL_TITLE)
                 if not item:
                     continue
                 audio_path = str(item.data(Qt.UserRole) or item.text())
@@ -1315,7 +1658,7 @@ class RenderTab(QWidget):
 
         current_items = []
         for r in range(self.table.rowCount()):
-            item = self.table.item(r, 0)
+            item = self.table.item(r, COL_TITLE)
             if item:
                 audio_path = str(item.data(Qt.UserRole) or item.text())
                 curr_title = item.text().strip()
@@ -1326,7 +1669,7 @@ class RenderTab(QWidget):
             new_titles = dlg.get_titles()
             for r, new_t in enumerate(new_titles):
                 if r < self.table.rowCount():
-                    item = self.table.item(r, 0)
+                    item = self.table.item(r, COL_TITLE)
                     if item:
                         item.setText(new_t)
                         audio_path = str(item.data(Qt.UserRole) or item.text())
@@ -1336,14 +1679,22 @@ class RenderTab(QWidget):
     @Slot(int, str)
     def _on_duration_loaded(self, row: int, dur_str: str) -> None:
         if row < self.table.rowCount():
-            self.table.setItem(row, 1, QTableWidgetItem(dur_str))
+            item = self.table.item(row, COL_DURATION)
+            if item:
+                item.setText(dur_str)
+            else:
+                self.table.setItem(row, COL_DURATION, QTableWidgetItem(dur_str))
 
     # ------------------ Render Queue & Operations ------------------
 
     @Slot(dict)
     def update_settings(self, settings: Dict[str, Any]) -> None:
-        self.settings.update(settings)
+        self.settings = settings
         self._update_project_labels()
+        if hasattr(self, "render_layout_combo"):
+            self._reload_render_layout_presets()
+        self._reload_row_layout_combos()
+        self._reload_intro_outro_combos()
 
     def _change_output_folder(self) -> None:
         current = self.settings.get("project", {}).get("output_folder", "") or self.settings.get("export", {}).get("output_folder", "")
@@ -1569,8 +1920,15 @@ class RenderTab(QWidget):
         else:
             self.render_layout_combo.setCurrentIndex(0)
         self.render_layout_combo.blockSignals(False)
+        self._reload_row_layout_combos()
 
     def _on_render_layout_changed(self, idx: int) -> None:
+        if hasattr(self, "table"):
+            for r in range(self.table.rowCount()):
+                widget = self.table.cellWidget(r, COL_LAYOUT)
+                if isinstance(widget, QComboBox) and widget.currentData() == "__default__":
+                    self._update_layout_combo_tooltip(widget)
+
         key = self.render_layout_combo.currentData()
         if not key or key == "__current__":
             return
@@ -1587,11 +1945,6 @@ class RenderTab(QWidget):
         except Exception:
             pass
 
-    def update_settings(self, settings: Dict[str, Any]) -> None:
-        self.settings = settings
-        if hasattr(self, "render_layout_combo"):
-            self._reload_render_layout_presets()
-
     def start_render(self) -> None:
         if self.worker and self.worker.isRunning():
             QMessageBox.information(self, "Đang render", "Tool đang render, hãy dừng hoặc đợi hoàn thành.")
@@ -1600,18 +1953,19 @@ class RenderTab(QWidget):
         self._stop_playback()
 
         # Áp dụng mẫu layout được chọn nếu có
+        top_layout_key = "__current__"
         if hasattr(self, "render_layout_combo"):
-            chosen_preset_key = self.render_layout_combo.currentData()
-            if chosen_preset_key and chosen_preset_key != "__current__":
+            top_layout_key = self.render_layout_combo.currentData() or "__current__"
+            if top_layout_key and top_layout_key != "__current__":
                 try:
                     from .layout_tab import get_all_layout_presets
                     presets = get_all_layout_presets()
-                    if chosen_preset_key in presets:
-                        preset = presets[chosen_preset_key]
+                    if top_layout_key in presets:
+                        preset = presets[top_layout_key]
                         if "layout_studio" not in self.settings:
                             self.settings["layout_studio"] = {}
                         self.settings["layout_studio"]["layers"] = copy.deepcopy(preset.get("layers", []))
-                        self.settings["layout_studio"]["selected_preset"] = chosen_preset_key
+                        self.settings["layout_studio"]["selected_preset"] = top_layout_key
                 except Exception:
                     pass
 
@@ -1623,13 +1977,56 @@ class RenderTab(QWidget):
         rows = self.selected_rows() or list(range(self.table.rowCount()))
         audio_files = []
         custom_titles = []
+        row_intro_presets: List[Dict[str, Any]] = []
+        row_layout_presets: List[Dict[str, Any]] = []
+
+        try:
+            from .layout_tab import get_all_layout_presets
+            all_layout_presets = get_all_layout_presets()
+        except Exception:
+            all_layout_presets = {}
+
+        from core.settings import normalize_intro_outro_presets
+        all_presets = normalize_intro_outro_presets(self.settings)
+        presets_by_id = {p.get("id"): p for p in all_presets}
+        default_preset = next((p for p in all_presets if p.get("is_default")), all_presets[0] if all_presets else {})
+
         for row in rows:
-            item = self.table.item(row, 0)
+            item = self.table.item(row, COL_TITLE)
             if item:
                 audio_path = str(item.data(Qt.UserRole) or item.text())
                 custom_title = item.text().strip()
                 audio_files.append(audio_path)
                 custom_titles.append(custom_title)
+
+                # Layout preset per row
+                combo_l = self.table.cellWidget(row, COL_LAYOUT)
+                chosen_l_key = combo_l.currentData() if isinstance(combo_l, QComboBox) else "__default__"
+                target_l_key = top_layout_key if chosen_l_key == "__default__" else chosen_l_key
+
+                if target_l_key and target_l_key != "__current__" and target_l_key in all_layout_presets:
+                    l_preset = all_layout_presets[target_l_key]
+                    layout_cfg = {
+                        "layers": copy.deepcopy(l_preset.get("layers", [])),
+                        "selected_preset": target_l_key,
+                        "preset_name": l_preset.get("name", target_l_key),
+                    }
+                else:
+                    layout_cfg = copy.deepcopy(self.settings.get("layout_studio", {}) or {})
+                    top_name = self.render_layout_combo.currentText() if hasattr(self, "render_layout_combo") else "Studio"
+                    layout_cfg["preset_name"] = top_name if top_layout_key != "__current__" else "Đang mở trên Studio"
+                row_layout_presets.append(layout_cfg)
+
+                # Intro / Outro preset per row
+                combo = self.table.cellWidget(row, COL_INTRO_OUTRO)
+                chosen_id = combo.currentData() if isinstance(combo, QComboBox) else "__default__"
+                if chosen_id == "__none__":
+                    preset_cfg = {"intro_file": "", "outro_file": "", "intro_mode": "sequential"}
+                elif chosen_id == "__default__":
+                    preset_cfg = dict(default_preset)
+                else:
+                    preset_cfg = dict(presets_by_id.get(chosen_id, default_preset))
+                row_intro_presets.append(preset_cfg)
 
         if not audio_files:
             QMessageBox.warning(self, "Thiếu audio", "Chưa có audio nào để render. Hãy thêm audio từ máy hoặc cào từ tab Cào MP3.")
@@ -1638,12 +2035,19 @@ class RenderTab(QWidget):
         for row in rows:
             self.update_row(row, "Chờ chạy", "Đợi trong queue", 0, "")
             self.row_elapsed_final.pop(row, None)
-            self.table.setItem(row, 5, QTableWidgetItem("00:00"))
+            self.table.setItem(row, COL_ELAPSED, QTableWidgetItem("00:00"))
             ph_item = QTableWidgetItem("-")
             ph_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 6, ph_item)
+            self.table.setItem(row, COL_OUTPUT, ph_item)
 
-        self.worker = RenderWorker(self.settings, rows, audio_files, custom_titles)
+        self.worker = RenderWorker(
+            self.settings,
+            rows,
+            audio_files,
+            custom_titles,
+            row_intro_presets=row_intro_presets,
+            row_layout_presets=row_layout_presets,
+        )
         self.worker.log_signal.connect(self.append_log)
         self.worker.row_update_signal.connect(self.update_row)
         self.worker.row_started_signal.connect(self.mark_row_started)
@@ -1719,7 +2123,7 @@ class RenderTab(QWidget):
                 elapsed = self.row_elapsed_final[row]
             else:
                 elapsed = 0
-            self.table.setItem(row, 5, QTableWidgetItem(seconds_to_hhmmss(elapsed)))
+            self.table.setItem(row, COL_ELAPSED, QTableWidgetItem(seconds_to_hhmmss(elapsed)))
 
     @Slot(str)
     def append_log(self, message: str) -> None:
@@ -1730,9 +2134,9 @@ class RenderTab(QWidget):
     def update_row(self, row: int, status: str, stage: str, percent: int, output: str = "") -> None:
         if row >= self.table.rowCount():
             return
-        self.table.setItem(row, 2, QTableWidgetItem(status))
-        self.table.setItem(row, 3, QTableWidgetItem(stage))
-        bar = self.table.cellWidget(row, 4)
+        self.table.setItem(row, COL_STATUS, QTableWidgetItem(status))
+        self.table.setItem(row, COL_STAGE, QTableWidgetItem(stage))
+        bar = self.table.cellWidget(row, COL_PROGRESS)
         if isinstance(bar, QProgressBar):
             bar.setValue(percent)
         if output:
@@ -1756,7 +2160,7 @@ class RenderTab(QWidget):
 
             layout.addWidget(btn_play)
             layout.addWidget(btn_folder)
-            self.table.setCellWidget(row, 6, cell_widget)
+            self.table.setCellWidget(row, COL_OUTPUT, cell_widget)
 
     def _open_video_file(self, path_str: str) -> None:
         p = Path(path_str)

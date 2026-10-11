@@ -38,6 +38,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "intro_file": "",
     "intro_mode": "sequential",  # "sequential" (nối tiếp trước MP3) hoặc "overlay" (đè lên đầu MP3)
     "outro_file": "",
+    "intro_outro_presets": [],
     "filter_bgm_after_30s": False,  # Giảm/lọc nhạc nền sau 30s đầu (giữ voice & SFX)
     "logo_file": "",
     "logo_enabled": False,
@@ -163,6 +164,43 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 }
 
 
+def normalize_intro_outro_presets(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Đảm bảo settings luôn có danh sách intro_outro_presets hợp lệ.
+    Nếu chưa có hoặc rỗng, tự động tạo preset 'Mặc định' từ intro_file, intro_mode, outro_file hiện tại.
+    Đồng thời đồng bộ root intro_file/intro_mode/outro_file với preset mặc định.
+    """
+    presets = settings.get("intro_outro_presets")
+    if not isinstance(presets, list) or len(presets) == 0:
+        presets = [
+            {
+                "id": "default",
+                "name": "Mặc định (Chung)",
+                "intro_file": str(settings.get("intro_file") or "").strip(),
+                "intro_mode": str(settings.get("intro_mode") or "sequential").strip(),
+                "outro_file": str(settings.get("outro_file") or "").strip(),
+                "is_default": True,
+            }
+        ]
+        settings["intro_outro_presets"] = presets
+    else:
+        # Nếu có duy nhất 1 preset mặc định nhưng các đường dẫn trống, trong khi root settings có file (migration)
+        if len(presets) == 1 and not presets[0].get("intro_file") and not presets[0].get("outro_file"):
+            if settings.get("intro_file") or settings.get("outro_file"):
+                presets[0]["intro_file"] = str(settings.get("intro_file") or "").strip()
+                presets[0]["intro_mode"] = str(settings.get("intro_mode") or "sequential").strip()
+                presets[0]["outro_file"] = str(settings.get("outro_file") or "").strip()
+
+        has_default = any(bool(p.get("is_default")) for p in presets)
+        if not has_default and len(presets) > 0:
+            presets[0]["is_default"] = True
+
+    default_p = next((p for p in presets if p.get("is_default")), presets[0])
+    settings["intro_file"] = default_p.get("intro_file", "")
+    settings["intro_mode"] = default_p.get("intro_mode", "sequential")
+    settings["outro_file"] = default_p.get("outro_file", "")
+    return presets
+
+
 def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     result = deepcopy(base)
     for key, value in override.items():
@@ -181,15 +219,22 @@ class SettingsManager:
     def load(self) -> Dict[str, Any]:
         if not self.path.exists():
             self.save(DEFAULT_SETTINGS)
-            return deepcopy(DEFAULT_SETTINGS)
+            res = deepcopy(DEFAULT_SETTINGS)
+            normalize_intro_outro_presets(res)
+            return res
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            return deep_merge(DEFAULT_SETTINGS, data)
+            res = deep_merge(DEFAULT_SETTINGS, data)
+            normalize_intro_outro_presets(res)
+            return res
         except Exception:
-            return deepcopy(DEFAULT_SETTINGS)
+            res = deepcopy(DEFAULT_SETTINGS)
+            normalize_intro_outro_presets(res)
+            return res
 
     def save(self, settings: Dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        normalize_intro_outro_presets(settings)
         merged = deep_merge(DEFAULT_SETTINGS, settings)
         self.path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -197,13 +242,16 @@ class SettingsManager:
     def save_project(path: str | Path, settings: Dict[str, Any]) -> None:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
+        normalize_intro_outro_presets(settings)
         p.write_text(json.dumps(deep_merge(DEFAULT_SETTINGS, settings), ensure_ascii=False, indent=2), encoding="utf-8")
 
     @staticmethod
     def load_project(path: str | Path) -> Dict[str, Any]:
         p = Path(path)
         data = json.loads(p.read_text(encoding="utf-8"))
-        return deep_merge(DEFAULT_SETTINGS, data)
+        res = deep_merge(DEFAULT_SETTINGS, data)
+        normalize_intro_outro_presets(res)
+        return res
 
     @staticmethod
     def list_projects() -> list[Path]:

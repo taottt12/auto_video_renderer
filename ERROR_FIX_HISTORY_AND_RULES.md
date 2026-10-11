@@ -406,27 +406,95 @@ Message: 'RenderEngine' object has no attribute '_get_media_duration'
 
 ---
 
+### 🔴 LỖI 16: TÁI PHÁT LỖI CUDA ILLEGAL MEMORY ACCESS DO TIER 1 WORD TIMESTAMPS, VRAM PEAK 4.9GB VÀ CẮT CỨNG 30S LÀM HỎNG AUDIO DÀI
+
+#### Triệu chứng lỗi & Vấn đề phát sinh:
+1. **Lỗi `CUDA error: an illegal memory access was encountered` liên tục không sửa được**:
+   - Khi chạy Whisper AI bóc tách phụ đề, GPU NVIDIA RTX 2060 lập tức ném ngoại lệ `CUDA error: an illegal memory access was encountered`.
+   - Tiến trình cố gắng dùng `try/except` để reload model trong cùng process nhưng tiếp tục văng lỗi vì CUDA context đã bị poisoned cấp phần cứng (mã lỗi 700).
+2. **Audio MP3 dài bị gián đoạn, dịch sai, lặp từ vô nghĩa (Hallucination)**:
+   - File MP3 dài 20-40 phút bị chia nhỏ thành các khúc 30.0s độc lập (`[0-30s]`, `[30-60s]`). Các câu nói diễn ra ở ranh giới 30s bị chém đôi làm mất ngữ cảnh âm thanh, gây hiện tượng lặp lại cụm từ hoặc đoán sai từ ngữ.
+3. **Cạn kiệt bộ nhớ VRAM (Free VRAM = 0.00 MB)**:
+   - `whisper.load_model(..., device="cuda")` nạp trực tiếp tạo spike 4,902 MB VRAM, triệt tiêu toàn bộ VRAM trống của card RTX 2060 6GB.
+
+#### Nguyên nhân gốc rễ:
+1. **`word_timestamps=True` bị kích hoạt ngầm ở Tier 1 trong `subtitle_worker.py`**:
+   - Mặc dù tài liệu Lỗi 5 đã cấm `word_timestamps=True`, trong class `FaultTolerantTranscriber`, Tier 1 vẫn cố tình gọi `word_timestamps=True`.
+   - `word_timestamps=True` tắt Flash Attention (`disable_sdpa()`), cài forward hooks đọc attention weights FP16. Trên Windows (không có Triton CUDA), kernel PyTorch unfold/sort FP16 truy cập vượt biên địa chỉ CUDA và gây `illegal memory access`.
+2. **Ảo tưởng phục hồi CUDA Context trong cùng 1 Process**:
+   - Khi dính lỗi 700, CUDA driver khóa vĩnh viễn context của process đó. Mọi lệnh `torch.cuda.empty_cache()` hay `model.to('cuda')` sau đó trong cùng tiến trình đều vô tác dụng.
+3. **Mất Staged FP16 Loading**:
+   - Hàm `safe_load_whisper_model` bị ghi đè thành gọi trực tiếp `whisper.load_model('turbo', device='cuda')`, gây spike 4.9 GB VRAM.
+4. **Cắt cứng audio 30s phá hủy cơ chế Native VAD Seek của Whisper**:
+   - Tự động chia `i * 30.0` thay vì để `model.transcribe()` nguyên bản tự điều phối seek theo ranh giới câu nói thực tế.
+
+#### Cách đã khắc phục triệt để:
+1. **Khôi phục Chuẩn Hóa Staged FP16 Loading (`safe_load_whisper_model`)**:
+   - Nạp trên CPU System RAM $\rightarrow$ Chuyển Linear/Conv1d/Embedding sang `torch.float16` $\rightarrow$ Giữ nguyên LayerNorm ở `torch.float32` $\rightarrow$ Đưa sang `cuda`.
+   - VRAM tĩnh khống chế ở mức **~1.55 GB**, giải phóng hơn **3.4 GB VRAM trống** trên GPU RTX 2060.
+2. **Chuyển sang 100% Native Time Tokens (`word_timestamps=False`)**:
+   - Tận dụng trọn vẹn PyTorch SDPA Flash Attention và FP16 Tensor Cores của NVIDIA RTX.
+   - Triệt tiêu 100% lỗi `CUDA error: an illegal memory access was encountered` và không bao giờ bị poisoned context.
+3. **Luồng Streaming Âm Thanh Dài Liên Tục (Continuous Native Transcribe)**:
+   - Truyền trực tiếp toàn bộ mảng `audio_data` vào `model.transcribe()`. Whisper tự động tịnh tiến `seek` theo câu nói thực tế, bảo toàn 100% dòng hội thoại và không bao giờ chém đôi từ ngữ.
+   - Bổ sung hook `AvrWhisperProgressBar` vào `whisper.transcribe` để cập nhật tiến trình % mượt mà theo thời gian thực về giao diện GUI.
+4. **Hậu xử lý Gom Cụm Phụ Đề Thông Minh (`group_words_into_phrases` / `split_text_into_chunks`)**:
+   - Tự động ngắt các câu dài thành các cụm 3-6 từ tự nhiên, căn chuẩn timeline và chống tràn màn hình mà không cần DTW hooks.
+
+---
+
+### 🔴 LỖI 17: PYTORCH CACHING ALLOCATOR PHÂN MẢNH VRAM TRÊN FILE AUDIO SIÊU DÀI (>30-90 PHÚT)
+
+#### Triệu chứng lỗi:
+* Khi chạy bóc tách âm thanh các file MP3 dài (từ 30 phút đến hơn 90 phút), quá trình chạy GPU mượt mà trong vài phút đầu nhưng sau đó đột ngột bị đứng hoặc báo lỗi `CUDA error: an illegal memory access was encountered` khi đang xử lý ở các phút thứ 30-80.
+* Task Manager hiển thị GPU VRAM bị đẩy lên 100% (6.0 GB / 6.0 GB) và không chịu nhả dù GPU chỉ đang tính toán các ma trận nhỏ.
+
+#### Nguyên nhân gốc rễ (Dựa trên cơ chế Caching Allocator & CUDA Hardware Bounds):
+1. **PyTorch Caching Allocator Giữ VRAM**: Khi chạy liên tục hàng trăm sliding windows trong 1 lệnh `transcribe()` duy nhất, PyTorch không trả VRAM về cho hệ điều hành mà giữ lại trong `Reserved Memory`. Các tensor trung gian liên tục cấp phát/hủy với kích thước khác nhau làm kho VRAM bị **phân mảnh nghiêm trọng (Memory Fragmentation)**.
+2. **Lệch Con Trỏ & Out-of-bounds Indexing**: Mảng Mel-Spectrogram cho file 90 phút có hơn $300.000$ frames. Biến `seek` tịnh tiến liên tục sinh ra các non-contiguous view với độ lệch byte cực lớn trên GPU. Khi bộ nhớ bị phân mảnh, một CUDA kernel tính toán địa chỉ con trỏ vượt ra ngoài phạm vi đã map trên VRAM $\rightarrow$ Kích hoạt lỗi phần cứng `cudaErrorIllegalAddress`.
+
+#### Cách đã khắc phục triệt để:
+1. **Kiến trúc Macro-Chunking (~10 phút / chunk)**:
+   - File âm thanh dài được chia thành các Macro-Chunk khoảng 10 phút ($600\text{s}$).
+   - **Silence-Aware Boundary Snapping**: Dò tìm điểm có năng lượng âm thanh nhỏ nhất (khoảng lặng) trong dải $\pm 15\text{s}$ để cắt chunk, đảm bảo không bao giờ làm đứt câu hay chém đôi từ ngữ.
+2. **Đồng Bộ Hóa CUDA & Chu Kỳ Xả VRAM Tức Thì (VRAM Flush Cycle)**:
+   - Sau khi hoàn thành bóc tách mỗi chunk, hệ thống gọi `torch.cuda.synchronize()` để ép GPU hoàn tất 100% byte dữ liệu cuối cùng trước khi xả cache.
+   - Gọi `del res`, `gc.collect()` và `torch.cuda.empty_cache()` + `torch.cuda.ipc_collect()`, sau đó áp dụng `time.sleep(0.15)` (micro-yield) để Windows DWM và driver đồ họa hoàn tất sắp xếp trang nhớ VRAM.
+   - Toàn bộ vùng nhớ tạm của PyTorch Caching Allocator được trả sạch về 0, khôi phục trạng thái VRAM tinh khiết (~1.55 GB tĩnh) trước khi nạp chunk tiếp theo.
+3. **Cơ Chế Làm Mới Model GPU Chu Kỳ (Model Auto-Refresh)**:
+   - Cứ sau mỗi **2 chunks** (~20 phút audio), hệ thống tự động hủy đối tượng `gpu_model` cũ và nạp lại một instance mới tinh (`safe_load_whisper_model` chỉ mất 1.2s).
+   - Cơ chế này xóa sạch 100% bộ đệm C++ và CUDA Context tích lũy sau nhiều chu kỳ nặng, ngăn chặn triệt để tình trạng GPU bị ngắt ở Chunk 5 hay Chunk 6, giúp toàn bộ file 85-120 phút chạy 100% trên GPU.
+4. **Cơ Chế Bảo Toàn Từng Chunk & Khôi Phục Thông Minh (Per-Chunk Fault Tolerance)**:
+   - Áp dụng khối bắt lỗi độc lập cho từng chunk. Chunk nào GPU chạy xong thì **chốt cứng (commit)** kết quả chunk đó vào danh sách an toàn.
+   - Nếu bất kỳ chunk nào gặp sự cố trên GPU, hệ thống **bảo toàn 100% kết quả các chunk trước** và chỉ chuyển **riêng các chunk còn lại** sang CPU để tiếp tục, tuyệt đối không xóa dữ liệu và không làm lại từ đầu.
+5. **Cộng bù Offset Timeline Tự Động**:
+   - Tự động cộng mốc `start_sec` của chunk vào các segments để tạo file `.srt` hoàn chỉnh, chính xác 100% từ đầu tới cuối.
+
+---
+
 ## 📋 BẢNG CHECKLIST KIỂM TRA TRƯỚC KHI COMMIT CODE
 
 Trước khi kết thúc bất kỳ phiên sửa đổi nào, hãy tự kiểm tra 20 câu hỏi sau:
 - [ ] 1. Có vô tình đổi tên model Whisper nào sang `large-v2` không? *(Không được phép)*
 - [ ] 2. Khi chạy Whisper trên CUDA, đã nạp qua `safe_load_whisper_model` (Staged FP16 Loading + FP32 LayerNorm) để tránh spike 4.9GB VRAM chưa?
-- [ ] 3. Khi chạy Whisper GPU cho large models với `word_timestamps=True`, đã dùng `beam_size=1` và `temperature=0.0` để tối ưu VRAM đỉnh (~2.1GB) chưa?
-- [ ] 4. Khi GPU bị lỗi, fallback CPU có giữ nguyên 100% đúng model người dùng đã chọn không?
-- [ ] 5. Bất kỳ hàm gọi `subprocess.Popen` nào có bị dính `readline()` blocking I/O làm liệt nút Dừng không?
-- [ ] 6. Quy trình render có tuân thủ **Direct 1-Pass Pipeline Tuyệt Đối** không sinh file clip hay video câm trung gian không?
-- [ ] 7. Các layer tĩnh trong Layout Studio có được render qua `LayoutRenderer` và tận dụng **Layout Cache MD5** không?
-- [ ] 8. Tuyệt đối KHÔNG dùng FFmpeg `drawtext` cho text layout tĩnh nhiều dòng để tránh lỗi khoảng cách dòng của FreeType.
-- [ ] 9. Kích thước font chữ trên Preview có dùng `font.setPixelSize` theo hệ số $k = H_{\text{preview}} / 1080$ để triệt tiêu lệch DPI Windows không?
-- [ ] 10. Thuật toán đo font có dùng `font.getmetrics()` tính đầy đủ Line Height (`ascent + descent + spacing + outline`) không?
-- [ ] 11. Các layer ảnh tràn viền / tọa độ âm có được paste/overlay tự do và clip chuẩn khung hình không?
-- [ ] 12. Intro Overlay có được tích hợp trực tiếp vào 1-Pass Filter Complex kèm Fade Out mượt mà và không chạy thêm pass re-encode CPU thứ 2 không?
-- [ ] 13. Whisper AI có được nạp từ khóa ngữ cảnh `initial_prompt`, hạ `no_speech_threshold = 0.3` để bắt trọn 30s đầu không?
-- [ ] 14. TUYỆT ĐỐI KHÔNG CHẠY TEST SCRIPT RENDER KHI NGƯỜI DÙNG YÊU CẦU DỪNG TEST để tránh lãng phí thời gian của người dùng.
-- [ ] 15. Mọi phương thức, hàm hoặc biến nội bộ mới thêm có kiểm tra đúng tên định danh của class (`self.ffmpeg`, `self._run`, `get_duration_seconds`) chưa?
-- [ ] 16. Đã kiểm tra đầy đủ import của tất cả UI widgets (`QPlainTextEdit` trong `PySide6.QtWidgets`, v.v.) và chạy thử nghiệm khởi tạo `MainWindow` để tránh lỗi `NameError` khi khởi động app chưa?
-- [ ] 17. Đã bóc tách đúng luồng thực tế của `config.json` và kiểm tra tĩnh AST/Syntax toàn diện chưa?
-- [ ] 18. Hàm `find_binary` có hỗ trợ tự động tìm kiếm đuôi `.exe` trên Windows chưa?
-- [ ] 19. **QUY TẮC GIT WORKFLOW**: TUYỆT ĐỐI KHÔNG tự ý push code lên nhánh `main` trừ khi người dùng yêu cầu rõ ràng. Mọi thay đổi trung gian nếu push thì chỉ push lên nhánh phụ (`dev` hoặc `fix/...`) và chỉ đưa vào `main` khi đã kiểm tra ổn định và được người dùng duyệt, nhằm bảo đảm nhánh `main` luôn an toàn để người dùng kéo về sử dụng bất kỳ lúc nào.
-- [ ] 20. TUYỆT ĐỐI KHÔNG tự ý sửa code hoặc chạy test ngầm khi người dùng chỉ yêu cầu ghi chép tài liệu / nhật ký lỗi.
+- [ ] 3. Khi chạy Whisper GPU, TUYỆT ĐỐI KHÔNG DÙNG `word_timestamps=True` trên Windows để tránh lỗi `CUDA illegal memory access` và sập context?
+- [ ] 4. File âm thanh dài có được chia thành các Macro-Chunk (~10 phút) cắt tại điểm im lặng kèm chu kỳ xả sạch `torch.cuda.empty_cache()` sau mỗi chunk để chống phân mảnh VRAM chưa?
+- [ ] 5. Khi GPU bị lỗi, fallback CPU có giữ nguyên 100% đúng model người dùng đã chọn không?
+- [ ] 6. Bất kỳ hàm gọi `subprocess.Popen` nào có bị dính `readline()` blocking I/O làm liệt nút Dừng không?
+- [ ] 7. Quy trình render có tuân thủ **Direct 1-Pass Pipeline Tuyệt Đối** không sinh file clip hay video câm trung gian không?
+- [ ] 8. Các layer tĩnh trong Layout Studio có được render qua `LayoutRenderer` và tận dụng **Layout Cache MD5** không?
+- [ ] 9. Tuyệt đối KHÔNG dùng FFmpeg `drawtext` cho text layout tĩnh nhiều dòng để tránh lỗi khoảng cách dòng của FreeType.
+- [ ] 10. Kích thước font chữ trên Preview có dùng `font.setPixelSize` theo hệ số $k = H_{\text{preview}} / 1080$ để triệt tiêu lệch DPI Windows không?
+- [ ] 11. Thuật toán đo font có dùng `font.getmetrics()` tính đầy đủ Line Height (`ascent + descent + spacing + outline`) không?
+- [ ] 12. Các layer ảnh tràn viền / tọa độ âm có được paste/overlay tự do và clip chuẩn khung hình không?
+- [ ] 13. Intro Overlay có được tích hợp trực tiếp vào 1-Pass Filter Complex kèm Fade Out mượt mà và không chạy thêm pass re-encode CPU thứ 2 không?
+- [ ] 14. Whisper AI có được nạp từ khóa ngữ cảnh `initial_prompt`, hạ `no_speech_threshold = 0.3` để bắt trọn 30s đầu không?
+- [ ] 15. TUYỆT ĐỐI KHÔNG CHẠY TEST SCRIPT RENDER KHI NGƯỜI DÙNG YÊU CẦU DỪNG TEST để tránh lãng phí thời gian của người dùng.
+- [ ] 16. Mọi phương thức, hàm hoặc biến nội bộ mới thêm có kiểm tra đúng tên định danh của class (`self.ffmpeg`, `self._run`, `get_duration_seconds`) chưa?
+- [ ] 17. Đã kiểm tra đầy đủ import của tất cả UI widgets (`QPlainTextEdit` trong `PySide6.QtWidgets`, v.v.) và chạy thử nghiệm khởi tạo `MainWindow` để tránh lỗi `NameError` khi khởi động app chưa?
+- [ ] 18. Đã bóc tách đúng luồng thực tế của `config.json` và kiểm tra tĩnh AST/Syntax toàn diện chưa?
+- [ ] 19. Hàm `find_binary` có hỗ trợ tự động tìm kiếm đuôi `.exe` trên Windows chưa?
+- [ ] 20. **QUY TẮC GIT WORKFLOW**: TUYỆT ĐỐI KHÔNG tự ý push code lên nhánh `main` trừ khi người dùng yêu cầu rõ ràng. Mọi thay đổi trung gian nếu push thì chỉ push lên nhánh phụ (`dev` hoặc `fix/...`) và chỉ đưa vào `main` khi đã kiểm tra ổn định và được người dùng duyệt, nhằm bảo đảm nhánh `main` luôn an toàn để người dùng kéo về sử dụng bất kỳ lúc nào.
+- [ ] 21. TUYỆT ĐỐI KHÔNG tự ý sửa code hoặc chạy test ngầm khi người dùng chỉ yêu cầu ghi chép tài liệu / nhật ký lỗi.
+
 

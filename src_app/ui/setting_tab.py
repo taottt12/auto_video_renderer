@@ -16,7 +16,8 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QPushButton, QListWidget,
     QFileDialog, QCheckBox, QComboBox, QSpinBox, QDoubleSpinBox,
     QLineEdit, QFormLayout, QScrollArea, QTextEdit, QPlainTextEdit, QColorDialog,
-    QToolButton, QLabel, QAbstractItemView, QSplitter, QMessageBox
+    QToolButton, QLabel, QAbstractItemView, QSplitter, QMessageBox,
+    QTableWidget, QTableWidgetItem, QHeaderView
 )
 
 from core.media_utils import AUDIO_EXTENSIONS
@@ -1059,27 +1060,271 @@ class SettingTab(QWidget):
         QTimer.singleShot(2500, lambda: self.save_status_label.setText("Sẵn sàng"))
 
     def _build_extra_group(self) -> QGroupBox:
-        group = QGroupBox()
-        form = QFormLayout(group)
-        self.intro_edit = self._file_row(form, "Intro", "Chọn intro", "Video (*.mp4 *.mov *.mkv)")
+        group = QGroupBox("Quản lý Mẫu Intro / Outro")
+        root_layout = QVBoxLayout(group)
+        root_layout.setSpacing(8)
+
+        lbl_hint = QLabel("💡 <i>Bạn có thể lưu nhiều mẫu Intro/Outro. Ở tab <b>Render</b>, bạn có thể chọn mẫu riêng cho từng video hoặc gán hàng loạt.</i>")
+        lbl_hint.setStyleSheet("color: #0288d1; font-size: 11px;")
+        root_layout.addWidget(lbl_hint)
+
+        self.intro_outro_table = QTableWidget(0, 5)
+        self.intro_outro_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.intro_outro_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.intro_outro_table.setHorizontalHeaderLabels(["Tên mẫu", "File Intro", "Chế độ Intro", "File Outro", "Mặc định"])
+        self.intro_outro_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.intro_outro_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.intro_outro_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.intro_outro_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.intro_outro_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.intro_outro_table.setMaximumHeight(150)
+        self.intro_outro_table.itemSelectionChanged.connect(self._on_preset_row_selected)
+        root_layout.addWidget(self.intro_outro_table)
+
+        preset_bar = QHBoxLayout()
+        preset_bar.setSpacing(6)
+        self.btn_add_preset = QPushButton("➕ Thêm mẫu mới")
+        self.btn_add_preset.setStyleSheet("font-weight: bold; background-color: #2e7d32; color: white; padding: 4px 10px;")
+        self.btn_add_preset.clicked.connect(self._add_new_preset)
+
+        self.btn_del_preset = QPushButton("🗑️ Xóa mẫu")
+        self.btn_del_preset.setStyleSheet("background-color: #c62828; color: white; padding: 4px 10px;")
+        self.btn_del_preset.clicked.connect(self._delete_selected_preset)
+
+        self.btn_set_default_preset = QPushButton("⭐ Đặt làm mặc định")
+        self.btn_set_default_preset.setStyleSheet("font-weight: bold; background-color: #f57f17; color: white; padding: 4px 10px;")
+        self.btn_set_default_preset.clicked.connect(self._set_selected_as_default)
+
+        preset_bar.addWidget(self.btn_add_preset)
+        preset_bar.addWidget(self.btn_del_preset)
+        preset_bar.addWidget(self.btn_set_default_preset)
+        preset_bar.addStretch(1)
+        root_layout.addLayout(preset_bar)
+
+        detail_box = QGroupBox("Chi tiết mẫu được chọn")
+        detail_form = QFormLayout(detail_box)
+
+        self.preset_name_edit = QLineEdit()
+        self.preset_name_edit.setPlaceholderText("Ví dụ: Kênh Chính, Series Phim, Chỉ Outro...")
+        self.preset_name_edit.textEdited.connect(self._on_preset_field_edited)
+        detail_form.addRow("Tên mẫu:", self.preset_name_edit)
+
+        intro_row = QHBoxLayout()
+        self.intro_edit = QLineEdit()
+        self.intro_edit.setPlaceholderText("Đường dẫn file video intro (.mp4, .mov, .mkv)...")
+        btn_intro_browse = QPushButton("Chọn intro")
+        btn_intro_browse.clicked.connect(lambda: self._choose_preset_video(self.intro_edit))
+        btn_intro_play = QPushButton("▶")
+        btn_intro_play.setFixedWidth(30)
+        btn_intro_play.setToolTip("Mở xem thử file Intro")
+        btn_intro_play.clicked.connect(lambda: self._preview_video_file(self.intro_edit.text()))
+        intro_row.addWidget(self.intro_edit)
+        intro_row.addWidget(btn_intro_browse)
+        intro_row.addWidget(btn_intro_play)
+        detail_form.addRow("Intro:", intro_row)
 
         self.intro_mode_combo = QComboBox()
         self.intro_mode_combo.addItem("Nối tiếp trước MP3 (Phát xong Intro mới tới nội dung chính)", "sequential")
         self.intro_mode_combo.addItem("Đè lên đầu MP3 (MP3 phát từ 0:00, Intro chỉ đè hình ảnh mở đầu)", "overlay")
-        form.addRow("Chế độ Intro:", self.intro_mode_combo)
+        self.intro_mode_combo.currentIndexChanged.connect(self._on_preset_field_edited)
+        detail_form.addRow("Chế độ Intro:", self.intro_mode_combo)
 
-        self.outro_edit = self._file_row(form, "Outro", "Chọn outro", "Video (*.mp4 *.mov *.mkv)")
+        outro_row = QHBoxLayout()
+        self.outro_edit = QLineEdit()
+        self.outro_edit.setPlaceholderText("Đường dẫn file video outro (.mp4, .mov, .mkv)...")
+        btn_outro_browse = QPushButton("Chọn outro")
+        btn_outro_browse.clicked.connect(lambda: self._choose_preset_video(self.outro_edit))
+        btn_outro_play = QPushButton("▶")
+        btn_outro_play.setFixedWidth(30)
+        btn_outro_play.setToolTip("Mở xem thử file Outro")
+        btn_outro_play.clicked.connect(lambda: self._preview_video_file(self.outro_edit.text()))
+        outro_row.addWidget(self.outro_edit)
+        outro_row.addWidget(btn_outro_browse)
+        outro_row.addWidget(btn_outro_play)
+        detail_form.addRow("Outro:", outro_row)
+
+        self.intro_edit.textEdited.connect(self._on_preset_field_edited)
+        self.outro_edit.textEdited.connect(self._on_preset_field_edited)
+        root_layout.addWidget(detail_box)
 
         self.filter_bgm_after_30s_cb = QCheckBox("Tự động giảm/lọc bỏ nhạc nền sau 30s đầu (Giữ nguyên giọng đọc & SFX)")
         self.filter_bgm_after_30s_cb.setToolTip("Khi bật: 30s đầu giữ nguyên 100% âm thanh gốc (bao gồm nhạc dạo / voice intro). Từ giây 30 trở đi sẽ lọc giảm nhạc nền giúp lời đọc rõ nét và giữ SFX.")
-        form.addRow("Lọc nhạc sau 30s:", self.filter_bgm_after_30s_cb)
+        root_layout.addWidget(self.filter_bgm_after_30s_cb)
 
         note_label = QLabel("💡 <i>Logo, Watermark, Huy hiệu & Lớp phủ đồ họa hiện được quản lý trực quan tại tab <b>Studio Layout</b>.</i>")
         note_label.setStyleSheet("color: #88c0d0; font-size: 11px;")
-        form.addRow(note_label)
+        root_layout.addWidget(note_label)
 
-        self._connect_change_widgets(self.intro_edit, self.intro_mode_combo, self.outro_edit, self.filter_bgm_after_30s_cb)
+        self._connect_change_widgets(self.filter_bgm_after_30s_cb)
+        self._current_presets: List[Dict[str, Any]] = []
         return group
+
+    def _choose_preset_video(self, line_edit: QLineEdit) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(self, "Chọn video Intro/Outro", line_edit.text().strip(), "Video (*.mp4 *.mov *.mkv *.avi *.webm)")
+        if file_path:
+            line_edit.setText(file_path)
+            self._on_preset_field_edited()
+
+    def _preview_video_file(self, path_str: str) -> None:
+        p = Path(path_str.strip())
+        if p.exists() and p.is_file():
+            try:
+                os.startfile(str(p))
+            except Exception as exc:
+                QMessageBox.warning(self, "Lỗi mở file", f"Không mở được video: {exc}")
+        else:
+            QMessageBox.information(self, "File không tồn tại", f"Chưa chọn file hoặc file không tồn tại:\n{path_str}")
+
+    def _load_presets_to_ui(self, presets: List[Dict[str, Any]]) -> None:
+        self._current_presets = [dict(p) for p in presets]
+        self._refresh_presets_table(select_idx=0)
+
+    def _refresh_presets_table(self, select_idx: int = -1) -> None:
+        self.intro_outro_table.blockSignals(True)
+        self.intro_outro_table.setRowCount(0)
+        default_idx = 0
+        for idx, p in enumerate(self._current_presets):
+            self.intro_outro_table.insertRow(idx)
+            is_def = bool(p.get("is_default", False))
+            if is_def:
+                default_idx = idx
+
+            name_item = QTableWidgetItem(f"⭐ {p.get('name', 'Mẫu')}" if is_def else str(p.get("name", "Mẫu")))
+            intro_p = Path(p.get("intro_file", "")).name if p.get("intro_file") else "-"
+            intro_item = QTableWidgetItem(intro_p)
+            intro_item.setToolTip(str(p.get("intro_file", "")))
+
+            mode_str = "Đè lên MP3" if p.get("intro_mode") == "overlay" else "Nối tiếp"
+            mode_item = QTableWidgetItem(mode_str)
+
+            outro_p = Path(p.get("outro_file", "")).name if p.get("outro_file") else "-"
+            outro_item = QTableWidgetItem(outro_p)
+            outro_item.setToolTip(str(p.get("outro_file", "")))
+
+            def_item = QTableWidgetItem("⭐ Mặc định" if is_def else "-")
+            def_item.setTextAlignment(Qt.AlignCenter)
+
+            self.intro_outro_table.setItem(idx, 0, name_item)
+            self.intro_outro_table.setItem(idx, 1, intro_item)
+            self.intro_outro_table.setItem(idx, 2, mode_item)
+            self.intro_outro_table.setItem(idx, 3, outro_item)
+            self.intro_outro_table.setItem(idx, 4, def_item)
+
+        self.intro_outro_table.blockSignals(False)
+        target_idx = select_idx if (0 <= select_idx < len(self._current_presets)) else default_idx
+        self._active_preset_idx = target_idx
+        if len(self._current_presets) > 0:
+            self.intro_outro_table.setCurrentCell(target_idx, 0)
+            self._display_preset_in_form(target_idx)
+
+    def _on_preset_row_selected(self) -> None:
+        row = self.intro_outro_table.currentRow()
+        if 0 <= row < len(self._current_presets):
+            self._active_preset_idx = row
+            self._display_preset_in_form(row)
+
+    def _display_preset_in_form(self, idx: int) -> None:
+        if not (0 <= idx < len(self._current_presets)):
+            return
+        self._active_preset_idx = idx
+        p = self._current_presets[idx]
+        self.preset_name_edit.blockSignals(True)
+        self.intro_edit.blockSignals(True)
+        self.intro_mode_combo.blockSignals(True)
+        self.outro_edit.blockSignals(True)
+
+        self.preset_name_edit.setText(str(p.get("name", "")))
+        self.intro_edit.setText(str(p.get("intro_file", "")))
+        self._set_combo_by_data(self.intro_mode_combo, p.get("intro_mode", "sequential"))
+        self.outro_edit.setText(str(p.get("outro_file", "")))
+
+        self.preset_name_edit.blockSignals(False)
+        self.intro_edit.blockSignals(False)
+        self.intro_mode_combo.blockSignals(False)
+        self.outro_edit.blockSignals(False)
+
+    def _on_preset_field_edited(self) -> None:
+        row = getattr(self, "_active_preset_idx", -1)
+        if not (0 <= row < len(self._current_presets)):
+            row = self.intro_outro_table.currentRow()
+        if not (0 <= row < len(self._current_presets)):
+            return
+        p = self._current_presets[row]
+        p["name"] = self.preset_name_edit.text().strip() or "Mẫu không tên"
+        p["intro_file"] = self.intro_edit.text().strip()
+        p["intro_mode"] = self.intro_mode_combo.currentData() or "sequential"
+        p["outro_file"] = self.outro_edit.text().strip()
+
+        is_def = bool(p.get("is_default", False))
+        if self.intro_outro_table.item(row, 0):
+            self.intro_outro_table.item(row, 0).setText(f"⭐ {p['name']}" if is_def else p["name"])
+        if self.intro_outro_table.item(row, 1):
+            intro_p = Path(p["intro_file"]).name if p["intro_file"] else "-"
+            self.intro_outro_table.item(row, 1).setText(intro_p)
+            self.intro_outro_table.item(row, 1).setToolTip(p["intro_file"])
+        if self.intro_outro_table.item(row, 2):
+            self.intro_outro_table.item(row, 2).setText("Đè lên MP3" if p["intro_mode"] == "overlay" else "Nối tiếp")
+        if self.intro_outro_table.item(row, 3):
+            outro_p = Path(p["outro_file"]).name if p["outro_file"] else "-"
+            self.intro_outro_table.item(row, 3).setText(outro_p)
+            self.intro_outro_table.item(row, 3).setToolTip(p["outro_file"])
+
+        self._emit()
+
+    def _add_new_preset(self) -> None:
+        import uuid
+        count = len(self._current_presets) + 1
+        new_preset = {
+            "id": f"preset_{uuid.uuid4().hex[:8]}",
+            "name": f"Mẫu Intro {count}",
+            "intro_file": "",
+            "intro_mode": "sequential",
+            "outro_file": "",
+            "is_default": False,
+        }
+        self._current_presets.append(new_preset)
+        self._refresh_presets_table(select_idx=len(self._current_presets) - 1)
+        self.preset_name_edit.setFocus()
+        self.preset_name_edit.selectAll()
+        self._emit()
+
+    def _delete_selected_preset(self) -> None:
+        if len(self._current_presets) <= 1:
+            QMessageBox.warning(self, "Không thể xóa", "Phải giữ lại ít nhất 1 cấu hình Intro/Outro.")
+            return
+        row = getattr(self, "_active_preset_idx", -1)
+        if not (0 <= row < len(self._current_presets)):
+            row = self.intro_outro_table.currentRow()
+        if not (0 <= row < len(self._current_presets)):
+            return
+        target = self._current_presets[row]
+        reply = QMessageBox.question(
+            self,
+            "Xác nhận xóa",
+            f"Bạn có chắc muốn xóa mẫu '{target.get('name')}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        was_def = target.get("is_default", False)
+        self._current_presets.pop(row)
+        if was_def and self._current_presets:
+            self._current_presets[0]["is_default"] = True
+        new_idx = min(row, len(self._current_presets) - 1)
+        self._refresh_presets_table(select_idx=new_idx)
+        self._emit()
+
+    def _set_selected_as_default(self) -> None:
+        row = getattr(self, "_active_preset_idx", -1)
+        if not (0 <= row < len(self._current_presets)):
+            row = self.intro_outro_table.currentRow()
+        if not (0 <= row < len(self._current_presets)):
+            return
+        for idx, p in enumerate(self._current_presets):
+            p["is_default"] = (idx == row)
+        self._refresh_presets_table(select_idx=row)
+        self._emit()
 
     def _build_text_group(self) -> QGroupBox:
         group = QGroupBox()
@@ -1956,10 +2201,24 @@ class SettingTab(QWidget):
     def collect_settings(self) -> Dict[str, Any]:
         width, height, ratio = self.ratio_combo.currentData()
         settings = dict(self.settings)
+        presets = [dict(p) for p in getattr(self, "_current_presets", [])]
+        if not presets:
+            presets = [
+                {
+                    "id": "default",
+                    "name": "Mặc định (Chung)",
+                    "intro_file": self.intro_edit.text().strip() if hasattr(self, "intro_edit") else "",
+                    "intro_mode": self.intro_mode_combo.currentData() if hasattr(self, "intro_mode_combo") else "sequential",
+                    "outro_file": self.outro_edit.text().strip() if hasattr(self, "outro_edit") else "",
+                    "is_default": True,
+                }
+            ]
+        default_p = next((p for p in presets if p.get("is_default")), presets[0])
         settings.update({
-            "intro_file": self.intro_edit.text().strip(),
-            "intro_mode": self.intro_mode_combo.currentData() if hasattr(self, "intro_mode_combo") else "sequential",
-            "outro_file": self.outro_edit.text().strip(),
+            "intro_file": default_p.get("intro_file", ""),
+            "intro_mode": default_p.get("intro_mode", "sequential"),
+            "outro_file": default_p.get("outro_file", ""),
+            "intro_outro_presets": presets,
             "filter_bgm_after_30s": self.filter_bgm_after_30s_cb.isChecked() if hasattr(self, "filter_bgm_after_30s_cb") else False,
             "background_music": {
                 "enabled": self.bgm_enabled.isChecked(),
@@ -2056,10 +2315,16 @@ class SettingTab(QWidget):
         self._lock_emit = True
         self.settings = settings
 
-        self.intro_edit.setText(settings.get("intro_file", ""))
-        if hasattr(self, "intro_mode_combo"):
-            self._set_combo_by_data(self.intro_mode_combo, settings.get("intro_mode", "sequential"))
-        self.outro_edit.setText(settings.get("outro_file", ""))
+        from core.settings import normalize_intro_outro_presets
+        presets = normalize_intro_outro_presets(settings)
+        if hasattr(self, "_load_presets_to_ui"):
+            self._load_presets_to_ui(presets)
+        else:
+            self.intro_edit.setText(settings.get("intro_file", ""))
+            if hasattr(self, "intro_mode_combo"):
+                self._set_combo_by_data(self.intro_mode_combo, settings.get("intro_mode", "sequential"))
+            self.outro_edit.setText(settings.get("outro_file", ""))
+
         if hasattr(self, "filter_bgm_after_30s_cb"):
             self.filter_bgm_after_30s_cb.setChecked(bool(settings.get("filter_bgm_after_30s", False)))
 
