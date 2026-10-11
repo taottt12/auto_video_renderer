@@ -3,8 +3,9 @@ from __future__ import annotations
 import random
 import re
 import subprocess
+import threading
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Tuple
 
 from .paths import find_binary
 from .process_utils import run_hidden
@@ -12,6 +13,9 @@ from .process_utils import run_hidden
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac"}
+
+_DURATION_CACHE: Dict[Tuple[str, float, int], float] = {}
+_DURATION_CACHE_LOCK = threading.Lock()
 
 
 def is_image(path: str | Path) -> bool:
@@ -27,14 +31,20 @@ def is_audio(path: str | Path) -> bool:
 
 
 def get_duration_seconds(path: str | Path) -> float:
-    """Đọc thời lượng media bằng ffprobe, có fallback và báo lỗi rõ hơn.
-
-    Một số file tải từ web/YouTube có tên dài, ký tự Unicode hoặc metadata lạ.
-    Hàm này không dùng shell, ghi rõ stderr để người dùng biết file lỗi hay FFmpeg lỗi.
-    """
+    """Đọc thời lượng media bằng ffprobe có cache theo mtime + size để tránh probe lặp lại."""
     media_path = Path(path)
     if not media_path.exists():
         raise FileNotFoundError(f"Không tìm thấy file: {media_path}")
+
+    cache_key: Tuple[str, float, int] | None = None
+    try:
+        st = media_path.stat()
+        cache_key = (str(media_path.resolve()), float(st.st_mtime), int(st.st_size))
+        with _DURATION_CACHE_LOCK:
+            if cache_key in _DURATION_CACHE:
+                return _DURATION_CACHE[cache_key]
+    except Exception:
+        cache_key = None
 
     try:
         ffprobe = find_binary("ffprobe.exe")
@@ -54,9 +64,13 @@ def get_duration_seconds(path: str | Path) -> float:
             try:
                 parsed = float(value)
                 if parsed > 0:
+                    if cache_key:
+                        with _DURATION_CACHE_LOCK:
+                            _DURATION_CACHE[cache_key] = parsed
                     return parsed
             except ValueError:
                 continue
+
 
     # Fallback: đọc dòng Duration từ ffmpeg -i, hữu ích với vài file metadata lạ.
     try:

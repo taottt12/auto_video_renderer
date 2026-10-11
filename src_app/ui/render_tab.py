@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import csv
+import uuid
 from PySide6.QtCore import QThread, Signal, Slot, QTimer, Qt, QUrl
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -28,7 +29,9 @@ from core.media_utils import (
     get_duration_seconds, seconds_to_hhmmss, is_image, is_video
 )
 from core.paths import find_binary
+from core.job_logger import JobLogger
 from core.render_engine import RenderEngine, RenderResult
+
 
 COL_TITLE = 0
 COL_DURATION = 1
@@ -414,7 +417,20 @@ class RenderWorker(QThread):
         intro_mode_str = f" - {job_settings['intro_mode']}" if job_settings.get("intro_file") else ""
         self.log_signal.emit(f"[Dòng {row + 1}] Cấu hình: Mẫu Layout [{layout_name}] | Intro [{intro_p}{intro_mode_str}] | Outro [{outro_p}]")
 
-        engine = RenderEngine(job_settings, log=log, progress=progress, cancel_event=self.cancel_event)
+        job_id = f"job_row{row + 1}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        run_id = "run_01"
+        job_logger = JobLogger(job_id=job_id, run_id=run_id)
+        self.log_signal.emit(f"[Dòng {row + 1}] 📋 Tracing Log JSONL: {job_logger.log_file.name}")
+
+        engine = RenderEngine(
+            job_settings,
+            log=log,
+            progress=progress,
+            cancel_event=self.cancel_event,
+            job_id=job_id,
+            run_id=run_id,
+            job_logger=job_logger,
+        )
         result = engine.render_audio(audio, custom_title=title)
         self.row_finished_signal.emit(row)
         return row, result

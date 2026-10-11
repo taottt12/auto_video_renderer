@@ -6,6 +6,9 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from src_app.core.process_utils import GpuResourceManager
+
+
 os.environ["CUDA_MODULE_LOADING"] = "LAZY"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -839,6 +842,7 @@ def transcribe_audio_to_srt(
     audio_duration: float = 0.0,
     enhance_voice: bool = True,
     initial_prompt: str = "",
+    job_logger: Any = None,
 ) -> Tuple[Path, str]:
     """Tự động nghe audio bằng Whisper AI, nhận diện ngôn ngữ và xuất file .srt chuẩn xác theo từng từ với Process Sandbox 100% an toàn."""
     if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
@@ -865,6 +869,19 @@ def transcribe_audio_to_srt(
     # Preflight Check CUDA cuBLAS thực tế
     has_cuda_runtime = check_cuda_whisper_support()
 
+    if job_logger and hasattr(job_logger, "log_event"):
+        job_logger.log_event(
+            event="whisper_started",
+            stage="Whisper AI",
+            data={
+                "model_size": model_size,
+                "has_cuda": has_cuda_runtime,
+                "target_lang": target_lang or "auto",
+                "audio_path": str(p_audio),
+                "enhance_voice": enhance_voice,
+            },
+        )
+
     success = False
     detected_lang = target_lang or "unknown"
     used_device = "cpu"
@@ -872,36 +889,8 @@ def transcribe_audio_to_srt(
     # Giai đoạn 1: Chạy trực tiếp trên GPU CUDA bằng Process Sandbox (Tách biệt hoàn toàn process)
     if has_cuda_runtime:
         try:
-            ok, err_msg, lang_res, ret_code = _run_isolated_whisper(
-                audio_path=p_audio,
-                out_srt_path=p_out,
-                model_size=model_size,
-                language=target_lang,
-                device="cuda",
-                compute_type="fp16",
-                speed=speed,
-                audio_duration=audio_duration,
-                cancel_event=cancel_event,
-                log_callback=log_callback,
-                progress_callback=progress_callback,
-                enhance_voice=enhance_voice,
-                initial_prompt=initial_prompt,
-            )
-            if ok:
-                success = True
-                used_device = "GPU CUDA (PyTorch Native FP16)"
-                detected_lang = lang_res
-            elif ret_code == CUDA_FATAL_EXIT_CODE:
-                _safe_log(
-                    log_callback,
-                    f"⚠️ [Process Sandbox] Worker CUDA gặp lỗi CUDA context/driver (Exit code {CUDA_FATAL_EXIT_CODE}: {err_msg}). "
-                    f"Tiến trình cũ đã bị hủy. Đang spawn 1 worker CUDA MỚI hoàn toàn để retry (1/1)..."
-                )
-                if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
-                    raise RenderCancelled("Đã dừng bởi người dùng")
-
-                # Spawn worker CUDA mới toanh (fresh process, fresh CUDA context)
-                ok_retry, err_retry, lang_retry, ret_retry = _run_isolated_whisper(
+            with GpuResourceManager.acquire_whisper_gpu():
+                ok, err_msg, lang_res, ret_code = _run_isolated_whisper(
                     audio_path=p_audio,
                     out_srt_path=p_out,
                     model_size=model_size,
@@ -916,21 +905,78 @@ def transcribe_audio_to_srt(
                     enhance_voice=enhance_voice,
                     initial_prompt=initial_prompt,
                 )
-                if ok_retry:
+                if ok:
                     success = True
-                    used_device = "GPU CUDA (PyTorch Native FP16 - Recovered Worker)"
-                    detected_lang = lang_retry
-                    _safe_log(log_callback, f"🎉 [Process Sandbox] Worker CUDA mới đã hoàn tất bóc tách phụ đề thành công!")
-                else:
+                    used_device = "GPU CUDA (PyTorch Native FP16)"
+                    detected_lang = lang_res
+                elif ret_code == CUDA_FATAL_EXIT_CODE:
+                    if job_logger and hasattr(job_logger, "log_event"):
+                        job_logger.log_event(
+                            event="cuda_error_detected",
+                            stage="Whisper AI",
+                            level="WARNING",
+                            data={"error": err_msg, "exit_code": ret_code, "action": "retry_fresh_worker"},
+                        )
                     _safe_log(
                         log_callback,
-                        f"⚠️ [Process Sandbox] Worker CUDA mới retry tiếp tục thất bại ({err_retry}) -> Chuyển sang fallback CPU đa luồng giữ nguyên model [{model_size}]..."
+                        f"⚠️ [Process Sandbox] Worker CUDA gặp lỗi CUDA context/driver (Exit code {CUDA_FATAL_EXIT_CODE}: {err_msg}). "
+                        f"Tiến trình cũ đã bị hủy. Đang spawn 1 worker CUDA MỚI hoàn toàn để retry (1/1)..."
                     )
-            else:
-                _safe_log(log_callback, f"⚠️ GPU CUDA gặp sự cố [{err_msg}] -> Tự động chuyển sang CPU đa luồng giữ nguyên model [{model_size}]...")
+                    if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
+                        raise RenderCancelled("Đã dừng bởi người dùng")
+
+                    # Spawn worker CUDA mới toanh (fresh process, fresh CUDA context)
+                    ok_retry, err_retry, lang_retry, ret_retry = _run_isolated_whisper(
+                        audio_path=p_audio,
+                        out_srt_path=p_out,
+                        model_size=model_size,
+                        language=target_lang,
+                        device="cuda",
+                        compute_type="fp16",
+                        speed=speed,
+                        audio_duration=audio_duration,
+                        cancel_event=cancel_event,
+                        log_callback=log_callback,
+                        progress_callback=progress_callback,
+                        enhance_voice=enhance_voice,
+                        initial_prompt=initial_prompt,
+                    )
+                    if ok_retry:
+                        success = True
+                        used_device = "GPU CUDA (PyTorch Native FP16 - Recovered Worker)"
+                        detected_lang = lang_retry
+                        _safe_log(log_callback, f"🎉 [Process Sandbox] Worker CUDA mới đã hoàn tất bóc tách phụ đề thành công!")
+                    else:
+                        if job_logger and hasattr(job_logger, "log_event"):
+                            job_logger.log_event(
+                                event="cuda_error_detected",
+                                stage="Whisper AI",
+                                level="WARNING",
+                                data={"error": err_retry, "exit_code": ret_retry, "action": "cpu_fallback"},
+                            )
+                        _safe_log(
+                            log_callback,
+                            f"⚠️ [Process Sandbox] Worker CUDA mới retry tiếp tục thất bại ({err_retry}) -> Chuyển sang fallback CPU đa luồng giữ nguyên model [{model_size}]..."
+                        )
+                else:
+                    if job_logger and hasattr(job_logger, "log_event"):
+                        job_logger.log_event(
+                            event="cuda_error_detected",
+                            stage="Whisper AI",
+                            level="WARNING",
+                            data={"error": err_msg, "exit_code": ret_code, "action": "cpu_fallback"},
+                        )
+                    _safe_log(log_callback, f"⚠️ GPU CUDA gặp sự cố [{err_msg}] -> Tự động chuyển sang CPU đa luồng giữ nguyên model [{model_size}]...")
         except RenderCancelled:
             raise
         except Exception as cuda_ex:
+            if job_logger and hasattr(job_logger, "log_event"):
+                job_logger.log_event(
+                    event="cuda_error_detected",
+                    stage="Whisper AI",
+                    level="WARNING",
+                    data={"error": str(cuda_ex), "action": "cpu_fallback"},
+                )
             _safe_log(log_callback, f"⚠️ GPU CUDA gặp ngoại lệ [{cuda_ex}] -> Tự động chuyển sang CPU đa luồng giữ nguyên model [{model_size}]...")
 
     # Giai đoạn 2: Fallback sang CPU đa luồng nếu GPU hoàn toàn không khả dụng
@@ -964,5 +1010,18 @@ def transcribe_audio_to_srt(
 
     _safe_log(log_callback, f"✔ Đã tạo file phụ đề .srt chính xác ({used_device.upper()}): {p_out.name}")
 
+    if job_logger and hasattr(job_logger, "log_event"):
+        job_logger.log_event(
+            event="whisper_completed",
+            stage="Whisper AI",
+            data={
+                "device": used_device,
+                "language": detected_lang,
+                "srt_file": str(p_out),
+                "srt_size": p_out.stat().st_size if p_out.exists() else 0,
+            },
+        )
+
     return p_out, detected_lang
+
 

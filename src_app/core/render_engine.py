@@ -4,6 +4,7 @@ import copy
 import hashlib
 import os
 import json
+import queue
 import random
 import re
 import shlex
@@ -19,6 +20,7 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from PIL import Image, ImageDraw
 
+from .job_logger import JobLogger, GpuTelemetrySampler
 from .layout_renderer import (
     LayoutRenderer,
     find_font_file,
@@ -29,7 +31,8 @@ from .layout_renderer import (
 from .media_utils import choose_media_sequence, get_duration_seconds, is_image, is_video
 from .overlay_generator import get_overlay_file, ensure_default_overlays
 from .paths import TEMP_DIR, OUTPUT_DIR, DATA_DIR, APP_ROOT, ensure_dirs, find_binary
-from .process_utils import popen_hidden, run_hidden
+from .process_utils import popen_hidden, run_hidden, GpuResourceManager
+
 from .subtitle_utils import (
     ensure_cuda_whisper_libraries,
     find_subtitle_file,
@@ -72,6 +75,9 @@ class RenderEngine:
         log: LogCallback | None = None,
         progress: ProgressCallback | None = None,
         cancel_event: threading.Event | None = None,
+        job_id: str = "",
+        run_id: str = "run_01",
+        job_logger: JobLogger | None = None,
     ) -> None:
         ensure_dirs()
         self.settings = settings
@@ -93,6 +99,9 @@ class RenderEngine:
         self.ffmpeg = self._find_binary_pair("ffmpeg")
         self.ffprobe = self._find_binary_pair("ffprobe")
         self.temp_root = TEMP_DIR
+        self.job_id = str(job_id or f"job_{uuid.uuid4().hex[:8]}")
+        self.run_id = str(run_id or "run_01")
+        self.job_logger = job_logger or JobLogger(self.job_id, self.run_id)
 
     def _find_binary_pair(self, name: str) -> str:
         try:
@@ -100,16 +109,82 @@ class RenderEngine:
         except Exception:
             return find_binary(name)
 
+    def _probe_output_integrity(self, file_path: Path) -> Dict[str, Any]:
+        """Kiểm tra toàn vẹn video thành phẩm bằng ffprobe: tồn tại, kích thước, video/audio stream."""
+        res: Dict[str, Any] = {"valid": False, "file": str(file_path)}
+        if not file_path.exists():
+            res["reason"] = "File không tồn tại sau khi render"
+            return res
+        try:
+            sz = file_path.stat().st_size
+            res["size_bytes"] = sz
+            if sz < 1024:
+                res["reason"] = f"Kích thước file quá nhỏ ({sz} bytes)"
+                return res
+            probe_cmd = [
+                self.ffprobe,
+                "-v", "error",
+                "-show_entries", "stream=codec_type,codec_name,duration:format=duration",
+                "-of", "json",
+                str(file_path),
+            ]
+            proc = run_hidden(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+            if proc.returncode == 0 and proc.stdout:
+                parsed = json.loads(proc.stdout)
+                streams = parsed.get("streams", [])
+                video_ok = any(s.get("codec_type") == "video" for s in streams)
+                audio_ok = any(s.get("codec_type") == "audio" for s in streams)
+                res["has_video"] = video_ok
+                res["has_audio"] = audio_ok
+                res["streams"] = [f"{s.get('codec_type')}:{s.get('codec_name')}" for s in streams]
+                format_dur = float(parsed.get("format", {}).get("duration", 0.0) or 0.0)
+                res["duration_sec"] = format_dur
+                if not video_ok:
+                    res["reason"] = "Không tìm thấy video stream hợp lệ trong file thành phẩm"
+                    return res
+                res["valid"] = True
+                return res
+            else:
+                res["reason"] = f"FFprobe không thể đọc file thành phẩm: {proc.stderr}"
+                return res
+        except Exception as ex:
+            res["reason"] = f"Lỗi ngoại lệ khi kiểm tra file thành phẩm: {ex}"
+            return res
+
     def render_audio(self, audio_file: str, custom_title: str = "") -> RenderResult:
-        job_id = uuid.uuid4().hex[:10]
+        job_id = self.job_id
         job_temp: Path | None = None
         success = False
+        start_ts = time.time()
+        sampler = GpuTelemetrySampler(self.job_logger, interval_sec=2.0)
+        sampler.start()
 
         try:
             self._raise_if_cancelled()
+            self.job_logger.log_event(
+                "job_started",
+                stage="init",
+                data={
+                    "audio_file": str(audio_file),
+                    "custom_title": custom_title,
+                    "encoder": self._encoder(),
+                    "parallel_jobs": self._max_parallel_jobs(),
+                },
+            )
+
+            self.job_logger.log_event("input_validation_started", stage="validate_input")
             audio_path = Path(audio_file)
             if not audio_path.exists():
                 raise FileNotFoundError(f"Không tìm thấy audio: {audio_file}")
+
+            self.job_logger.log_event(
+                "input_validation_completed",
+                stage="validate_input",
+                data={
+                    "audio_size_bytes": audio_path.stat().st_size,
+                    "audio_stem": audio_path.stem,
+                },
+            )
 
             # Tiêu đề video hiển thị và đặt tên file: Ưu tiên custom_title nếu có
             title_to_use = str(custom_title).strip() if custom_title and str(custom_title).strip() else audio_path.stem
@@ -142,7 +217,17 @@ class RenderEngine:
             self.log(f"Audio speed: {audio_speed:.2f}x → duration render: {render_duration:.2f}s")
             self.log(f"Encoder: {self._encoder_label()} | Parallel jobs: {self._max_parallel_jobs()}")
             self.log(f"Temp drive: {job_temp.parent} | Output: {output_folder}")
+            self.job_logger.log_event(
+                "metadata_probe_completed",
+                stage="metadata_probe",
+                data={
+                    "original_duration_sec": round(original_duration, 2),
+                    "render_duration_sec": round(render_duration, 2),
+                    "audio_speed": audio_speed,
+                },
+            )
             self._preflight_disk_space(output_folder, job_temp.parent, render_duration, width, height, fps)
+
             if self._encoder() != "cpu":
                 self.log(f"GPU strict mode: {'tắt, cho phép fallback CPU' if self._allow_cpu_fallback() else 'bật, KHÔNG tự chuyển sang CPU'}")
                 if self._gpu_preflight_check():
@@ -205,6 +290,7 @@ class RenderEngine:
                             audio_duration=original_duration,
                             enhance_voice=whisper_enhance,
                             initial_prompt=combined_prompt,
+                            job_logger=self.job_logger,
                         )
                     except RenderCancelled:
                         raise
@@ -256,6 +342,25 @@ class RenderEngine:
             # LẬP KẾ HOẠCH MEDIA TASKS VÀ KIỂM TRA ĐIỀU KIỆN DIRECT 1-PASS
             media_tasks = self._plan_media_tasks(media_sequence, render_duration, image_duration, width, height, fps)
             batch_limit = self._transition_batch_size()
+            mode_choice = "direct_1pass" if len(media_tasks) <= batch_limit else "multi_pass"
+
+            self.job_logger.log_event(
+                "media_preparation_started",
+                stage="media_plan",
+                data={
+                    "media_sequence_count": len(media_sequence),
+                    "media_tasks_count": len(media_tasks),
+                },
+            )
+            self.job_logger.log_event(
+                "render_mode_selected",
+                stage="select_mode",
+                data={
+                    "mode": mode_choice,
+                    "tasks_count": len(media_tasks),
+                    "batch_limit": batch_limit,
+                },
+            )
 
             self.progress(35, "Chuẩn bị và mix audio")
             final_audio = self._build_final_audio(audio_path, job_temp, render_duration, audio_speed)
@@ -332,20 +437,49 @@ class RenderEngine:
                 self._finalize_output(current_video, output_file)
 
             self._delete_temp_file(final_audio, "audio tạm sau khi hoàn tất render")
+
+            # Xác thực độ toàn vẹn của file video thành phẩm
+            integrity = self._probe_output_integrity(output_file)
+            self.job_logger.log_event("output_validation_completed", stage="validate_output", data=integrity)
+            if not integrity.get("valid", False):
+                raise RuntimeError(f"Video xuất ra không đạt yêu cầu toàn vẹn: {integrity.get('reason')}")
+
+            peak_metrics = sampler.get_peak_metrics()
+            self.job_logger.log_event(
+                "job_completed",
+                stage="completed",
+                data={
+                    "output_file": str(output_file),
+                    "size_bytes": output_file.stat().st_size if output_file.exists() else 0,
+                    "peak_vram_used_mb": peak_metrics.get("peak_vram_used_mb", 0.0),
+                    "peak_ram_used_mb": peak_metrics.get("peak_ram_used_mb", 0.0),
+                    "total_time_sec": round(time.time() - start_ts, 2),
+                },
+            )
+
             success = True
             self.progress(100, "Hoàn thành")
             return RenderResult(audio_file=audio_file, output_file=str(output_file), success=True)
 
         except RenderCancelled:
+            if self.job_logger:
+                self.job_logger.log_event("job_cancelled", stage="cancelled", level="WARNING")
             return RenderResult(audio_file=audio_file, output_file="", success=False, message="Đã dừng bởi người dùng")
         except Exception as exc:
             import traceback
             traceback.print_exc()
             self.log(f"❌ Render engine error: {exc}")
+            if self.job_logger:
+                self.job_logger.log_event("job_failed", stage="failed", level="ERROR", error=exc)
             return RenderResult(audio_file=audio_file, output_file="", success=False, message=str(exc))
         finally:
+            sampler.stop()
+            sampler.join(timeout=3.0)
             if job_temp is not None:
                 self._cleanup_job_temp(job_temp, success=success)
+            GpuResourceManager.clean_torch_cuda_vram()
+            if self.job_logger:
+                self.job_logger.log_event("resource_cleanup_completed", stage="cleanup")
 
     def _performance(self) -> Dict[str, Any]:
         return self.settings.get("performance", {}) or {}
@@ -713,60 +847,133 @@ class RenderEngine:
     def _run(self, cmd: List[str], stage: str, allow_cpu_fallback: bool = False, fallback_builder: Callable[[], List[str]] | None = None) -> None:
         self._raise_if_cancelled()
         self.log(f"{stage}: {self._pretty_cmd(cmd)}")
-        try:
-            process = popen_hidden(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="ignore")
-        except OSError as exc:
-            # Windows báo WinError 206 khi command line quá dài. Trường hợp hay gặp nhất
-            # là xfade transition với vài trăm clip ảnh/video khiến -filter_complex phình rất lớn.
-            # Bản v5.2 đã chia transition theo batch và dùng filter_complex_script, nhưng đoạn này
-            # vẫn giữ để báo lỗi dễ hiểu nếu người dùng gặp command khác quá dài.
-            winerror = getattr(exc, "winerror", None)
-            detail = str(exc)
-            if winerror == 206 or "filename or extension is too long" in detail.lower() or "file name too long" in detail.lower():
-                raise RuntimeError(
-                    f"Lệnh FFmpeg quá dài ở bước: {stage}. "
-                    "Tool đã có chế độ chia batch transition tự động; nếu vẫn gặp lỗi này, hãy giảm số clip trong một batch transition, "
-                    "rút ngắn đường dẫn Temp folder/Output folder, hoặc tắt transition cho job cực dài."
-                ) from exc
-            raise
-        recent_lines: List[str] = []
-        try:
-            assert process.stdout is not None
-            while True:
-                if self.cancel_event.is_set():
-                    process.terminate()
+        if self.job_logger:
+            self.job_logger.log_event("ffmpeg_command_started", stage=stage, data={"cmd": cmd})
+
+        is_nvenc = "-c:v" in cmd and any("nvenc" in part.lower() for part in cmd)
+
+        def _execute_process() -> Tuple[int, List[str]]:
+            try:
+                process = popen_hidden(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="ignore")
+            except OSError as exc:
+                winerror = getattr(exc, "winerror", None)
+                detail = str(exc)
+                if winerror == 206 or "filename or extension is too long" in detail.lower() or "file name too long" in detail.lower():
+                    raise RuntimeError(
+                        f"Lệnh FFmpeg quá dài ở bước: {stage}. "
+                        "Tool đã có chế độ chia batch transition tự động; nếu vẫn gặp lỗi này, hãy giảm số clip trong một batch transition, "
+                        "rút ngắn đường dẫn Temp folder/Output folder, hoặc tắt transition cho job cực dài."
+                    ) from exc
+                raise
+
+            recent_lines: List[str] = []
+            out_queue: queue.Queue[str] = queue.Queue(maxsize=2000)
+
+            def _reader() -> None:
+                try:
+                    assert process.stdout is not None
+                    for raw_line in iter(process.stdout.readline, ""):
+                        if raw_line:
+                            out_queue.put(raw_line)
+                        else:
+                            break
+                except Exception:
+                    pass
+                finally:
+                    if process.stdout:
+                        try:
+                            process.stdout.close()
+                        except Exception:
+                            pass
+
+            reader_thread = threading.Thread(target=_reader, daemon=True)
+            reader_thread.start()
+
+            try:
+                while True:
+                    if self.cancel_event.is_set():
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                        raise RenderCancelled("Đã dừng bởi người dùng")
+
                     try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
+                        line = out_queue.get(timeout=0.1)
+                        line = line.strip()
+                        if line:
+                            recent_lines.append(line)
+                            if len(recent_lines) > 30:
+                                recent_lines = recent_lines[-30:]
+                            self.log(line)
+                    except queue.Empty:
+                        if process.poll() is not None:
+                            while not out_queue.empty():
+                                try:
+                                    rem = out_queue.get_nowait().strip()
+                                    if rem:
+                                        recent_lines.append(rem)
+                                        self.log(rem)
+                                except queue.Empty:
+                                    break
+                            break
+
+                code = process.wait()
+                return code, recent_lines
+            finally:
+                if process.poll() is None:
+                    try:
                         process.kill()
-                    raise RenderCancelled("Đã dừng bởi người dùng")
-                line = process.stdout.readline()
-                if line:
-                    line = line.strip()
-                    if line:
-                        recent_lines.append(line)
-                        if len(recent_lines) > 25:
-                            recent_lines = recent_lines[-25:]
-                        self.log(line)
-                elif process.poll() is not None:
-                    break
-                else:
-                    time.sleep(0.05)
-            code = process.wait()
-        finally:
-            if process.poll() is None:
-                process.kill()
+                    except Exception:
+                        pass
+
+        # Bảo vệ tải NVENC bằng GPU Semaphore trên các hệ thống có VRAM giới hạn
+        if is_nvenc:
+            with GpuResourceManager.acquire_nvenc_gpu():
+                code, recent_lines = _execute_process()
+        else:
+            code, recent_lines = _execute_process()
 
         if code != 0:
-            detail = "\n".join(recent_lines[-12:]).strip()
-            if allow_cpu_fallback and self._encoder() != "cpu" and fallback_builder is not None and self._allow_cpu_fallback():
-                self.log(f"GPU encoder lỗi ở bước '{stage}'. Người dùng cho phép fallback nên tự chuyển sang CPU/libx264 cho bước này.")
+            detail = "\n".join(recent_lines[-15:]).strip()
+            is_gpu_err = GpuResourceManager.is_gpu_hardware_failure(detail, code)
+
+            if is_gpu_err and allow_cpu_fallback and self._encoder() != "cpu" and fallback_builder is not None and self._allow_cpu_fallback():
+                self.log(f"⚠️ Phát hiện lỗi phần cứng GPU/NVENC ở bước '{stage}' (Exit code: {code}). Tự động chuyển sang CPU/libx264...")
                 if detail:
-                    self.log("Lỗi GPU gần nhất:\n" + detail)
-                self._run(fallback_builder(), stage + " (CPU fallback)", allow_cpu_fallback=False)
+                    self.log("Chi tiết lỗi GPU:\n" + detail)
+                if self.job_logger:
+                    self.job_logger.log_event("cpu_fallback_started", stage=stage, level="WARNING", data={"reason": detail, "code": code})
+
+                # Xóa file output dở dang trước khi chạy CPU fallback để tránh file hỏng / xung đột ghi
+                try:
+                    target_out = Path(cmd[-1])
+                    if target_out.exists() and target_out.is_file():
+                        target_out.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+                fallback_cmd = fallback_builder()
+                fallback_cmd = GpuResourceManager.strip_cuda_hwaccel_from_cmd(fallback_cmd)
+                self._run(fallback_cmd, stage + " (CPU fallback)", allow_cpu_fallback=False)
+                if self.job_logger:
+                    self.job_logger.log_event("cpu_fallback_completed", stage=stage, level="INFO")
                 return
-            if allow_cpu_fallback and self._encoder() != "cpu" and fallback_builder is not None and not self._allow_cpu_fallback():
-                self.log(f"GPU encoder lỗi ở bước '{stage}'. Đang bật GPU strict nên KHÔNG fallback sang CPU.")
+
+            if is_gpu_err and allow_cpu_fallback and self._encoder() != "cpu" and fallback_builder is not None and not self._allow_cpu_fallback():
+                self.log(f"⚠️ GPU encoder lỗi ở bước '{stage}'. Đang bật GPU strict nên KHÔNG fallback sang CPU.")
+
+            if self.job_logger:
+                self.job_logger.log_event(
+                    "ffmpeg_failed",
+                    stage=stage,
+                    level="ERROR",
+                    error_type="FFmpegExitError",
+                    error_message=detail,
+                    data={"code": code, "stage": stage},
+                )
+
             lower_detail = detail.lower()
             if "no space left on device" in lower_detail or "error code: -28" in lower_detail:
                 hint = self._disk_hint_from_cmd(cmd)
@@ -3080,7 +3287,7 @@ class RenderEngine:
             )
 
         def build_cpu() -> List[str]:
-            cpu_cmd = [part for part in cmd if part not in {"-hwaccel", "cuda"}]
+            cpu_cmd = GpuResourceManager.strip_cuda_hwaccel_from_cmd(cmd)
             return (
                 cpu_cmd
                 + ["-filter_complex_script", str(script_file), "-map", "[v]"]
