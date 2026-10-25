@@ -77,6 +77,13 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "video_effect_mode": "none",
     "transition_mode": "auto_soft",
     "transition_duration": 0.5,
+    "opening_effect": {
+        "enabled": False,
+        "mode": "fade_black",
+        "duration": 0.8,
+        "audio_fade_enabled": False,
+        "audio_fade_duration": 0.3,
+    },
     "layout_studio": {
         "enabled": True,
         "selected_preset": "custom",
@@ -178,7 +185,7 @@ PROJECT_SETTING_KEYS = {
     "image_duration_mode", "effect_mode", "image_motion_enabled",
     "video_effect_mode", "video_effect_enabled", "video_effect_custom_file",
     "video_effect_opacity", "transition_mode", "transition_enabled",
-    "transition_duration", "layout_studio", "audio_speed", "video_speed",
+    "transition_duration", "opening_effect", "layout_studio", "audio_speed", "video_speed",
     "performance", "text_overlay", "subtitle", "export", "project",
     "render_queue",
 }

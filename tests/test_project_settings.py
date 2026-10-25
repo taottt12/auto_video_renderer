@@ -45,6 +45,7 @@ class TestProjectSettings(unittest.TestCase):
             "audio_files": ["D:/audio/one.mp3"],
             "media_files": ["D:/media/bg.jpg"],
             "render_queue": [{"id": "job-1", "audio_file": "D:/audio/one.mp3", "title": "One"}],
+            "opening_effect": {"enabled": True, "mode": "fade_black", "duration": 0.8},
             "audio_crawler": {"cookie_file_path": "SECRET_COOKIE", "save_folder": "D:/audio"},
             "youtube_uploader": {"custom_api_key": "SECRET_KEY", "active_channel_id": "channel"},
             "project": {"current_name": "Demo", "current_path": "D:/old/demo.avr.json"},
@@ -56,6 +57,7 @@ class TestProjectSettings(unittest.TestCase):
 
         self.assertEqual(raw["audio_files"], ["D:/audio/one.mp3"])
         self.assertEqual(raw["render_queue"][0]["title"], "One")
+        self.assertTrue(raw["opening_effect"]["enabled"])
         self.assertNotIn("audio_crawler", raw)
         self.assertNotIn("youtube_uploader", raw)
         self.assertNotIn("current_path", raw["project"])

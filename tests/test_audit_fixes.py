@@ -239,6 +239,35 @@ class TestAuditAndOptimizationFixes(unittest.TestCase):
         self.assertTrue(any("SECOND LINE" in part for part in title_filters))
         self.assertTrue(all("\n" not in part and "\r" not in part for part in title_filters))
 
+    def test_project_opening_effect_is_applied_after_visual_layers(self):
+        engine = RenderEngine(settings={
+            "opening_effect": {
+                "enabled": True,
+                "mode": "fade_white",
+                "duration": 1.2,
+            },
+            "layout_studio": {"enabled": False, "layers": []},
+        })
+        cmd, filters = [engine.ffmpeg], []
+        last, next_input = engine._build_visual_layers_filtergraph(
+            cmd, filters, "[0:v]", 1, 1280, 720, fps=25
+        )
+        self.assertEqual(next_input, 1)
+        self.assertTrue(last.startswith("[v_opening_"))
+        self.assertTrue(any("fade=t=in:st=0:d=1.200:color=white" in part for part in filters))
+        self.assertTrue(engine._has_visual_overlays())
+
+    def test_project_opening_effect_is_skipped_when_intro_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            intro = Path(tmp) / "intro.mp4"
+            intro.write_bytes(b"placeholder")
+            engine = RenderEngine(settings={
+                "intro_file": str(intro),
+                "intro_mode": "sequential",
+                "opening_effect": {"enabled": True, "mode": "fade_black", "duration": 0.8},
+            })
+            self.assertIsNone(engine._active_opening_effect())
+
 
 if __name__ == "__main__":
     unittest.main()

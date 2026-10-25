@@ -373,7 +373,7 @@ class RenderEngine:
             intro_file = self.settings.get("intro_file") or ""
             outro_file = self.settings.get("outro_file") or ""
             intro_mode = str(self.settings.get("intro_mode", "overlay")).lower()
-            has_concat_intro_outro = bool(outro_file or (intro_file and intro_mode == "concat"))
+            has_concat_intro_outro = bool(outro_file or (intro_file and intro_mode == "sequential"))
 
             if len(media_tasks) <= batch_limit:
                 if not has_concat_intro_outro:
@@ -828,6 +828,34 @@ class RenderEngine:
             return min(4.0, max(0.25, float(self.settings.get("audio_speed", 1.0))))
         except Exception:
             return 1.0
+
+    def _active_opening_effect(self) -> Dict[str, Any] | None:
+        """Return the normalized project opening effect, unless an Intro is active."""
+        cfg = self.settings.get("opening_effect", {}) or {}
+        if not bool(cfg.get("enabled", False)):
+            return None
+
+        intro_file = str(self.settings.get("intro_file", "") or "").strip()
+        if intro_file and Path(intro_file).exists():
+            return None
+
+        mode = str(cfg.get("mode", "fade_black") or "fade_black").lower()
+        if mode not in {"fade_black", "fade_white", "fade_soft"}:
+            mode = "fade_black"
+        try:
+            duration = min(5.0, max(0.2, float(cfg.get("duration", 0.8) or 0.8)))
+        except (TypeError, ValueError):
+            duration = 0.8
+        try:
+            audio_duration = min(3.0, max(0.1, float(cfg.get("audio_fade_duration", 0.3) or 0.3)))
+        except (TypeError, ValueError):
+            audio_duration = 0.3
+        return {
+            "mode": mode,
+            "duration": duration,
+            "audio_fade_enabled": bool(cfg.get("audio_fade_enabled", False)),
+            "audio_fade_duration": audio_duration,
+        }
 
     def _video_speed(self) -> float:
         try:
@@ -1662,6 +1690,20 @@ class RenderEngine:
             except Exception as ex:
                 self.log(f"⚠️ Bộ lọc nhạc sau 30s gặp cảnh báo: {ex}, tiếp tục dùng audio hiện tại.")
 
+        opening_cfg = self._active_opening_effect()
+        if opening_cfg and opening_cfg["audio_fade_enabled"]:
+            fade_audio_out = job_temp / "audio_opening_fade.m4a"
+            fade_duration = float(opening_cfg["audio_fade_duration"])
+            fade_cmd = [
+                self.ffmpeg, "-y", "-i", str(current), "-vn",
+                "-af", f"afade=t=in:st=0:d={fade_duration:.3f}",
+                "-t", f"{duration:.6f}", "-c:a", "aac", "-b:a", "192k",
+                str(fade_audio_out),
+            ]
+            self._run(fade_cmd, "Fade In âm thanh mở đầu")
+            self._delete_temp_file(current, "audio trước hiệu ứng mở đầu")
+            current = fade_audio_out
+
         return current
 
     def _mix_background_music_audio(self, main_audio: Path, music: Path, out: Path, duration: float) -> None:
@@ -2259,6 +2301,7 @@ class RenderEngine:
             or (text.get("enabled") and str(text.get("content", "")).strip())
             or has_sub
             or has_video_fx
+            or self._active_opening_effect()
         )
 
     def _resolve_asset_path(self, path_str: str) -> Optional[Path]:
@@ -3306,6 +3349,22 @@ class RenderEngine:
                 last = out_lbl
                 input_index += 1
                 stage += 1
+
+        opening_cfg = self._active_opening_effect()
+        if opening_cfg:
+            mode = str(opening_cfg["mode"])
+            duration = float(opening_cfg["duration"])
+            fade_color = {
+                "fade_black": "black",
+                "fade_white": "white",
+                "fade_soft": "0x202028",
+            }.get(mode, "black")
+            out_opening = f"[v_opening_{stage}]"
+            filters.append(
+                f"{last}fade=t=in:st=0:d={duration:.3f}:color={fade_color}{out_opening}"
+            )
+            last = out_opening
+            stage += 1
 
         return last, input_index
 

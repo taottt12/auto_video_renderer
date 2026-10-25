@@ -1888,9 +1888,58 @@ class SettingTab(QWidget):
 
         group_layout.addWidget(params_group)
 
+        opening_card = QGroupBox("4. Hiệu ứng mở đầu toàn video (không cần file Intro)")
+        opening_grid = QGridLayout(opening_card)
+        opening_grid.setContentsMargins(8, 8, 8, 8)
+        opening_grid.setHorizontalSpacing(10)
+        opening_grid.setVerticalSpacing(6)
+
+        self.opening_effect_enabled = QCheckBox("Bật hiệu ứng mở đầu")
+        self.opening_effect_enabled.setToolTip(
+            "Áp dụng lên toàn bộ khung hình sau khi đã ghép nền, layout, logo và phụ đề. "
+            "Nếu dòng render có Intro hợp lệ thì hiệu ứng này tự động được bỏ qua."
+        )
+        opening_grid.addWidget(self.opening_effect_enabled, 0, 0, 1, 2)
+
+        opening_grid.addWidget(QLabel("Kiểu xuất hiện:"), 1, 0)
+        self.opening_effect_combo = QComboBox()
+        self.opening_effect_combo.addItem("🌑 Fade từ màu đen", "fade_black")
+        self.opening_effect_combo.addItem("⬜ Fade từ màu trắng", "fade_white")
+        self.opening_effect_combo.addItem("✨ Fade mềm", "fade_soft")
+        opening_grid.addWidget(self.opening_effect_combo, 1, 1)
+
+        opening_grid.addWidget(QLabel("Thời lượng hình:"), 1, 2)
+        self.opening_effect_duration = QDoubleSpinBox()
+        self.opening_effect_duration.setRange(0.2, 5.0)
+        self.opening_effect_duration.setSingleStep(0.1)
+        self.opening_effect_duration.setValue(0.8)
+        self.opening_effect_duration.setSuffix(" s")
+        opening_grid.addWidget(self.opening_effect_duration, 1, 3)
+
+        self.opening_audio_fade_enabled = QCheckBox("Fade In âm thanh")
+        opening_grid.addWidget(self.opening_audio_fade_enabled, 2, 0, 1, 2)
+        opening_grid.addWidget(QLabel("Thời lượng âm thanh:"), 2, 2)
+        self.opening_audio_fade_duration = QDoubleSpinBox()
+        self.opening_audio_fade_duration.setRange(0.1, 3.0)
+        self.opening_audio_fade_duration.setSingleStep(0.1)
+        self.opening_audio_fade_duration.setValue(0.3)
+        self.opening_audio_fade_duration.setSuffix(" s")
+        opening_grid.addWidget(self.opening_audio_fade_duration, 2, 3)
+
+        opening_note = QLabel(
+            "Hiệu ứng không làm tăng thời lượng video và không thay đổi đồng bộ MP3. "
+            "Cấu hình được lưu riêng theo từng dự án."
+        )
+        opening_note.setWordWrap(True)
+        opening_note.setStyleSheet("color: #78909c; font-size: 11px;")
+        opening_grid.addWidget(opening_note, 3, 0, 1, 4)
+        group_layout.addWidget(opening_card)
+
         self.image_motion_enabled.toggled.connect(self._on_effects_toggled)
         self.video_effect_enabled.toggled.connect(self._on_effects_toggled)
         self.transition_enabled.toggled.connect(self._on_effects_toggled)
+        self.opening_effect_enabled.toggled.connect(self._on_opening_effect_toggled)
+        self.opening_audio_fade_enabled.toggled.connect(self._on_opening_effect_toggled)
 
         self.effect_combo.currentIndexChanged.connect(self._update_all_effect_demos)
         self.video_effect_combo.currentIndexChanged.connect(self._on_video_effect_combo_changed)
@@ -1901,9 +1950,21 @@ class SettingTab(QWidget):
             self.image_duration_combo, self.effect_combo, self.video_effect_combo,
             self.custom_layer_edit, self.video_effect_opacity,
             self.transition_combo, self.transition_duration,
+            self.opening_effect_enabled, self.opening_effect_combo, self.opening_effect_duration,
+            self.opening_audio_fade_enabled, self.opening_audio_fade_duration,
             self.audio_speed_spin, self.video_speed_spin
         )
+        self._on_opening_effect_toggled()
         return group
+
+    def _on_opening_effect_toggled(self) -> None:
+        enabled = self.opening_effect_enabled.isChecked()
+        self.opening_effect_combo.setEnabled(enabled)
+        self.opening_effect_duration.setEnabled(enabled)
+        self.opening_audio_fade_enabled.setEnabled(enabled)
+        self.opening_audio_fade_duration.setEnabled(
+            enabled and self.opening_audio_fade_enabled.isChecked()
+        )
 
     def _on_video_effect_combo_changed(self) -> None:
         is_custom = self.video_effect_combo.currentData() == "custom"
@@ -2265,6 +2326,13 @@ class SettingTab(QWidget):
             "video_effect_opacity": self.video_effect_opacity.value() if hasattr(self, "video_effect_opacity") else 0.80,
             "transition_mode": self.transition_combo.currentData() if self.transition_enabled.isChecked() else "none",
             "transition_duration": self.transition_duration.value(),
+            "opening_effect": {
+                "enabled": self.opening_effect_enabled.isChecked(),
+                "mode": self.opening_effect_combo.currentData() or "fade_black",
+                "duration": self.opening_effect_duration.value(),
+                "audio_fade_enabled": self.opening_audio_fade_enabled.isChecked(),
+                "audio_fade_duration": self.opening_audio_fade_duration.value(),
+            },
             "audio_speed": self.audio_speed_spin.value(),
             "video_speed": self.video_speed_spin.value(),
             "performance": {
@@ -2391,6 +2459,13 @@ class SettingTab(QWidget):
         self.transition_enabled.setChecked(tr_on)
         self._set_combo_by_data(self.transition_combo, transition_mode)
         self.transition_duration.setValue(float(settings.get("transition_duration", 0.5)))
+        opening_cfg = settings.get("opening_effect", {}) or {}
+        self.opening_effect_enabled.setChecked(bool(opening_cfg.get("enabled", False)))
+        self._set_combo_by_data(self.opening_effect_combo, opening_cfg.get("mode", "fade_black"))
+        self.opening_effect_duration.setValue(float(opening_cfg.get("duration", 0.8) or 0.8))
+        self.opening_audio_fade_enabled.setChecked(bool(opening_cfg.get("audio_fade_enabled", False)))
+        self.opening_audio_fade_duration.setValue(float(opening_cfg.get("audio_fade_duration", 0.3) or 0.3))
+        self._on_opening_effect_toggled()
         self.audio_speed_spin.setValue(float(settings.get("audio_speed", 1.0)))
         self.video_speed_spin.setValue(float(settings.get("video_speed", 1.0)))
         self._on_effects_toggled()
