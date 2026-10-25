@@ -96,6 +96,22 @@ class TestProjectSettings(unittest.TestCase):
         self.assertEqual(loaded["audio_crawler"]["cookie_file_path"], "GLOBAL_COOKIE")
         self.assertEqual(loaded["project"]["current_path"], str(project_file))
 
+    def test_legacy_crawler_link_only_migrates_when_explicitly_requested(self):
+        base = {
+            "audio_crawler": {
+                "playlist_url": "https://youtube.com/playlist?list=LAST_USED",
+                "save_folder": "D:/last-used",
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            project_file = Path(tmp) / "legacy.avr.json"
+            project_file.write_text(json.dumps({"project": {"current_name": "Legacy"}}), encoding="utf-8")
+            blank = SettingsManager.load_project(project_file, base)
+            migrated = SettingsManager.load_project(project_file, base, migrate_legacy_crawler=True)
+
+        self.assertEqual(blank["audio_crawler_project"]["playlist_url"], "")
+        self.assertEqual(migrated["audio_crawler_project"]["playlist_url"], base["audio_crawler"]["playlist_url"])
+
 
 if __name__ == "__main__":
     unittest.main()

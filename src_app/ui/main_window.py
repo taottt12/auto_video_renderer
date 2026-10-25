@@ -155,7 +155,11 @@ class MainWindow(QMainWindow):
         self.settings: Dict[str, Any] = self.settings_manager.load()
         active_project = SettingsManager.resolve_current_project(self.settings)
         if active_project:
-            self.settings = SettingsManager.load_project(active_project, self.settings)
+            self.settings = SettingsManager.load_project(
+                active_project,
+                self.settings,
+                migrate_legacy_crawler=True,
+            )
             SettingsManager.save_project(active_project, self.settings)
         # One-time/ongoing migration: keep only app-scoped values in config.json
         # and move credentials to the ignored local secrets store.

@@ -364,7 +364,11 @@ class SettingsManager:
         p.write_text(json.dumps(_project_payload(settings), ensure_ascii=False, indent=2), encoding="utf-8")
 
     @staticmethod
-    def load_project(path: str | Path, base_settings: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    def load_project(
+        path: str | Path,
+        base_settings: Dict[str, Any] | None = None,
+        migrate_legacy_crawler: bool = False,
+    ) -> Dict[str, Any]:
         p = Path(path)
         data = json.loads(p.read_text(encoding="utf-8"))
         # Filtering also sanitizes legacy projects which used to contain the
@@ -374,14 +378,15 @@ class SettingsManager:
         if "audio_crawler_project" not in data:
             legacy = (base_settings or {}).get("audio_crawler", {}) or {}
             profile = deepcopy(DEFAULT_SETTINGS["audio_crawler_project"])
-            for key in (
-                "mode", "video_urls", "playlist_url", "playlist_limit",
-                "channel_url", "channel_limit", "channel_order",
-                "channel_date_filter", "channel_date_from", "channel_date_to",
-                "save_folder", "auto_add_to_audio_list", "direct_crawl", "audio_trim",
-            ):
-                if key in legacy:
-                    profile[key] = deepcopy(legacy[key])
+            if migrate_legacy_crawler:
+                for key in (
+                    "mode", "video_urls", "playlist_url", "playlist_limit",
+                    "channel_url", "channel_limit", "channel_order",
+                    "channel_date_filter", "channel_date_from", "channel_date_to",
+                    "save_folder", "auto_add_to_audio_list", "direct_crawl", "audio_trim",
+                ):
+                    if key in legacy:
+                        profile[key] = deepcopy(legacy[key])
             profile["initialized"] = True
             res["audio_crawler_project"] = profile
         res.setdefault("project", {})["current_path"] = str(p)
