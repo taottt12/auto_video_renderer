@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -18,6 +19,45 @@ from .process_utils import run_hidden
 
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int, str], None]  # current, total, status_text
+
+
+def youtube_source_key(url: str, mode: str = "playlist") -> str:
+    """Build a stable project-history key from a YouTube playlist/channel URL."""
+    raw = str(url or "").strip()
+    if not raw:
+        return f"{mode}:unknown"
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        if mode == "playlist":
+            playlist_id = urllib.parse.parse_qs(parsed.query).get("list", [""])[0]
+            if playlist_id:
+                return f"playlist:{playlist_id}"
+        clean_path = parsed.path.rstrip("/").lower()
+        if clean_path:
+            return f"{mode}:{parsed.netloc.lower()}{clean_path}"
+    except Exception:
+        pass
+    return f"{mode}:{raw.lower()}"
+
+
+def youtube_video_id(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        host = parsed.netloc.lower()
+        if host.endswith("youtu.be"):
+            return parsed.path.strip("/").split("/")[0]
+        query_id = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
+        if query_id:
+            return query_id
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 2 and parts[0].lower() in {"shorts", "live", "embed"}:
+            return parts[1]
+    except Exception:
+        pass
+    return ""
 
 
 def json_cookies_to_netscape_content(data: list) -> str:
@@ -624,6 +664,7 @@ def extract_entry_list(
     cookie_file: str = "",
     log: LogCallback | None = None,
     cancel_event: threading.Event | None = None,
+    exclude_ids: set[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """Duyệt nhanh danh sách video từ Playlist hoặc Channel bằng flat-playlist và lọc video bị chặn/hội viên."""
     _log = log or (lambda msg: None)
@@ -669,6 +710,17 @@ def extract_entry_list(
                     if not page_token:
                         break
                 _log(f"🔐 Đã tìm thấy {len(api_items)} video qua YouTube Data API v3 chính chủ.")
+                if order == "oldest_first":
+                    api_items = list(reversed(api_items))
+                excluded = {str(value) for value in (exclude_ids or set()) if str(value)}
+                if excluded:
+                    before = len(api_items)
+                    api_items = [item for item in api_items if str(item.get("id") or "") not in excluded]
+                    skipped = before - len(api_items)
+                    if skipped:
+                        _log(f"📚 Lịch sử dự án: bỏ qua {skipped} video đã tải trước đó.")
+                if limit > 0:
+                    api_items = api_items[:limit]
                 return api_items
         except Exception as e:
             _log(f"⚠ Không thể quét bằng YouTube API ({e}), chuyển sang quét thông thường...")
@@ -766,7 +818,17 @@ def extract_entry_list(
     if order == "oldest_first":
         valid_entries = list(reversed(valid_entries))
 
-    # 4. Giới hạn số lượng
+    # 4. Loại video đã hoàn thành của đúng dự án trước khi áp dụng giới hạn.
+    # Nhờ vậy "100" có nghĩa là tối đa 100 video CHƯA tải, không phải 100 vị trí đầu playlist.
+    excluded = {str(value) for value in (exclude_ids or set()) if str(value)}
+    if excluded:
+        before = len(valid_entries)
+        valid_entries = [item for item in valid_entries if str(item.get("id") or "") not in excluded]
+        skipped = before - len(valid_entries)
+        if skipped:
+            _log(f"📚 Lịch sử dự án: bỏ qua {skipped} video đã tải trước đó.")
+
+    # 5. Giới hạn số lượng video mới
     if limit > 0:
         valid_entries = valid_entries[:limit]
 
@@ -1205,6 +1267,7 @@ def run_crawler(
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
     on_file_downloaded: Callable[[str], None] | None = None,
+    on_history_updated: Callable[[Dict[str, Any]], None] | None = None,
 ) -> List[str]:
     """Hàm chính điều phối toàn bộ tác vụ cào MP3."""
     _log = log or (lambda msg: None)
@@ -1229,6 +1292,45 @@ def run_crawler(
         _log(f"🍪 Chế độ Cookie vượt chặn Bot: Sử dụng Cookie từ trình duyệt '{browser_cookie.capitalize()}'.")
     else:
         _log("🍪 Chế độ Cookie: Tắt (Dùng Client Spoofing SmartTV/Mobile).")
+
+    history = crawler_cfg.setdefault("download_history", {})
+    if not isinstance(history, dict):
+        history = {}
+        crawler_cfg["download_history"] = history
+    only_new = bool(crawler_cfg.get("only_new", True))
+    source_url = {
+        "playlist": str(crawler_cfg.get("playlist_url") or ""),
+        "channel": str(crawler_cfg.get("channel_url") or ""),
+        "video": "manual-video-list",
+    }.get(mode, "")
+    source_key = youtube_source_key(source_url, mode)
+
+    completed_ids: set[str] = set()
+    if only_new:
+        for video_id, record in history.items():
+            if not isinstance(record, dict):
+                continue
+            status = str(record.get("status") or "")
+            file_path = str(record.get("file_path") or "")
+            if status in {"downloaded", "existing"} and file_path and Path(file_path).exists():
+                completed_ids.add(str(video_id))
+
+    def remember(item: Dict[str, Any], status: str, file_path: str = "", error: str = "") -> None:
+        video_id = str(item.get("id") or youtube_video_id(str(item.get("url") or ""))).strip()
+        if not video_id:
+            return
+        history[video_id] = {
+            "video_id": video_id,
+            "title": str(item.get("title") or ""),
+            "url": str(item.get("url") or ""),
+            "source_key": source_key,
+            "status": status,
+            "file_path": str(file_path or ""),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "error": str(error or ""),
+        }
+        if on_history_updated:
+            on_history_updated(dict(history))
 
     targets: List[Dict[str, str]] = []
 
@@ -1256,6 +1358,7 @@ def run_crawler(
             cookie_file=cookie_file,
             log=_log,
             cancel_event=_cancel,
+            exclude_ids=completed_ids,
         )
 
     elif mode == "channel":
@@ -1280,7 +1383,18 @@ def run_crawler(
             cookie_file=cookie_file,
             log=_log,
             cancel_event=_cancel,
+            exclude_ids=completed_ids,
         )
+
+    if only_new and completed_ids and crawler_cfg.get("selected_targets"):
+        before = len(targets)
+        targets = [
+            item for item in targets
+            if str(item.get("id") or youtube_video_id(str(item.get("url") or ""))) not in completed_ids
+        ]
+        skipped = before - len(targets)
+        if skipped:
+            _log(f"📚 Lịch sử dự án: bỏ qua {skipped} video đã tải trong phần được chọn.")
 
     total = len(targets)
     if total == 0:
@@ -1318,6 +1432,7 @@ def run_crawler(
         if existing_match:
             _log(f"⚡ [{index + 1}/{total}] [Đã có sẵn] {existing_match.name} ➔ Bỏ qua không tải lại.")
             downloaded_files.append(str(existing_match))
+            remember(item, "existing", str(existing_match))
             if on_file_downloaded:
                 on_file_downloaded(str(existing_match))
             continue
@@ -1341,11 +1456,13 @@ def run_crawler(
                 mp3_path = trim_audio_file(mp3_path, trim_cfg, _log)
 
             downloaded_files.append(mp3_path)
+            remember(item, "downloaded", mp3_path)
             _log(f"➔ Đã cào thành công: {os.path.basename(mp3_path)}")
             if on_file_downloaded:
                 on_file_downloaded(mp3_path)
         else:
             _log(f"⚠ Tải thất bại hoặc bị bỏ qua: {item['url']}")
+            remember(item, "failed", error="Không tải được hoặc video không khả dụng")
 
         # Giãn cách an toàn 2.0 giây giữa các lần tải để reset rate-limit của YouTube
         if index < total - 1 and not _cancel.is_set():

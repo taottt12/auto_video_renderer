@@ -27,6 +27,7 @@ from core.audio_crawler import (
     open_dedicated_browser_for_login,
     has_dedicated_profile_data,
     clear_dedicated_profile,
+    youtube_source_key,
 )
 
 
@@ -253,6 +254,7 @@ class AudioCrawlerThread(QThread):
     progress_signal = Signal(int, int, str)
     file_downloaded_signal = Signal(str)
     finished_signal = Signal(list)
+    history_signal = Signal(dict)
     error_signal = Signal(str)
 
     def __init__(self, crawler_cfg: Dict[str, Any]) -> None:
@@ -271,7 +273,9 @@ class AudioCrawlerThread(QThread):
                 progress=self.progress_signal.emit,
                 cancel_event=self.cancel_event,
                 on_file_downloaded=self.file_downloaded_signal.emit,
+                on_history_updated=self.history_signal.emit,
             )
+            self.history_signal.emit(dict(self.crawler_cfg.get("download_history", {}) or {}))
             self.finished_signal.emit(files)
         except Exception as exc:
             self.error_signal.emit(str(exc))
@@ -289,6 +293,7 @@ class CrawlerTab(QWidget):
         self._crawler_thread: AudioCrawlerThread | None = None
         self._scan_thread: ScanVideoListThread | None = None
         self._scanned_videos: List[Dict[str, Any]] = []
+        self._download_history: Dict[str, Any] = {}
         self._lock_table_event = False
         self._build_ui()
         self.load_settings(settings)
@@ -418,6 +423,21 @@ class CrawlerTab(QWidget):
         self.auto_add_checkbox = QCheckBox("Tự động thêm MP3 đã cào vào Render của dự án đang chọn")
         self.auto_add_checkbox.setChecked(True)
         form_layout.addRow("", self.auto_add_checkbox)
+        self.only_new_checkbox = QCheckBox("Chỉ cào video chưa tải của dự án này")
+        self.only_new_checkbox.setChecked(True)
+        self.only_new_checkbox.setToolTip(
+            "So sánh YouTube Video ID với lịch sử của dự án trước khi áp dụng giới hạn số lượng."
+        )
+        form_layout.addRow("", self.only_new_checkbox)
+        self.history_status_label = QLabel("Lịch sử dự án: 0 đã tải · 0 lỗi")
+        self.history_status_label.setStyleSheet("color: #607d8b; font-weight: bold;")
+        history_row = QHBoxLayout()
+        history_row.addWidget(self.history_status_label, 1)
+        self.clear_source_history_btn = QPushButton("Xóa lịch sử nguồn")
+        self.clear_source_history_btn.setToolTip("Chỉ xóa dấu đã tải của nguồn đang mở; không xóa file MP3.")
+        self.clear_source_history_btn.clicked.connect(self._clear_current_source_history)
+        history_row.addWidget(self.clear_source_history_btn)
+        form_layout.addRow("", history_row)
         self.project_target_label = QLabel("Dự án đích: Chưa chọn dự án")
         self.project_target_label.setStyleSheet("color: #ef6c00; font-weight: bold;")
         form_layout.addRow("", self.project_target_label)
@@ -461,7 +481,7 @@ class CrawlerTab(QWidget):
         page_playlist_form.setVerticalSpacing(4)
         self.playlist_url_edit = QLineEdit()
         self.playlist_url_edit.setPlaceholderText("https://www.youtube.com/playlist?list=...")
-        self.playlist_limit_label = QLabel("Số lượng tối đa:")
+        self.playlist_limit_label = QLabel("Số video mới tối đa:")
         self.playlist_limit_spin = QSpinBox()
         self.playlist_limit_spin.setRange(0, 10000)
         self.playlist_limit_spin.setValue(0)
@@ -615,11 +635,12 @@ class CrawlerTab(QWidget):
         range_row.addWidget(self.selected_count_label)
         preview_layout.addLayout(range_row)
 
-        self.preview_table = QTableWidget(0, 3)
-        self.preview_table.setHorizontalHeaderLabels(["Tập / Chọn", "Tiêu đề video", "Thời lượng"])
+        self.preview_table = QTableWidget(0, 4)
+        self.preview_table.setHorizontalHeaderLabels(["Tập / Chọn", "Tiêu đề video", "Thời lượng", "Lịch sử"])
         self.preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.preview_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.preview_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.preview_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.preview_table.setMinimumHeight(260)
@@ -707,13 +728,16 @@ class CrawlerTab(QWidget):
 
         # Signals kết nối UI
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self.mode_combo.currentIndexChanged.connect(lambda _index: self._update_history_status())
+        self.playlist_url_edit.textChanged.connect(lambda _text: self._update_history_status())
+        self.channel_url_edit.textChanged.connect(lambda _text: self._update_history_status())
         self.channel_date_combo.currentIndexChanged.connect(
             lambda: self.custom_date_widget.setVisible(self.channel_date_combo.currentData() == "custom")
         )
 
         self._connect_change_events(
             self.platform_combo, self.cookie_file_edit, self.audio_quality_combo, self.folder_edit, self.auto_add_checkbox,
-            self.direct_crawl_checkbox,
+            self.only_new_checkbox, self.direct_crawl_checkbox,
             self.mode_combo, self.video_urls_edit, self.playlist_url_edit,
             self.playlist_limit_spin, self.channel_url_edit, self.channel_limit_spin,
             self.channel_order_combo, self.channel_date_combo,
@@ -947,7 +971,18 @@ class CrawlerTab(QWidget):
             self.preview_table.insertRow(r)
 
             check_item = QTableWidgetItem(f"Tập {idx + 1}")
-            check_item.setCheckState(Qt.Checked)
+            video_id = str(item.get("id") or "")
+            history_record = self._download_history.get(video_id, {}) if video_id else {}
+            history_status = str(history_record.get("status") or "") if isinstance(history_record, dict) else ""
+            history_path = str(history_record.get("file_path") or "") if isinstance(history_record, dict) else ""
+            already_downloaded = (
+                history_status in {"downloaded", "existing"}
+                and bool(history_path)
+                and Path(history_path).exists()
+            )
+            check_item.setCheckState(
+                Qt.Unchecked if already_downloaded and self.only_new_checkbox.isChecked() else Qt.Checked
+            )
             check_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
             self.preview_table.setItem(r, 0, check_item)
 
@@ -958,6 +993,17 @@ class CrawlerTab(QWidget):
             dur_item = QTableWidgetItem(item.get("duration_str", "--:--"))
             dur_item.setTextAlignment(Qt.AlignCenter)
             self.preview_table.setItem(r, 2, dur_item)
+
+            if already_downloaded:
+                status_item = QTableWidgetItem("✅ Đã tải")
+                status_item.setToolTip(history_path)
+            elif history_status == "failed":
+                status_item = QTableWidgetItem("⚠ Tải lỗi")
+                status_item.setToolTip(str(history_record.get("error") or ""))
+            else:
+                status_item = QTableWidgetItem("🆕 Chưa tải")
+            status_item.setTextAlignment(Qt.AlignCenter)
+            self.preview_table.setItem(r, 3, status_item)
 
         self._lock_table_event = False
         self._update_selected_count()
@@ -1177,6 +1223,7 @@ class CrawlerTab(QWidget):
         self._crawler_thread.log_signal.connect(self.append_log)
         self._crawler_thread.progress_signal.connect(self._on_progress)
         self._crawler_thread.file_downloaded_signal.connect(self._on_file_downloaded)
+        self._crawler_thread.history_signal.connect(self._on_history_updated)
         self._crawler_thread.finished_signal.connect(self._on_finished)
         self._crawler_thread.error_signal.connect(self._on_error)
         self._crawler_thread.start()
@@ -1210,6 +1257,60 @@ class CrawlerTab(QWidget):
         # Transfer once when the batch finishes. Rebuilding and saving the full
         # render queue after every individual download made large crawls slow.
         pass
+
+    @Slot(dict)
+    def _on_history_updated(self, history: Dict[str, Any]) -> None:
+        self._download_history = dict(history or {})
+        self._update_history_status()
+        self._emit()
+
+    def _update_history_status(self) -> None:
+        mode = self.mode_combo.currentData() or "playlist"
+        source_url = (
+            self.playlist_url_edit.text().strip() if mode == "playlist"
+            else self.channel_url_edit.text().strip() if mode == "channel"
+            else "manual-video-list"
+        )
+        source_key = youtube_source_key(source_url, mode)
+        records = [
+            record for record in self._download_history.values()
+            if isinstance(record, dict) and str(record.get("source_key") or "") == source_key
+        ]
+        completed = sum(1 for record in records if record.get("status") in {"downloaded", "existing"})
+        failed = sum(1 for record in records if record.get("status") == "failed")
+        self.history_status_label.setText(
+            f"Lịch sử nguồn này: {completed} đã tải · {failed} lỗi · {len(records)} đã ghi nhận"
+        )
+
+    def _clear_current_source_history(self) -> None:
+        mode = self.mode_combo.currentData() or "playlist"
+        source_url = (
+            self.playlist_url_edit.text().strip() if mode == "playlist"
+            else self.channel_url_edit.text().strip() if mode == "channel"
+            else "manual-video-list"
+        )
+        source_key = youtube_source_key(source_url, mode)
+        matching_ids = [
+            video_id for video_id, record in self._download_history.items()
+            if isinstance(record, dict) and str(record.get("source_key") or "") == source_key
+        ]
+        if not matching_ids:
+            QMessageBox.information(self, "Lịch sử nguồn", "Nguồn hiện tại chưa có lịch sử để xóa.")
+            return
+        reply = QMessageBox.question(
+            self,
+            "Xóa lịch sử nguồn",
+            f"Xóa dấu đã tải của {len(matching_ids)} video thuộc nguồn hiện tại?\n\n"
+            "Các file MP3 trên ổ đĩa sẽ được giữ nguyên.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        for video_id in matching_ids:
+            self._download_history.pop(video_id, None)
+        self._update_history_status()
+        self._emit()
 
     @Slot(list)
     def _on_finished(self, files: list) -> None:
@@ -1269,13 +1370,17 @@ class CrawlerTab(QWidget):
 
     def collect_settings(self) -> Dict[str, Any]:
         settings = dict(self.settings)
-        crawler_settings = {
+        crawler_auth = {
             "platform": self.platform_combo.currentData() or "youtube",
             "browser_cookie": self.cookie_mode_combo.currentData() or "profile",
             "cookie_file_path": self.cookie_file_edit.text().strip(),
             "audio_quality": self.audio_quality_combo.currentData() or "192",
+        }
+        project_crawler = {
+            "initialized": True,
             "save_folder": self.folder_edit.text().strip(),
             "auto_add_to_audio_list": self.auto_add_checkbox.isChecked(),
+            "only_new": self.only_new_checkbox.isChecked(),
             "direct_crawl": self.direct_crawl_checkbox.isChecked(),
             "mode": self.mode_combo.currentData() or "video",
             "video_urls": self.video_urls_edit.toPlainText().strip(),
@@ -1293,14 +1398,28 @@ class CrawlerTab(QWidget):
                 "start_time": self.trim_start_edit.text().strip(),
                 "end_time": self.trim_end_edit.text().strip(),
             },
+            "history": dict(self._download_history),
         }
+        crawler_settings = dict(crawler_auth)
+        crawler_settings.update(project_crawler)
+        crawler_settings["download_history"] = dict(self._download_history)
         settings["audio_crawler"] = crawler_settings
+        settings["audio_crawler_project"] = project_crawler
         return settings
 
     def load_settings(self, settings: Dict[str, Any]) -> None:
         self._lock_emit = True
         self.settings = settings
-        crawler_cfg = settings.get("audio_crawler", {}) or {}
+        global_cfg = settings.get("audio_crawler", {}) or {}
+        project_cfg = settings.get("audio_crawler_project", {}) or {}
+        if bool(project_cfg.get("initialized", False)):
+            crawler_cfg = dict(global_cfg)
+            crawler_cfg.update(project_cfg)
+            self._download_history = dict(project_cfg.get("history", {}) or {})
+        else:
+            # Migration for projects created before per-project crawler profiles.
+            crawler_cfg = dict(global_cfg)
+            self._download_history = {}
 
         self._set_combo_by_data(self.platform_combo, crawler_cfg.get("platform", "youtube"))
         b_cookie = str(crawler_cfg.get("browser_cookie", "profile"))
@@ -1310,6 +1429,7 @@ class CrawlerTab(QWidget):
         self._set_combo_by_data(self.audio_quality_combo, crawler_cfg.get("audio_quality", "192"))
         self.folder_edit.setText(str(crawler_cfg.get("save_folder", "")))
         self.auto_add_checkbox.setChecked(bool(crawler_cfg.get("auto_add_to_audio_list", True)))
+        self.only_new_checkbox.setChecked(bool(crawler_cfg.get("only_new", True)))
         self.direct_crawl_checkbox.setChecked(bool(crawler_cfg.get("direct_crawl", True)))
         self._set_combo_by_data(self.mode_combo, crawler_cfg.get("mode", "video"))
         self.mode_stack.setCurrentIndex(self.mode_combo.currentIndex())
@@ -1343,6 +1463,7 @@ class CrawlerTab(QWidget):
                 self.date_to_edit.setDate(d_to)
 
         self._on_direct_crawl_toggled()
+        self._update_history_status()
         self._on_mode_changed(self.mode_combo.currentIndex())
         self._lock_emit = False
 

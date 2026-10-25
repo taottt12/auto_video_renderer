@@ -19,7 +19,11 @@ class TestProjectSettings(unittest.TestCase):
     def test_global_save_moves_secrets_out_of_config(self):
         settings = {
             "audio_files": ["D:/audio/project-only.mp3"],
-            "audio_crawler": {"cookie_file_path": "COOKIE", "save_folder": "D:/downloads"},
+            "audio_crawler": {
+                "cookie_file_path": "COOKIE",
+                "save_folder": "D:/downloads",
+                "playlist_url": "https://youtube.com/playlist?list=PRIVATE_PROJECT_LIST",
+            },
             "youtube_uploader": {"custom_api_key": "KEY", "active_channel_id": "channel"},
             "project": {"current_name": "Demo", "current_path": "D:/demo.avr.json", "output_folder": "D:/out"},
         }
@@ -35,6 +39,8 @@ class TestProjectSettings(unittest.TestCase):
 
         self.assertNotIn("audio_files", raw_config)
         self.assertNotIn("cookie_file_path", raw_config["audio_crawler"])
+        self.assertNotIn("playlist_url", raw_config["audio_crawler"])
+        self.assertNotIn("save_folder", raw_config["audio_crawler"])
         self.assertNotIn("custom_api_key", raw_config["youtube_uploader"])
         self.assertNotIn("output_folder", raw_config["project"])
         self.assertEqual(raw_secrets["audio_crawler"]["cookie_file_path"], "COOKIE")
@@ -46,6 +52,11 @@ class TestProjectSettings(unittest.TestCase):
             "media_files": ["D:/media/bg.jpg"],
             "render_queue": [{"id": "job-1", "audio_file": "D:/audio/one.mp3", "title": "One"}],
             "opening_effect": {"enabled": True, "mode": "fade_black", "duration": 0.8},
+            "audio_crawler_project": {
+                "initialized": True,
+                "playlist_url": "https://youtube.com/playlist?list=PROJECT_LIST",
+                "history": {"video-1": {"status": "downloaded", "file_path": "D:/audio/one.mp3"}},
+            },
             "audio_crawler": {"cookie_file_path": "SECRET_COOKIE", "save_folder": "D:/audio"},
             "youtube_uploader": {"custom_api_key": "SECRET_KEY", "active_channel_id": "channel"},
             "project": {"current_name": "Demo", "current_path": "D:/old/demo.avr.json"},
@@ -58,6 +69,8 @@ class TestProjectSettings(unittest.TestCase):
         self.assertEqual(raw["audio_files"], ["D:/audio/one.mp3"])
         self.assertEqual(raw["render_queue"][0]["title"], "One")
         self.assertTrue(raw["opening_effect"]["enabled"])
+        self.assertEqual(raw["audio_crawler_project"]["playlist_url"], "https://youtube.com/playlist?list=PROJECT_LIST")
+        self.assertIn("video-1", raw["audio_crawler_project"]["history"])
         self.assertNotIn("audio_crawler", raw)
         self.assertNotIn("youtube_uploader", raw)
         self.assertNotIn("current_path", raw["project"])

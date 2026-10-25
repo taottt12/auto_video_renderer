@@ -156,6 +156,7 @@ class MainWindow(QMainWindow):
         active_project = SettingsManager.resolve_current_project(self.settings)
         if active_project:
             self.settings = SettingsManager.load_project(active_project, self.settings)
+            SettingsManager.save_project(active_project, self.settings)
         # One-time/ongoing migration: keep only app-scoped values in config.json
         # and move credentials to the ignored local secrets store.
         self.settings_manager.save(self.settings)
@@ -243,6 +244,7 @@ class MainWindow(QMainWindow):
         self.settings = SettingsManager.load_project(path, global_settings)
         self.settings.setdefault("project", {})["current_name"] = path.stem.replace(".avr", "")
         self.settings["project"]["current_path"] = str(path)
+        SettingsManager.save_project(path, self.settings)
         self.settings_manager.save(self.settings)
         self.crawler_tab.load_settings(self.settings)
         self.setting_tab.load_settings(self.settings)
@@ -285,6 +287,30 @@ class MainWindow(QMainWindow):
         blank["audio_files"] = []
         blank["media_files"] = []
         blank["render_queue"] = []
+        blank["audio_crawler_project"] = {
+            "initialized": True,
+            "mode": "playlist",
+            "video_urls": "",
+            "playlist_url": "",
+            "playlist_limit": 100,
+            "channel_url": "",
+            "channel_limit": 50,
+            "channel_order": "newest_first",
+            "channel_date_filter": "all",
+            "channel_date_from": "",
+            "channel_date_to": "",
+            "save_folder": "",
+            "auto_add_to_audio_list": True,
+            "direct_crawl": True,
+            "only_new": True,
+            "audio_trim": {
+                "enabled": False,
+                "mode": "remove_segment",
+                "start_time": "00:00:00",
+                "end_time": "00:00:10",
+            },
+            "history": {},
+        }
         blank["project"] = {"current_name": "", "current_path": ""}
         dlg = ProjectDialog(self, blank)
         dlg.name_edit.clear()

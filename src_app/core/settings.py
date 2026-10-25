@@ -31,6 +31,30 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "direct_crawl": True,
         "audio_quality": "192",
     },
+    "audio_crawler_project": {
+        "initialized": False,
+        "mode": "playlist",
+        "video_urls": "",
+        "playlist_url": "",
+        "playlist_limit": 100,
+        "channel_url": "",
+        "channel_limit": 50,
+        "channel_order": "newest_first",
+        "channel_date_filter": "all",
+        "channel_date_from": "",
+        "channel_date_to": "",
+        "save_folder": "",
+        "auto_add_to_audio_list": True,
+        "direct_crawl": True,
+        "only_new": True,
+        "audio_trim": {
+            "enabled": False,
+            "mode": "remove_segment",
+            "start_time": "00:00:00",
+            "end_time": "00:00:10",
+        },
+        "history": {},
+    },
     "media_files": [],
     "shuffle_media": True,
     "avoid_repeat": True,
@@ -176,7 +200,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 # stay outside them so opening a project cannot replace crawler credentials,
 # YouTube accounts, or application-wide defaults.
 PROJECT_SETTING_KEYS = {
-    "audio_files", "audio_source_mode", "media_files", "shuffle_media",
+    "audio_files", "audio_source_mode", "audio_crawler_project", "media_files", "shuffle_media",
     "avoid_repeat", "delete_audio_after_render", "intro_file", "intro_mode",
     "outro_file", "intro_outro_presets", "filter_bgm_after_30s", "logo_file",
     "logo_enabled", "logo_position", "logo_scale", "logo_margin_x",
@@ -316,6 +340,12 @@ class SettingsManager:
         global_payload = {
             key: deepcopy(settings[key]) for key in GLOBAL_SETTING_KEYS if key in settings
         }
+        crawler = settings.get("audio_crawler", {}) or {}
+        global_payload["audio_crawler"] = {
+            key: deepcopy(crawler[key])
+            for key in ("platform", "browser_cookie", "cookie_file_path", "audio_quality")
+            if key in crawler
+        }
         project = settings.get("project", {}) or {}
         global_payload["project"] = {
             "current_name": str(project.get("current_name", "") or ""),
@@ -341,6 +371,19 @@ class SettingsManager:
         # complete global config, including account credentials.
         base = deep_merge(DEFAULT_SETTINGS, base_settings or {})
         res = deep_merge(base, _project_payload(data))
+        if "audio_crawler_project" not in data:
+            legacy = (base_settings or {}).get("audio_crawler", {}) or {}
+            profile = deepcopy(DEFAULT_SETTINGS["audio_crawler_project"])
+            for key in (
+                "mode", "video_urls", "playlist_url", "playlist_limit",
+                "channel_url", "channel_limit", "channel_order",
+                "channel_date_filter", "channel_date_from", "channel_date_to",
+                "save_folder", "auto_add_to_audio_list", "direct_crawl", "audio_trim",
+            ):
+                if key in legacy:
+                    profile[key] = deepcopy(legacy[key])
+            profile["initialized"] = True
+            res["audio_crawler_project"] = profile
         res.setdefault("project", {})["current_path"] = str(p)
         normalize_intro_outro_presets(res)
         return res
