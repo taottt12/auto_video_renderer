@@ -5,7 +5,7 @@ from typing import Any, Dict
 
 from PySide6.QtWidgets import (
     QMainWindow, QTabWidget, QMessageBox, QDialog, QVBoxLayout, QHBoxLayout,
-    QPushButton, QListWidget, QLineEdit, QLabel, QFileDialog
+    QPushButton, QListWidget, QLineEdit, QLabel, QFileDialog, QWidget, QComboBox
 )
 
 from core.settings import SettingsManager, PROJECTS_DIR
@@ -153,6 +153,12 @@ class MainWindow(QMainWindow):
 
         self.settings_manager = SettingsManager()
         self.settings: Dict[str, Any] = self.settings_manager.load()
+        active_project = SettingsManager.resolve_current_project(self.settings)
+        if active_project:
+            self.settings = SettingsManager.load_project(active_project, self.settings)
+        # One-time/ongoing migration: keep only app-scoped values in config.json
+        # and move credentials to the ignored local secrets store.
+        self.settings_manager.save(self.settings)
 
         self.tabs = QTabWidget()
         self.crawler_tab = CrawlerTab(self.settings)
@@ -162,17 +168,39 @@ class MainWindow(QMainWindow):
         self.youtube_tab = YouTubeTab(self.settings)
 
         self.tabs.addTab(self.crawler_tab, "Cào MP3")
-        self.tabs.addTab(self.setting_tab, "Setting")
+        self.tabs.addTab(self.setting_tab, "Cấu hình dự án")
         self.tabs.addTab(self.layout_tab, "Studio Layout")
         self.tabs.addTab(self.render_tab, "Render")
         self.tabs.addTab(self.youtube_tab, "Đăng YouTube")
-        self.setCentralWidget(self.tabs)
+        shell = QWidget()
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(8, 8, 8, 8)
+        shell_layout.setSpacing(6)
+        project_bar = QHBoxLayout()
+        project_bar.addWidget(QLabel("<b>Dự án đang làm:</b>"))
+        self.project_combo = QComboBox()
+        self.project_combo.setMinimumWidth(360)
+        self.project_combo.currentIndexChanged.connect(self._on_project_combo_changed)
+        project_bar.addWidget(self.project_combo, 1)
+        self.new_project_btn = QPushButton("Tạo dự án mới")
+        self.new_project_btn.clicked.connect(self.create_new_project)
+        project_bar.addWidget(self.new_project_btn)
+        self.manage_project_btn = QPushButton("Quản lý dự án")
+        self.manage_project_btn.clicked.connect(self.open_project_dialog)
+        project_bar.addWidget(self.manage_project_btn)
+        self.project_save_state = QLabel("Đã lưu tự động")
+        self.project_save_state.setStyleSheet("color: #2e7d32; font-weight: bold;")
+        project_bar.addWidget(self.project_save_state)
+        shell_layout.addLayout(project_bar)
+        shell_layout.addWidget(self.tabs, 1)
+        self.setCentralWidget(shell)
+        self._refresh_project_combo()
 
         # Kết nối sự kiện giữa các tab
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.crawler_tab.settings_changed.connect(self.on_settings_changed)
-        self.crawler_tab.audio_downloaded.connect(self.render_tab.add_audio_file)
-        self.crawler_tab.audio_batch_downloaded.connect(self.render_tab.add_audio_files)
+        self.crawler_tab.audio_downloaded.connect(self._on_crawler_audio_downloaded)
+        self.crawler_tab.audio_batch_downloaded.connect(self._on_crawler_audio_batch_downloaded)
 
         self.setting_tab.settings_changed.connect(self.on_settings_changed)
         self.layout_tab.settings_changed.connect(self.on_settings_changed)
@@ -183,6 +211,97 @@ class MainWindow(QMainWindow):
         self.render_tab.render_lock_changed.connect(self.setting_tab.set_locked)
         self.render_tab.render_lock_changed.connect(lambda locked: self.layout_tab.setEnabled(not locked))
         self.render_tab.render_lock_changed.connect(lambda locked: self.crawler_tab.setEnabled(not locked))
+        self._update_project_context_ui()
+
+    def _refresh_project_combo(self) -> None:
+        current_path = str((self.settings.get("project", {}) or {}).get("current_path", "") or "")
+        self.project_combo.blockSignals(True)
+        self.project_combo.clear()
+        self.project_combo.addItem("— Chưa chọn dự án —", "")
+        for path in SettingsManager.list_projects():
+            self.project_combo.addItem(path.stem.replace(".avr", ""), str(path))
+        idx = self.project_combo.findData(current_path)
+        self.project_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.project_combo.blockSignals(False)
+
+    def _update_project_context_ui(self) -> None:
+        project = self.settings.get("project", {}) or {}
+        active = bool(project.get("current_path") and Path(str(project.get("current_path"))).exists())
+        self.crawler_tab.set_project_context(
+            str(project.get("current_name", "") or ""),
+            str(project.get("current_path", "") or ""),
+        )
+        # Project-scoped editors stay disabled until their destination is
+        # explicit. YouTube remains available because it can select a project
+        # or an external output folder independently.
+        self.tabs.setTabEnabled(1, active)
+        self.tabs.setTabEnabled(2, active)
+        self.tabs.setTabEnabled(3, active)
+
+    def _load_project_path(self, path: Path, show_message: bool = False) -> None:
+        global_settings = self.settings_manager.load()
+        self.settings = SettingsManager.load_project(path, global_settings)
+        self.settings.setdefault("project", {})["current_name"] = path.stem.replace(".avr", "")
+        self.settings["project"]["current_path"] = str(path)
+        self.settings_manager.save(self.settings)
+        self.crawler_tab.load_settings(self.settings)
+        self.setting_tab.load_settings(self.settings)
+        self.layout_tab.update_settings(self.settings)
+        self.render_tab.load_settings(self.settings)
+        self.youtube_tab.load_settings(self.settings)
+        self.youtube_tab.refresh_projects()
+        self._refresh_project_combo()
+        self._update_project_context_ui()
+        if show_message:
+            QMessageBox.information(self, "Đã mở", f"Đã mở dự án:\n{path.name}")
+
+    def _on_project_combo_changed(self, _index: int) -> None:
+        path_str = self.project_combo.currentData()
+        if path_str:
+            self._load_project_path(Path(path_str))
+        elif (self.settings.get("project", {}) or {}).get("current_path"):
+            self._refresh_project_combo()
+
+    def _has_active_project(self) -> bool:
+        path = str((self.settings.get("project", {}) or {}).get("current_path", "") or "")
+        return bool(path and Path(path).exists())
+
+    def _on_crawler_audio_downloaded(self, path: str) -> None:
+        if self._has_active_project():
+            self.render_tab.add_audio_file(path)
+
+    def _on_crawler_audio_batch_downloaded(self, paths: list) -> None:
+        if self._has_active_project():
+            self.render_tab.add_audio_files(paths)
+        elif paths:
+            QMessageBox.warning(
+                self,
+                "Chưa chọn dự án",
+                "MP3 đã tải xong nhưng chưa được thêm vào Render. Hãy chọn hoặc tạo dự án trước, rồi nạp MP3 vào dự án.",
+            )
+
+    def create_new_project(self) -> None:
+        blank = self.settings_manager.load()
+        blank["audio_files"] = []
+        blank["media_files"] = []
+        blank["render_queue"] = []
+        blank["project"] = {"current_name": "", "current_path": ""}
+        dlg = ProjectDialog(self, blank)
+        dlg.name_edit.clear()
+        dlg.setWindowTitle("Tạo dự án mới")
+        if dlg.exec() != QDialog.Accepted or dlg.action != "save" or not dlg.selected_path:
+            self._refresh_project_combo()
+            return
+        self.settings = blank
+        self.settings.setdefault("project", {})["current_name"] = dlg.selected_path.stem.replace(".avr", "")
+        self.settings["project"]["current_path"] = str(dlg.selected_path)
+        out_folder = dlg.output_edit.text().strip()
+        if out_folder:
+            self.settings.setdefault("export", {})["output_folder"] = out_folder
+            self.settings["project"]["output_folder"] = out_folder
+        SettingsManager.save_project(dlg.selected_path, self.settings)
+        self._load_project_path(dlg.selected_path)
+        QMessageBox.information(self, "Đã tạo", f"Đã tạo dự án mới:\n{dlg.selected_path.name}")
 
     def _on_tab_changed(self, index: int) -> None:
         current_widget = self.tabs.widget(index)
@@ -215,10 +334,13 @@ class MainWindow(QMainWindow):
                 self.setting_tab.output_edit.blockSignals(False)
         if self.sender() != self.youtube_tab:
             self.youtube_tab.load_settings(self.settings)
+        self._update_project_context_ui()
 
     def open_project_dialog(self) -> None:
         dlg = ProjectDialog(self, self.settings)
         if dlg.exec() != QDialog.Accepted or not dlg.selected_path:
+            self._refresh_project_combo()
+            self._update_project_context_ui()
             return
         try:
             if dlg.action == "save":
@@ -236,20 +358,11 @@ class MainWindow(QMainWindow):
                 self.render_tab.update_settings(self.settings)
                 self.youtube_tab.load_settings(self.settings)
                 self.youtube_tab.refresh_projects()
+                self._refresh_project_combo()
+                self._update_project_context_ui()
                 QMessageBox.information(self, "Đã lưu", f"Đã lưu dự án:\n{dlg.selected_path.name}")
             elif dlg.action == "open":
-                self.settings = SettingsManager.load_project(dlg.selected_path)
-                self.settings.setdefault("project", {})
-                self.settings["project"]["current_name"] = dlg.selected_path.stem.replace(".avr", "")
-                self.settings["project"]["current_path"] = str(dlg.selected_path)
-                self.settings_manager.save(self.settings)
-                self.crawler_tab.load_settings(self.settings)
-                self.setting_tab.load_settings(self.settings)
-                self.layout_tab.update_settings(self.settings)
-                self.render_tab.load_settings(self.settings)
-                self.youtube_tab.load_settings(self.settings)
-                self.youtube_tab.refresh_projects()
-                QMessageBox.information(self, "Đã mở", f"Đã mở dự án:\n{dlg.selected_path.name}")
+                self._load_project_path(dlg.selected_path, show_message=True)
         except Exception as exc:
             QMessageBox.critical(self, "Lỗi", f"Không xử lý được dự án: {exc}")
 

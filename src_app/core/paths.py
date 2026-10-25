@@ -26,6 +26,7 @@ FONTS_DIR = ASSETS_DIR / "fonts"
 OVERLAYS_DIR = ASSETS_DIR / "overlays"
 TOOLS_DIR = APP_ROOT / "tools"
 CONFIG_PATH = APP_ROOT / "config.json"
+SECRETS_PATH = DATA_DIR / "secrets.json"
 
 
 def ensure_dirs() -> None:

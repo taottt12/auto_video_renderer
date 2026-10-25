@@ -39,6 +39,7 @@ src_app/data/cache/
 src_app/data/output/
 src_app/data/logs/
 src_app/data/tokens/
+src_app/data/secrets.json
 src_app/data/browser_profile/
 src_app/data/projects/*.json
 src_app/data/projects/*.avr.json

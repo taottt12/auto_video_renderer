@@ -1016,7 +1016,7 @@ class SettingTab(QWidget):
 
         # Thanh nút lưu đầu trang
         save_bar = QHBoxLayout()
-        self.save_btn = QPushButton("💾 Lưu cấu hình Render")
+        self.save_btn = QPushButton("💾 Lưu ngay cấu hình dự án")
         self.save_btn.setStyleSheet(
             "background-color: #2e7d32; color: white; padding: 7px 20px; font-weight: bold; font-size: 13px; border-radius: 4px;"
         )

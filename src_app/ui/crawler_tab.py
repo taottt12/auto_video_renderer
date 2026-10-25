@@ -415,9 +415,12 @@ class CrawlerTab(QWidget):
         form_layout.addRow("Thư mục lưu:", folder_row)
 
         # Tự động nạp sang Render
-        self.auto_add_checkbox = QCheckBox("Tự động chuyển file MP3 đã cào sang tab Render")
+        self.auto_add_checkbox = QCheckBox("Tự động thêm MP3 đã cào vào Render của dự án đang chọn")
         self.auto_add_checkbox.setChecked(True)
         form_layout.addRow("", self.auto_add_checkbox)
+        self.project_target_label = QLabel("Dự án đích: Chưa chọn dự án")
+        self.project_target_label.setStyleSheet("color: #ef6c00; font-weight: bold;")
+        form_layout.addRow("", self.project_target_label)
 
         # Cào trực tiếp toàn bộ hay xem trước
         self.direct_crawl_checkbox = QCheckBox("Cào trực tiếp toàn bộ (Không cần quét xem trước)")
@@ -1204,8 +1207,9 @@ class CrawlerTab(QWidget):
 
     @Slot(str)
     def _on_file_downloaded(self, fpath: str) -> None:
-        if self.auto_add_checkbox.isChecked():
-            self.audio_downloaded.emit(fpath)
+        # Transfer once when the batch finishes. Rebuilding and saving the full
+        # render queue after every individual download made large crawls slow.
+        pass
 
     @Slot(list)
     def _on_finished(self, files: list) -> None:
@@ -1341,6 +1345,18 @@ class CrawlerTab(QWidget):
         self._on_direct_crawl_toggled()
         self._on_mode_changed(self.mode_combo.currentIndex())
         self._lock_emit = False
+
+    def set_project_context(self, name: str, path: str) -> None:
+        if not hasattr(self, "project_target_label"):
+            return
+        if name and path:
+            self.project_target_label.setText(f"Dự án đích: {name}")
+            self.project_target_label.setToolTip(path)
+            self.project_target_label.setStyleSheet("color: #2e7d32; font-weight: bold;")
+        else:
+            self.project_target_label.setText("Dự án đích: Chưa chọn dự án")
+            self.project_target_label.setToolTip("")
+            self.project_target_label.setStyleSheet("color: #ef6c00; font-weight: bold;")
 
     @staticmethod
     def _set_combo_by_data(combo: QComboBox, value: Any) -> None:

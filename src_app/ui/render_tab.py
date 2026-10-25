@@ -514,6 +514,7 @@ class RenderTab(QWidget):
         super().__init__()
         self.settings = settings
         self._lock_sync = False
+        self._lock_queue_persist = True
         self.worker: RenderWorker | None = None
         self.duration_loader = DurationLoaderThread(self)
         self.duration_loader.duration_loaded.connect(self._on_duration_loaded)
@@ -535,6 +536,7 @@ class RenderTab(QWidget):
 
         self._build_ui()
         self.load_settings(settings)
+        self._lock_queue_persist = False
 
     @Slot(int, str)
     def _on_duration_loaded(self, row: int, dur_str: str) -> None:
@@ -868,6 +870,7 @@ class RenderTab(QWidget):
         self.table.setColumnWidth(COL_PROGRESS, 90)
         self.table.horizontalHeader().setSectionResizeMode(COL_ELAPSED, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(COL_OUTPUT, QHeaderView.ResizeToContents)
+        self.table.itemChanged.connect(self._on_queue_item_changed)
         root.addWidget(self.table, 2)
 
         # Khung Log Render
@@ -1025,13 +1028,28 @@ class RenderTab(QWidget):
 
     # ------------------ Xử lý File Audio & Media ------------------
 
+    def _require_active_project(self) -> bool:
+        path = str((self.settings.get("project", {}) or {}).get("current_path", "") or "")
+        if path and Path(path).exists():
+            return True
+        QMessageBox.warning(
+            self,
+            "Chưa chọn dự án",
+            "Hãy chọn hoặc tạo dự án ở thanh phía trên trước khi thêm tài nguyên hoặc render.",
+        )
+        return False
+
     def _choose_and_add_audio(self) -> None:
+        if not self._require_active_project():
+            return
         exts = " ".join(f"*{e}" for e in sorted(AUDIO_EXTENSIONS))
         files, _ = QFileDialog.getOpenFileNames(self, "Chọn file audio", "", f"Audio ({exts})")
         if files:
             self.add_audio_files(files)
 
     def _choose_and_add_media(self) -> None:
+        if not self._require_active_project():
+            return
         exts = " ".join(f"*{e}" for e in sorted(IMAGE_EXTENSIONS | VIDEO_EXTENSIONS))
         files, _ = QFileDialog.getOpenFileNames(self, "Chọn ảnh/video", "", f"Media ({exts})")
         if files:
@@ -1118,6 +1136,7 @@ class RenderTab(QWidget):
         audios = [self.audio_list.item(i).text() for i in range(self.audio_list.count())]
         self.settings["audio_files"] = audios
         self._populate_table_from_list(audios)
+        self.settings["render_queue"] = self._serialize_render_queue()
         self.settings_changed.emit(self.settings)
 
     def _sync_media_settings(self) -> None:
@@ -1133,6 +1152,13 @@ class RenderTab(QWidget):
         current = [str(self.table.item(r, COL_TITLE).data(Qt.UserRole) or self.table.item(r, COL_TITLE).text()) for r in range(self.table.rowCount()) if self.table.item(r, COL_TITLE)]
         if current == audio_files:
             return
+        saved_queue = self.settings.get("render_queue", []) or []
+        queue_by_audio = {
+            str(entry.get("audio_file", "")): entry
+            for entry in saved_queue if isinstance(entry, dict) and entry.get("audio_file")
+        }
+        previous_lock = self._lock_queue_persist
+        self._lock_queue_persist = True
         self.table.setRowCount(0)
         self.row_start_times.clear()
         self.row_elapsed_final.clear()
@@ -1140,17 +1166,19 @@ class RenderTab(QWidget):
         # Nạp hàng loạt ngay lập tức (không đơ máy)
         tasks: List[Tuple[int, str]] = []
         for row_idx, audio in enumerate(audio_files):
-            self.add_audio_row_fast(row_idx, audio)
+            self.add_audio_row_fast(row_idx, audio, queue_by_audio.get(str(audio)))
             tasks.append((row_idx, audio))
 
         # Đọc thời lượng ngầm
         if tasks:
             self.duration_loader.add_tasks(tasks)
+        self._lock_queue_persist = previous_lock
 
     def _create_layout_combo_for_row(self, row: int, selected_key: str = "") -> QComboBox:
         combo = QComboBox()
         self._populate_layout_combo(combo, selected_key)
         combo.currentIndexChanged.connect(lambda _, c=combo: self._update_layout_combo_tooltip(c))
+        combo.currentIndexChanged.connect(self._persist_render_queue)
         return combo
 
     def _populate_layout_combo(self, combo: QComboBox, selected_key: str = "") -> None:
@@ -1277,6 +1305,7 @@ class RenderTab(QWidget):
         combo = QComboBox()
         self._populate_intro_outro_combo(combo, selected_id)
         combo.currentIndexChanged.connect(lambda _, c=combo: self._update_intro_outro_combo_tooltip(c))
+        combo.currentIndexChanged.connect(self._persist_render_queue)
         return combo
 
     def _populate_intro_outro_combo(self, combo: QComboBox, selected_id: str = "") -> None:
@@ -1406,32 +1435,70 @@ class RenderTab(QWidget):
                             break
             QMessageBox.information(self, "Thành công", f"Đã áp dụng mẫu cho {len(target_rows)} dòng video.")
 
-    def add_audio_row_fast(self, row: int, audio: str) -> None:
+    def add_audio_row_fast(self, row: int, audio: str, queue_entry: Dict[str, Any] | None = None) -> None:
+        queue_entry = queue_entry or {}
         self.table.insertRow(row)
-        title_text = Path(audio).stem
+        title_text = str(queue_entry.get("title") or Path(audio).stem)
         name_item = QTableWidgetItem(title_text)
         name_item.setData(Qt.UserRole, audio)
+        name_item.setData(Qt.UserRole + 2, str(queue_entry.get("id") or uuid.uuid4().hex))
         name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
         name_item.setToolTip(f"Tiêu đề: {title_text}\nAudio gốc: {Path(audio).name}\nĐường dẫn: {audio}\n(Nháy đúp chuột để chỉnh sửa tiêu đề)")
         self.table.setItem(row, COL_TITLE, name_item)
         self.table.setItem(row, COL_DURATION, QTableWidgetItem("Đang đọc..."))
 
-        combo_layout = self._create_layout_combo_for_row(row)
+        combo_layout = self._create_layout_combo_for_row(row, str(queue_entry.get("layout_preset_id", "") or ""))
         self.table.setCellWidget(row, COL_LAYOUT, combo_layout)
 
-        combo_intro = self._create_intro_outro_combo_for_row(row)
+        combo_intro = self._create_intro_outro_combo_for_row(row, str(queue_entry.get("intro_outro_preset_id", "") or ""))
         self.table.setCellWidget(row, COL_INTRO_OUTRO, combo_intro)
 
-        self.table.setItem(row, COL_STATUS, QTableWidgetItem("Chưa chạy"))
-        self.table.setItem(row, COL_STAGE, QTableWidgetItem("Chờ"))
+        self.table.setItem(row, COL_STATUS, QTableWidgetItem(str(queue_entry.get("status") or "Chưa chạy")))
+        self.table.setItem(row, COL_STAGE, QTableWidgetItem(str(queue_entry.get("stage") or "Chờ")))
         progress = QProgressBar()
         progress.setRange(0, 100)
         progress.setValue(0)
         self.table.setCellWidget(row, COL_PROGRESS, progress)
         self.table.setItem(row, COL_ELAPSED, QTableWidgetItem("00:00"))
         ph_item = QTableWidgetItem("-")
+        ph_item.setData(Qt.UserRole, str(queue_entry.get("output_file", "") or ""))
         ph_item.setTextAlignment(Qt.AlignCenter)
         self.table.setItem(row, COL_OUTPUT, ph_item)
+
+    def _on_queue_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() == COL_TITLE:
+            self._persist_render_queue()
+
+    def _serialize_render_queue(self) -> List[Dict[str, Any]]:
+        queue: List[Dict[str, Any]] = []
+        for row in range(self.table.rowCount()):
+            title_item = self.table.item(row, COL_TITLE)
+            if not title_item:
+                continue
+            layout_combo = self.table.cellWidget(row, COL_LAYOUT)
+            intro_combo = self.table.cellWidget(row, COL_INTRO_OUTRO)
+            status_item = self.table.item(row, COL_STATUS)
+            stage_item = self.table.item(row, COL_STAGE)
+            output_item = self.table.item(row, COL_OUTPUT)
+            queue.append({
+                "id": str(title_item.data(Qt.UserRole + 2) or uuid.uuid4().hex),
+                "audio_file": str(title_item.data(Qt.UserRole) or ""),
+                "title": title_item.text().strip(),
+                "layout_preset_id": layout_combo.currentData() if isinstance(layout_combo, QComboBox) else "__default__",
+                "intro_outro_preset_id": intro_combo.currentData() if isinstance(intro_combo, QComboBox) else "__default__",
+                "status": status_item.text() if status_item else "Chưa chạy",
+                "stage": stage_item.text() if stage_item else "Chờ",
+                "output_file": str(output_item.data(Qt.UserRole) or "") if output_item else "",
+            })
+        return queue
+
+    def _persist_render_queue(self, *_args: Any) -> None:
+        if self._lock_queue_persist or self._lock_sync:
+            return
+        queue = self._serialize_render_queue()
+        self.settings["render_queue"] = queue
+        self.settings["audio_files"] = [entry["audio_file"] for entry in queue if entry["audio_file"]]
+        self.settings_changed.emit(self.settings)
 
     # ------------------ Quản lý & Xuất / Nhập Tiêu đề Video ------------------
 
@@ -1761,6 +1828,9 @@ class RenderTab(QWidget):
         self.audio_count_label.setText(f"Tổng: {self.audio_list.count()} audio")
         self.media_count_label.setText(f"{self.media_list.count()} media")
 
+        # Rebuild from this project's queue even if another project referenced
+        # the exact same audio paths.
+        self.table.setRowCount(0)
         self._populate_table_from_list(audio_files)
 
         if self.media_list.count() > 0:
@@ -1962,6 +2032,8 @@ class RenderTab(QWidget):
             pass
 
     def start_render(self) -> None:
+        if not self._require_active_project():
+            return
         if self.worker and self.worker.isRunning():
             QMessageBox.information(self, "Đang render", "Tool đang render, hãy dừng hoặc đợi hoàn thành.")
             return
@@ -2055,6 +2127,8 @@ class RenderTab(QWidget):
             ph_item = QTableWidgetItem("-")
             ph_item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, COL_OUTPUT, ph_item)
+
+        self._persist_render_queue()
 
         self.worker = RenderWorker(
             self.settings,
@@ -2157,6 +2231,11 @@ class RenderTab(QWidget):
             bar.setValue(percent)
         if output:
             out_path = Path(output)
+            output_item = self.table.item(row, COL_OUTPUT)
+            if output_item is None:
+                output_item = QTableWidgetItem("-")
+                self.table.setItem(row, COL_OUTPUT, output_item)
+            output_item.setData(Qt.UserRole, str(out_path))
             cell_widget = QWidget()
             layout = QHBoxLayout(cell_widget)
             layout.setContentsMargins(4, 2, 4, 2)
@@ -2177,6 +2256,8 @@ class RenderTab(QWidget):
             layout.addWidget(btn_play)
             layout.addWidget(btn_folder)
             self.table.setCellWidget(row, COL_OUTPUT, cell_widget)
+        if status in {"Hoàn thành", "Lỗi", "Đã dừng"}:
+            self._persist_render_queue()
 
     def _open_video_file(self, path_str: str) -> None:
         p = Path(path_str)

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 
-from .paths import APP_ROOT, CONFIG_PATH, PROJECTS_DIR
+from .paths import APP_ROOT, CONFIG_PATH, PROJECTS_DIR, SECRETS_PATH
 
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
@@ -161,7 +161,76 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "current_name": "",
         "current_path": "",
     },
+    "render_queue": [],
 }
+
+
+# Project files are portable workspaces. Machine/account settings intentionally
+# stay outside them so opening a project cannot replace crawler credentials,
+# YouTube accounts, or application-wide defaults.
+PROJECT_SETTING_KEYS = {
+    "audio_files", "audio_source_mode", "media_files", "shuffle_media",
+    "avoid_repeat", "delete_audio_after_render", "intro_file", "intro_mode",
+    "outro_file", "intro_outro_presets", "filter_bgm_after_30s", "logo_file",
+    "logo_enabled", "logo_position", "logo_scale", "logo_margin_x",
+    "logo_margin_y", "watermark_file", "watermark_enabled",
+    "watermark_opacity", "watermark_scale", "background_music", "promo_audio",
+    "image_duration_mode", "effect_mode", "image_motion_enabled",
+    "video_effect_mode", "video_effect_enabled", "video_effect_custom_file",
+    "video_effect_opacity", "transition_mode", "transition_enabled",
+    "transition_duration", "layout_studio", "audio_speed", "video_speed",
+    "performance", "text_overlay", "subtitle", "export", "project",
+    "render_queue",
+}
+
+GLOBAL_SETTING_KEYS = {"audio_crawler", "youtube_uploader", "performance", "project"}
+
+
+def _project_payload(settings: Dict[str, Any]) -> Dict[str, Any]:
+    payload = {k: deepcopy(settings[k]) for k in PROJECT_SETTING_KEYS if k in settings}
+    project = payload.setdefault("project", {})
+    project.pop("current_path", None)
+    return payload
+
+
+def _extract_secrets(settings: Dict[str, Any]) -> Dict[str, Any]:
+    crawler = settings.get("audio_crawler", {}) or {}
+    youtube = settings.get("youtube_uploader", {}) or {}
+    return {
+        "audio_crawler": {
+            "cookie_file_path": str(crawler.get("cookie_file_path", "") or ""),
+        },
+        "youtube_uploader": {
+            key: str(value or "")
+            for key, value in youtube.items()
+            if key.endswith("api_key")
+        },
+    }
+
+
+def _without_secrets(settings: Dict[str, Any]) -> Dict[str, Any]:
+    result = deepcopy(settings)
+    result.setdefault("audio_crawler", {}).pop("cookie_file_path", None)
+    yt = result.setdefault("youtube_uploader", {})
+    for key in list(yt):
+        if key.endswith("api_key"):
+            yt.pop(key, None)
+    return result
+
+
+def _load_secrets() -> Dict[str, Any]:
+    try:
+        if SECRETS_PATH.exists():
+            data = json.loads(SECRETS_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_secrets(secrets: Dict[str, Any]) -> None:
+    SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SECRETS_PATH.write_text(json.dumps(secrets, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def normalize_intro_outro_presets(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -225,6 +294,7 @@ class SettingsManager:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             res = deep_merge(DEFAULT_SETTINGS, data)
+            res = deep_merge(res, _load_secrets())
             normalize_intro_outro_presets(res)
             return res
         except Exception:
@@ -235,23 +305,53 @@ class SettingsManager:
     def save(self, settings: Dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         normalize_intro_outro_presets(settings)
-        merged = deep_merge(DEFAULT_SETTINGS, settings)
-        self.path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+        _save_secrets(_extract_secrets(settings))
+        global_payload = {
+            key: deepcopy(settings[key]) for key in GLOBAL_SETTING_KEYS if key in settings
+        }
+        project = settings.get("project", {}) or {}
+        global_payload["project"] = {
+            "current_name": str(project.get("current_name", "") or ""),
+            "current_path": str(project.get("current_path", "") or ""),
+        }
+        # Remember the active project, but never persist its output/render state
+        # in the global application config.
+        safe_payload = _without_secrets(global_payload)
+        self.path.write_text(json.dumps(safe_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     @staticmethod
     def save_project(path: str | Path, settings: Dict[str, Any]) -> None:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         normalize_intro_outro_presets(settings)
-        p.write_text(json.dumps(deep_merge(DEFAULT_SETTINGS, settings), ensure_ascii=False, indent=2), encoding="utf-8")
+        p.write_text(json.dumps(_project_payload(settings), ensure_ascii=False, indent=2), encoding="utf-8")
 
     @staticmethod
-    def load_project(path: str | Path) -> Dict[str, Any]:
+    def load_project(path: str | Path, base_settings: Dict[str, Any] | None = None) -> Dict[str, Any]:
         p = Path(path)
         data = json.loads(p.read_text(encoding="utf-8"))
-        res = deep_merge(DEFAULT_SETTINGS, data)
+        # Filtering also sanitizes legacy projects which used to contain the
+        # complete global config, including account credentials.
+        base = deep_merge(DEFAULT_SETTINGS, base_settings or {})
+        res = deep_merge(base, _project_payload(data))
+        res.setdefault("project", {})["current_path"] = str(p)
         normalize_intro_outro_presets(res)
         return res
+
+    @staticmethod
+    def resolve_current_project(settings: Dict[str, Any]) -> Path | None:
+        project = settings.get("project", {}) or {}
+        configured = str(project.get("current_path", "") or "").strip()
+        if configured:
+            path = Path(configured)
+            if path.exists():
+                return path
+        name = str(project.get("current_name", "") or "").strip()
+        if name:
+            candidate = SettingsManager.project_path(name)
+            if candidate.exists():
+                return candidate
+        return None
 
     @staticmethod
     def list_projects() -> list[Path]:
