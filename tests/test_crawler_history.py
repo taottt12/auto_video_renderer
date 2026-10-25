@@ -95,6 +95,40 @@ class TestCrawlerProjectHistory(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in result], ["new-1"])
 
+    def test_existing_folder_files_do_not_consume_new_download_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir = Path(tmp)
+            (save_dir / "Old.mp3").write_bytes(b"0" * 12000)
+            downloaded = save_dir / "New 1.mp3"
+            cfg = {
+                "mode": "playlist",
+                "playlist_url": "https://youtube.com/playlist?list=PL123",
+                "playlist_limit": 1,
+                "save_folder": str(save_dir),
+                "only_new": True,
+                "download_history": {},
+            }
+            entries = [
+                {"id": "old", "title": "Old", "url": "https://youtu.be/old"},
+                {"id": "new-1", "title": "New 1", "url": "https://youtu.be/new-1"},
+                {"id": "new-2", "title": "New 2", "url": "https://youtu.be/new-2"},
+            ]
+
+            def fake_download(**_kwargs):
+                downloaded.write_bytes(b"1" * 12000)
+                return str(downloaded)
+
+            with patch("src_app.core.audio_crawler.extract_entry_list", return_value=entries) as extract_mock, patch(
+                "src_app.core.audio_crawler.download_single_audio", side_effect=fake_download
+            ):
+                files = run_crawler(cfg)
+
+            self.assertEqual(extract_mock.call_args.kwargs["limit"], 0)
+            self.assertEqual(files, [str(downloaded)])
+            self.assertEqual(cfg["download_history"]["old"]["status"], "existing")
+            self.assertEqual(cfg["download_history"]["new-1"]["status"], "downloaded")
+            self.assertNotIn("new-2", cfg["download_history"])
+
 
 if __name__ == "__main__":
     unittest.main()

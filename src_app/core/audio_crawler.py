@@ -1332,7 +1332,26 @@ def run_crawler(
         if on_history_updated:
             on_history_updated(dict(history))
 
+    existing_audio_files = [
+        path for path in Path(save_folder).glob("*.mp3")
+        if path.is_file() and path.stat().st_size > 10240
+    ]
+
+    def find_existing_audio(title: str) -> Path | None:
+        safe_title = sanitize_filename(title)
+        exact_path = Path(save_folder) / f"{safe_title}.mp3"
+        if exact_path.exists() and exact_path.is_file() and exact_path.stat().st_size > 10240:
+            return exact_path
+        clean_search = re.sub(r"[\W_]+", "", safe_title[:20]).lower()
+        if clean_search:
+            for audio_file in existing_audio_files:
+                file_clean = re.sub(r"[\W_]+", "", audio_file.stem).lower()
+                if clean_search in file_clean:
+                    return audio_file
+        return None
+
     targets: List[Dict[str, str]] = []
+    requested_limit = 0
 
     if crawler_cfg.get("selected_targets"):
         targets = list(crawler_cfg["selected_targets"])
@@ -1350,10 +1369,10 @@ def run_crawler(
         playlist_url = str(crawler_cfg.get("playlist_url") or "").strip()
         if not playlist_url:
             raise ValueError("Chưa nhập URL Danh sách phát (Playlist).")
-        limit = int(crawler_cfg.get("playlist_limit") or 0)
+        requested_limit = int(crawler_cfg.get("playlist_limit") or 0)
         targets = extract_entry_list(
             url=playlist_url,
-            limit=limit,
+            limit=0 if only_new else requested_limit,
             browser_cookie=browser_cookie,
             cookie_file=cookie_file,
             log=_log,
@@ -1366,7 +1385,7 @@ def run_crawler(
         if not channel_url:
             raise ValueError("Chưa nhập URL Kênh (Channel).")
         channel_url = normalize_channel_url(channel_url)
-        limit = int(crawler_cfg.get("channel_limit") or 0)
+        requested_limit = int(crawler_cfg.get("channel_limit") or 0)
         order = str(crawler_cfg.get("channel_order") or "newest_first")
         date_filter = str(crawler_cfg.get("channel_date_filter") or "all")
         date_from = str(crawler_cfg.get("channel_date_from") or "")
@@ -1374,7 +1393,7 @@ def run_crawler(
 
         targets = extract_entry_list(
             url=channel_url,
-            limit=limit,
+            limit=0 if only_new else requested_limit,
             order=order,
             date_filter=date_filter,
             date_from=date_from,
@@ -1396,6 +1415,24 @@ def run_crawler(
         if skipped:
             _log(f"📚 Lịch sử dự án: bỏ qua {skipped} video đã tải trong phần được chọn.")
 
+    if only_new:
+        pending_targets: List[Dict[str, str]] = []
+        discovered_existing = 0
+        for item in targets:
+            title = str(item.get("title") or item.get("url") or "")
+            existing_match = find_existing_audio(title)
+            if existing_match:
+                remember(item, "existing", str(existing_match))
+                discovered_existing += 1
+            else:
+                pending_targets.append(item)
+        if discovered_existing:
+            _log(
+                f"📁 Đã đồng bộ {discovered_existing} MP3 có sẵn vào lịch sử dự án; "
+                "không tính chúng vào giới hạn video mới."
+            )
+        targets = pending_targets[:requested_limit] if requested_limit > 0 else pending_targets
+
     total = len(targets)
     if total == 0:
         _log("Không có video nào để cào MP3.")
@@ -1415,19 +1452,7 @@ def run_crawler(
         _progress(index + 1, total, f"Đang cào ({index + 1}/{total}): {title[:40]}...")
 
         # 1. Kiểm tra nếu file MP3 đã tồn tại sẵn trong thư mục lưu (tự động bỏ qua để tiếp tục các tập còn thiếu)
-        safe_title = sanitize_filename(title)
-        existing_match = None
-        exact_path = Path(save_folder) / f"{safe_title}.mp3"
-        if exact_path.exists() and exact_path.is_file() and exact_path.stat().st_size > 10240:
-            existing_match = exact_path
-        else:
-            clean_search = re.sub(r'[\W_]+', '', safe_title[:20]).lower()
-            if clean_search:
-                for f in Path(save_folder).glob("*.mp3"):
-                    f_clean = re.sub(r'[\W_]+', '', f.stem).lower()
-                    if clean_search in f_clean and f.stat().st_size > 10240:
-                        existing_match = f
-                        break
+        existing_match = find_existing_audio(title)
 
         if existing_match:
             _log(f"⚡ [{index + 1}/{total}] [Đã có sẵn] {existing_match.name} ➔ Bỏ qua không tải lại.")
